@@ -7,6 +7,7 @@
 import os
 import shutil
 import hashlib
+import threading
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Callable
 from datetime import datetime
@@ -48,100 +49,132 @@ class ImportManager:
         self.images_path = self.storage_path / "images"
         self.images_path.mkdir(exist_ok=True)
     
-    def import_folder(self, folder_path: str, 
-                     progress_callback: Callable[[int, str], None] = None) -> Tuple[int, int]:
+    def import_folder(self, folder_path: str,
+                     progress_callback: Callable[[int, str], None] = None,
+                     cancel_event: Optional[threading.Event] = None) -> Tuple[int, int]:
         """
         导入文件夹中的所有图像
-        
+
         Args:
             folder_path: 文件夹路径
-            progress_callback: 进度回调函数，参数为(进度百分比, 状态信息)
-            
+            progress_callback: 进度回调函数，参数为(进度百分比, 状态信息)；
+                进度为 -1 表示总量未知/尚在准备，调用方应显示忙碌态而非具体百分比
+            cancel_event: 取消信号，每张图片处理前检查一次，最迟在下一张图片边界停止
+
         Returns:
             (成功导入数量, 跳过数量)
         """
         folder_path = Path(folder_path)
         if not folder_path.exists() or not folder_path.is_dir():
             raise ValueError(f"无效的文件夹路径: {folder_path}")
-        
+
+        if progress_callback:
+            progress_callback(-1, f"正在扫描文件夹: {folder_path.name}")
+
         # 获取所有图像文件
         image_files = []
         for ext in self.SUPPORTED_IMAGE_FORMATS:
             image_files.extend(folder_path.rglob(f"*{ext}"))
             image_files.extend(folder_path.rglob(f"*{ext.upper()}"))
-        
+
         # 去重并排序
         image_files = sorted(set(image_files))
-        
+
         if not image_files:
+            if progress_callback:
+                progress_callback(100, "文件夹中没有找到图片")
             return 0, 0
-        
+
         total = len(image_files)
         imported = 0
         skipped = 0
-        
+        last_progress = 0
+
+        if progress_callback:
+            progress_callback(0, f"共 {total} 张待导入")
+
         for i, image_file in enumerate(image_files):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
             try:
                 # 更新进度
                 progress = int((i / total) * 100)
+                last_progress = progress
                 if progress_callback:
-                    progress_callback(progress, f"正在导入: {image_file.name}")
-                
+                    progress_callback(progress, f"正在导入: {image_file.name} ({i + 1}/{total})")
+
                 # 导入单张图像
                 result = self.import_single_image(str(image_file))
                 if result:
                     imported += 1
                 else:
                     skipped += 1
-                    
+
             except Exception as e:
                 print(f"导入图像失败 {image_file}: {e}")
                 skipped += 1
-        
-        # 完成进度
+
+        # 完成进度：取消时保留最后的真实进度，不要显示成 100% 完成
         if progress_callback:
-            progress_callback(100, f"导入完成: 成功 {imported}, 跳过 {skipped}")
-        
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            status = "已取消" if cancelled else "导入完成"
+            final_progress = last_progress if cancelled else 100
+            progress_callback(final_progress, f"{status}: 成功 {imported}, 跳过 {skipped}")
+
         return imported, skipped
-    
+
     def import_images(self, file_paths: List[str],
-                     progress_callback: Callable[[int, str], None] = None) -> Tuple[int, int]:
+                     progress_callback: Callable[[int, str], None] = None,
+                     cancel_event: Optional[threading.Event] = None) -> Tuple[int, int]:
         """
         导入多张图像
-        
+
         Args:
             file_paths: 图像文件路径列表
             progress_callback: 进度回调函数
-            
+            cancel_event: 取消信号，每张图片处理前检查一次，最迟在下一张图片边界停止
+
         Returns:
             (成功导入数量, 跳过数量)
         """
         total = len(file_paths)
         imported = 0
         skipped = 0
-        
+        last_progress = 0
+
+        if progress_callback:
+            progress_callback(0, f"正在导入 0/{total} 张图片")
+
         for i, file_path in enumerate(file_paths):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
             try:
                 # 更新进度
-                progress = int((i / total) * 100)
+                progress = int((i / total) * 100) if total else 100
+                last_progress = progress
                 if progress_callback:
-                    progress_callback(progress, f"正在导入: {Path(file_path).name}")
-                
+                    progress_callback(progress, f"正在导入: {Path(file_path).name} ({i + 1}/{total})")
+
                 # 导入单张图像
                 result = self.import_single_image(file_path)
                 if result:
                     imported += 1
                 else:
                     skipped += 1
-                    
+
             except Exception as e:
                 print(f"导入图像失败 {file_path}: {e}")
                 skipped += 1
-        
-        # 完成进度
+
+        # 完成进度：取消时保留最后的真实进度，不要显示成 100% 完成
         if progress_callback:
-            progress_callback(100, f"导入完成: 成功 {imported}, 跳过 {skipped}")
-        
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            status = "已取消" if cancelled else "导入完成"
+            final_progress = last_progress if cancelled else 100
+            progress_callback(final_progress, f"{status}: 成功 {imported}, 跳过 {skipped}")
+
         return imported, skipped
     
     def import_single_image(self, file_path: str) -> bool:
@@ -204,64 +237,95 @@ class ImportManager:
             return False
     
     def import_video(self, video_path: str, frame_interval: int = 1,
-                    progress_callback: Callable[[int, str], None] = None) -> Tuple[int, int]:
+                    progress_callback: Callable[[int, str], None] = None,
+                    cancel_event: Optional[threading.Event] = None) -> Tuple[int, int]:
         """
         从视频中抽取帧导入
-        
+
         Args:
             video_path: 视频文件路径
             frame_interval: 抽帧间隔（每隔多少帧抽取一帧）
-            progress_callback: 进度回调函数
-            
+            progress_callback: 进度回调函数；进度为 -1 表示总帧数未知，
+                调用方应显示忙碌态而非具体百分比
+            cancel_event: 取消信号，每帧读取后检查一次，最迟在下一帧边界停止
+
         Returns:
             (成功导入数量, 跳过数量)
         """
         video_path = Path(video_path)
         if not video_path.exists():
             raise ValueError(f"视频文件不存在: {video_path}")
-        
+
         if video_path.suffix.lower() not in self.SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"不支持的视频格式: {video_path.suffix}")
-        
+
+        if progress_callback:
+            progress_callback(-1, f"正在打开视频: {video_path.name}")
+
         # 打开视频
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ValueError(f"无法打开视频: {video_path}")
-        
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        
+
+        if progress_callback:
+            if total_frames > 0:
+                # 向上取整：例如 31 帧、间隔 30，第 0/30 帧都会被抽到，预计 2 张
+                estimated = (total_frames + frame_interval - 1) // frame_interval
+                progress_callback(
+                    0, f"视频信息就绪: 共 {total_frames} 帧，间隔 {frame_interval}，预计抽取 {estimated} 张"
+                )
+            else:
+                progress_callback(-1, f"视频总帧数未知，间隔 {frame_interval}，将持续抽帧")
+
         imported = 0
         skipped = 0
         frame_count = 0
-        
+        last_progress = 0
+        cancelled = False
+
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
+
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+
                 # 按间隔抽帧
                 if frame_count % frame_interval == 0:
                     try:
                         # 更新进度
-                        progress = int((frame_count / total_frames) * 100)
                         if progress_callback:
-                            progress_callback(progress, f"正在抽取帧 {frame_count}/{total_frames}")
-                        
+                            if total_frames > 0:
+                                progress = int((frame_count / total_frames) * 100)
+                                last_progress = progress
+                                progress_callback(
+                                    progress,
+                                    f"正在抽取帧 {frame_count}/{total_frames}（已导入 {imported}）",
+                                )
+                            else:
+                                progress_callback(
+                                    -1, f"正在抽取帧 {frame_count}（已导入 {imported}）"
+                                )
+
                         # 保存帧为图像
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                         target_filename = f"{timestamp}_frame_{frame_count:06d}.jpg"
                         target_path = self.images_path / target_filename
-                        
+
                         # 转换颜色空间并保存
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         cv2.imwrite(str(target_path), frame)
-                        
+
                         # 获取图像信息
                         height, width = frame.shape[:2]
                         size = target_path.stat().st_size
-                        
+
                         # 添加到数据库
                         db.add_image(
                             project_id=self.project_id,
@@ -274,22 +338,24 @@ class ImportManager:
                             original_path=str(video_path),
                             group_id=self.group_id,
                         )
-                        
+
                         imported += 1
-                        
+
                     except Exception as e:
                         print(f"保存帧失败 {frame_count}: {e}")
                         skipped += 1
-                
+
                 frame_count += 1
-                
+
         finally:
             cap.release()
-        
-        # 完成进度
+
+        # 完成进度：取消时保留最后的真实进度，不要显示成 100% 完成
         if progress_callback:
-            progress_callback(100, f"视频导入完成: 成功 {imported}, 跳过 {skipped}")
-        
+            status = "已取消" if cancelled else "视频导入完成"
+            final_progress = last_progress if cancelled else 100
+            progress_callback(final_progress, f"{status}: 成功 {imported}, 跳过 {skipped}")
+
         return imported, skipped
     
     def _calculate_file_hash(self, file_path: str) -> str:

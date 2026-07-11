@@ -1,304 +1,490 @@
 # -*- coding: utf-8 -*-
 """
 设置页面
+
+辅助页，不属于主流程，所以视觉上比流程页轻：没有大标题（页头已给），
+只有三组内容 + 一条底部操作栏。
+
+    常用设置      —— 自动保存、预训练模型路径
+    AI 与自动标注 —— 自动标注用的是什么模型，就地打开配置
+    标注快捷键    —— 键位，改完立即生效
+
+保存规则写在界面上，不让用户猜：
+    快捷键改完立即写入；路径和自动保存要点「保存设置」才写入。
 """
 
+import json
+from pathlib import Path
+from typing import Optional
+
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
-    QGroupBox, QFormLayout, QComboBox, QSlider, QSpinBox,
-    QFileDialog, QMessageBox, QCheckBox
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QGroupBox, QSpinBox, QCheckBox,
+    QScrollArea, QFrame, QFileDialog, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal
+from PyQt6.QtGui import QKeySequence
 
 from gui.styles import COLORS
+from gui.widgets.elided_label import ElidedLabel
+
+APP_ROOT = Path(__file__).parent.parent.parent
+DEFAULT_PRETRAINED_PATH = APP_ROOT / "pretrained"
+SAM_CONFIG_FILE = APP_ROOT / "config" / "sam_config.json"
+LLM_CONFIG_FILE = APP_ROOT / "config" / "llm_config.json"
+
+# 应用当前固定用浅色主题，仍按原键写回 QSettings
+THEME_NAME = "浅色主题"
+
+# (设置键, 显示名, 默认键位)
+SHORTCUTS = [
+    ("rect_tool_shortcut", "矩形工具", "W"),
+    ("poly_tool_shortcut", "多边形工具", "P"),
+    ("move_tool_shortcut", "移动工具", "V"),
+    ("prev_image_shortcut", "上一张图片", "A"),
+    ("next_image_shortcut", "下一张图片", "D"),
+    ("delete_shortcut", "删除标注", "DELETE"),
+    ("reset_view_shortcut", "重置视图", "R"),
+]
+
+HINT_IDLE = "路径和自动保存的改动，点「保存设置」后才写入。"
+
+
+def normalize_shortcut(text: str) -> str:
+    """把用户输入的键位整理成配置里存的那一个字符串，认不出来就返回空串。
+
+    单个字母/数字照旧转成大写；DELETE、BACKSPACE、SPACE、UP 这类键名交给 Qt 判断，
+    这样默认的 DELETE 被改掉之后还能再输回来。
+    组合键（Ctrl+S）不收：读快捷键的地方是拿单个键位的文本去比对的。
+    """
+    key = " ".join(text.split()).upper()
+    if not key or "+" in key:
+        return ""
+    if len(key) == 1:
+        return key
+
+    seq = QKeySequence.fromString(key)
+    if seq.count() != 1 or seq[0].key() == Qt.Key.Key_unknown:
+        return ""
+    return key
+
+
+def shortcut_key_code(text: str) -> Optional[int]:
+    """把存下来的键位字符串解析成 Qt 键码，认不出来返回 None。"""
+    key = normalize_shortcut(text)
+    if not key:
+        return None
+
+    seq = QKeySequence.fromString(key)
+    if seq.count() != 1:
+        return None
+
+    code = seq[0].key()
+    return None if code == Qt.Key.Key_unknown else code
+
+
+def event_matches_shortcut(event, text: str) -> bool:
+    """这次按键是不是这个快捷键。
+
+    比的是键码，不是 event.text()。DELETE / SPACE / 方向键根本没有可打印字符
+    （event.text() 分别是 '\x7f'、' '、''），拿文本去比永远匹配不上——设置页
+    会照样存下来并显示「已经生效」，实际上键是哑的。
+    单键快捷键带上 Ctrl/Alt/Meta 就不算，免得和 Ctrl+Z 这类组合键抢。
+    """
+    code = shortcut_key_code(text)
+    if code is None or event.key() != code:
+        return False
+
+    blocked = (
+        Qt.KeyboardModifier.ControlModifier
+        | Qt.KeyboardModifier.AltModifier
+        | Qt.KeyboardModifier.MetaModifier
+    )
+    return not (event.modifiers() & blocked)
+
+
+def read_config(path: Path) -> dict:
+    """读配置文件，只用于显示当前状态；读不到就当没配置过。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 class SettingsPage(QWidget):
     """设置页面"""
-    
+
     # 主题变化信号
     theme_changed = pyqtSignal(str)  # 发送新的主题名称
-    
+
+    # 请求打开自动标注配置：''=默认页，'sam'=SAM 分割，'llm'=LLM 视觉
+    # 设置页自己不认识 AutoLabelDialog，由主窗口接住并打开标注页那一个实例
+    auto_label_config_requested = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.settings = QSettings("EzYOLO", "Settings")
+        self.shortcut_buttons = {}
         self.init_ui()
-    
+
     def init_ui(self):
         """初始化界面"""
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
-        
-        # 标题
-        title = QLabel("设置")
-        title.setObjectName("title")
-        title.setStyleSheet("font-size: 20px; font-weight: bold;")
-        main_layout.addWidget(title)
-        
-        # 主题设置
-        theme_group = self.create_theme_group()
-        main_layout.addWidget(theme_group)
-        
-        # 路径设置
-        path_group = self.create_path_group()
-        main_layout.addWidget(path_group)
-        
-        # 自动保存设置
-        auto_save_group = self.create_auto_save_group()
-        main_layout.addWidget(auto_save_group)
-        
-        # 快捷键设置（预留）
-        shortcut_group = self.create_shortcut_group()
-        main_layout.addWidget(shortcut_group)
-        
-        # 底部按钮
-        btn_layout = QHBoxLayout()
-        
-        self.btn_save = QPushButton("💾 保存设置")
-        self.btn_save.clicked.connect(self.save_settings)
-        btn_layout.addWidget(self.btn_save)
-        
-        self.btn_reset = QPushButton("🔄 恢复默认")
-        self.btn_reset.clicked.connect(self.reset_settings)
-        btn_layout.addWidget(self.btn_reset)
-        
-        btn_layout.addStretch()
-        main_layout.addLayout(btn_layout)
-    
-    def create_theme_group(self) -> QGroupBox:
-        """创建主题设置组"""
-        group = QGroupBox("主题设置")
-        
-        layout = QFormLayout(group)
-        
-        # 主题选择（只保留深色主题）
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("深色主题")
-        # 固定为深色主题
-        self.theme_combo.setCurrentIndex(0)
-        # 禁用下拉框，防止用户修改
-        self.theme_combo.setEnabled(False)
-        layout.addRow("主题:", self.theme_combo)
-        
-        return group
-    
-    def create_path_group(self) -> QGroupBox:
-        """创建路径设置组"""
-        group = QGroupBox("路径设置")
-        
-        layout = QFormLayout(group)
-        
-        # 预训练模型路径
-        path_layout = QHBoxLayout()
-        from pathlib import Path
-        app_root = Path(__file__).parent.parent.parent  # 向上三级到EzYOLO根目录
-        default_pretrained_path = app_root / "pretrained"
-        self.pretrained_path = QLabel(self.settings.value("pretrained_path", str(default_pretrained_path)))
-        self.pretrained_path.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        path_layout.addWidget(self.pretrained_path)
-        
-        btn_browse = QPushButton("浏览")
-        btn_browse.clicked.connect(lambda: self.browse_path("pretrained_path", "选择预训练模型目录"))
-        path_layout.addWidget(btn_browse)
-        
-        layout.addRow("预训练模型路径:", path_layout)
-        
-        return group
-    
-    def create_auto_save_group(self) -> QGroupBox:
-        """创建自动保存设置组"""
-        group = QGroupBox("自动保存设置")
-        
-        layout = QFormLayout(group)
-        
-        # 自动保存间隔
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(24, 20, 24, 8)
+        body_layout.setSpacing(14)
+
+        # 设置项本身很窄，让分组框铺满一整屏只会把几行字摊成一片空白。
+        # 固定一列内容宽度（宽屏时留白在右侧），窄屏时照常缩。
+        column = QWidget()
+        column.setMaximumWidth(760)
+        column_layout = QVBoxLayout(column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(14)
+        column_layout.addWidget(self.create_common_group())
+        column_layout.addWidget(self.create_ai_group())
+        column_layout.addWidget(self.create_shortcut_group())
+
+        body_layout.addWidget(column)
+        body_layout.addStretch()
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        outer.addWidget(divider)
+        outer.addWidget(self.create_action_bar())
+
+    # ==================== 分组 ====================
+
+    @staticmethod
+    def _caption(text: str) -> QLabel:
+        """行首说明列，右对齐，贴 macOS 表单习惯。"""
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return label
+
+    def create_common_group(self) -> QGroupBox:
+        """常用设置：自动保存 + 预训练模型路径
+
+        不用 QFormLayout：QMacStyle 下它的值列宽度按 sizeHint 走，长值不跟着
+        分组框伸缩，路径这类内容会过早截断。显式网格 + 列拉伸没有这个问题。
+        """
+        group = QGroupBox("常用设置")
+
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        self.auto_save_enabled = QCheckBox("标注过程中自动保存")
+        self.auto_save_enabled.setChecked(
+            self.settings.value("auto_save_enabled", True, type=bool)
+        )
+        self.auto_save_enabled.toggled.connect(self.on_auto_save_toggled)
+        grid.addWidget(self._caption("自动保存:"), 0, 0)
+        grid.addWidget(self.auto_save_enabled, 0, 1, 1, 2)
+
         self.auto_save_interval = QSpinBox()
         self.auto_save_interval.setRange(1, 60)
+        self.auto_save_interval.setSuffix(" 分钟")
         self.auto_save_interval.setValue(int(self.settings.value("auto_save_interval", 5)))
-        layout.addRow("自动保存间隔 (分钟):", self.auto_save_interval)
-        
-        # 启用自动保存
-        self.auto_save_enabled = QCheckBox("启用自动保存")
-        self.auto_save_enabled.setChecked(self.settings.value("auto_save_enabled", True, type=bool))
-        layout.addRow(self.auto_save_enabled)
-        
+        self.auto_save_interval.setEnabled(self.auto_save_enabled.isChecked())
+        self.auto_save_interval.setMaximumWidth(260)
+        self.auto_save_interval.valueChanged.connect(self.mark_dirty)
+        grid.addWidget(self._caption("保存间隔:"), 1, 0)
+        grid.addWidget(self.auto_save_interval, 1, 1, 1, 2,
+                       Qt.AlignmentFlag.AlignLeft)
+
+        self._pretrained_path_value = str(
+            self.settings.value("pretrained_path", str(DEFAULT_PRETRAINED_PATH))
+        )
+        self.pretrained_path = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
+        self._refresh_pretrained_path_display()
+        grid.addWidget(self._caption("预训练模型:"), 2, 0)
+        grid.addWidget(self.pretrained_path, 2, 1)
+
+        btn_browse = QPushButton("浏览…")
+        btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_browse.clicked.connect(
+            lambda: self.browse_path("pretrained_path", "选择预训练模型目录")
+        )
+        grid.addWidget(btn_browse, 2, 2)
+
         return group
-    
+
+    def _refresh_pretrained_path_display(self):
+        """路径可能很长：标签按可用宽度中部省略，完整路径和用途说明放 tooltip。"""
+        self.pretrained_path.setText(self._pretrained_path_value)
+        self.pretrained_path.setToolTip(
+            f"{self._pretrained_path_value}\n训练时从这个目录读取 YOLO 预训练权重（.pt 文件）。"
+        )
+
+    def create_ai_group(self) -> QGroupBox:
+        """AI 与自动标注：显示当前用的是什么，并且就地打开配置
+
+        状态值单行显示、装不下省略并给 tooltip——QMacStyle 下 QFormLayout
+        配换行标签会算错行高，文字折行后裁切、上下重叠，所以不走表单布局。
+
+        原来这里只有一句「配置入口在数据标注 → 自动标注」：用户看得到状态，
+        却要自己走到另一个页面、在工具栏里找那个按钮。现在按钮就在状态旁边，
+        点了直接开同一个配置窗口（AutoLabelDialog），关掉后状态跟着刷新。
+        """
+        group = QGroupBox("AI 与自动标注")
+
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        self.sam_status = ElidedLabel()
+        grid.addWidget(self._caption("分割模型:"), 0, 0)
+        grid.addWidget(self.sam_status, 0, 1)
+
+        self.btn_config_sam = QPushButton("配置…")
+        self.btn_config_sam.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_config_sam.setToolTip("打开自动标注配置，直接跳到 SAM 分割那一页")
+        self.btn_config_sam.clicked.connect(
+            lambda: self.auto_label_config_requested.emit('sam')
+        )
+        grid.addWidget(self.btn_config_sam, 0, 2)
+
+        self.llm_status = ElidedLabel()
+        grid.addWidget(self._caption("视觉大模型:"), 1, 0)
+        grid.addWidget(self.llm_status, 1, 1)
+
+        self.btn_config_llm = QPushButton("配置…")
+        self.btn_config_llm.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_config_llm.setToolTip("打开自动标注配置，直接跳到 LLM 视觉那一页（填 API Key）")
+        self.btn_config_llm.clicked.connect(
+            lambda: self.auto_label_config_requested.emit('llm')
+        )
+        grid.addWidget(self.btn_config_llm, 1, 2)
+
+        layout.addLayout(grid)
+
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+
+        self.btn_open_auto_label = QPushButton("打开自动标注配置")
+        self.btn_open_auto_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_auto_label.setToolTip(
+            "YOLO 预标注、SAM 分割、LLM 视觉都在这个窗口里配"
+        )
+        self.btn_open_auto_label.clicked.connect(
+            lambda: self.auto_label_config_requested.emit('')
+        )
+        btn_row.addWidget(self.btn_open_auto_label)
+
+        hint = QLabel("和「数据标注 → 自动标注」打开的是同一个配置窗口。")
+        hint.setObjectName("caption")
+        hint.setWordWrap(True)
+        btn_row.addWidget(hint, 1)
+
+        layout.addLayout(btn_row)
+
+        self.refresh_ai_status()
+        return group
+
     def create_shortcut_group(self) -> QGroupBox:
-        """创建快捷键设置组"""
-        group = QGroupBox("快捷键设置")
-        
-        layout = QFormLayout(group)
-        
-        # 重置视图快捷键
-        shortcut_layout = QHBoxLayout()
-        self.reset_view_shortcut = QLabel(self.settings.value("reset_view_shortcut", "R"))
-        self.reset_view_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        shortcut_layout.addWidget(self.reset_view_shortcut)
-        
-        btn_set_shortcut = QPushButton("设置")
-        btn_set_shortcut.clicked.connect(lambda: self.set_shortcut("reset_view_shortcut", self.reset_view_shortcut))
-        shortcut_layout.addWidget(btn_set_shortcut)
-        
-        layout.addRow("重置视图:", shortcut_layout)
-        
-        # 矩形工具快捷键
-        rect_layout = QHBoxLayout()
-        self.rect_tool_shortcut = QLabel(self.settings.value("rect_tool_shortcut", "W"))
-        self.rect_tool_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        rect_layout.addWidget(self.rect_tool_shortcut)
-        
-        btn_set_rect = QPushButton("设置")
-        btn_set_rect.clicked.connect(lambda: self.set_shortcut("rect_tool_shortcut", self.rect_tool_shortcut))
-        rect_layout.addWidget(btn_set_rect)
-        
-        layout.addRow("矩形工具:", rect_layout)
-        
-        # 多边形工具快捷键
-        poly_layout = QHBoxLayout()
-        self.poly_tool_shortcut = QLabel(self.settings.value("poly_tool_shortcut", "P"))
-        self.poly_tool_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        poly_layout.addWidget(self.poly_tool_shortcut)
-        
-        btn_set_poly = QPushButton("设置")
-        btn_set_poly.clicked.connect(lambda: self.set_shortcut("poly_tool_shortcut", self.poly_tool_shortcut))
-        poly_layout.addWidget(btn_set_poly)
-        
-        layout.addRow("多边形工具:", poly_layout)
-        
-        # 移动工具快捷键
-        move_layout = QHBoxLayout()
-        self.move_tool_shortcut = QLabel(self.settings.value("move_tool_shortcut", "V"))
-        self.move_tool_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        move_layout.addWidget(self.move_tool_shortcut)
-        
-        btn_set_move = QPushButton("设置")
-        btn_set_move.clicked.connect(lambda: self.set_shortcut("move_tool_shortcut", self.move_tool_shortcut))
-        move_layout.addWidget(btn_set_move)
-        
-        layout.addRow("移动工具:", move_layout)
-        
-        # 上一张图片快捷键
-        prev_layout = QHBoxLayout()
-        self.prev_image_shortcut = QLabel(self.settings.value("prev_image_shortcut", "A"))
-        self.prev_image_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        prev_layout.addWidget(self.prev_image_shortcut)
-        
-        btn_set_prev = QPushButton("设置")
-        btn_set_prev.clicked.connect(lambda: self.set_shortcut("prev_image_shortcut", self.prev_image_shortcut))
-        prev_layout.addWidget(btn_set_prev)
-        
-        layout.addRow("上一张图片:", prev_layout)
-        
-        # 下一张图片快捷键
-        next_layout = QHBoxLayout()
-        self.next_image_shortcut = QLabel(self.settings.value("next_image_shortcut", "D"))
-        self.next_image_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        next_layout.addWidget(self.next_image_shortcut)
-        
-        btn_set_next = QPushButton("设置")
-        btn_set_next.clicked.connect(lambda: self.set_shortcut("next_image_shortcut", self.next_image_shortcut))
-        next_layout.addWidget(btn_set_next)
-        
-        layout.addRow("下一张图片:", next_layout)
-        
-        # 删除标注快捷键
-        delete_layout = QHBoxLayout()
-        self.delete_shortcut = QLabel(self.settings.value("delete_shortcut", "DELETE"))
-        self.delete_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        delete_layout.addWidget(self.delete_shortcut)
-        
-        btn_set_delete = QPushButton("设置")
-        btn_set_delete.clicked.connect(lambda: self.set_shortcut("delete_shortcut", self.delete_shortcut))
-        delete_layout.addWidget(btn_set_delete)
-        
-        layout.addRow("删除标注:", delete_layout)
-        
+        """标注快捷键：自己一组。
+
+        原来它是「外观与其他」卡片里再套一个标题——卡片里嵌一个二级标题，
+        层级读不出来。外观那一组只剩一行「主题：浅色主题」，既改不了也不用看，
+        一并去掉；应用固定浅色这件事不需要一行常驻文字来说。
+        """
+        group = QGroupBox("标注快捷键")
+
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        shortcut_hint = QLabel("点键位修改，立即生效。")
+        shortcut_hint.setObjectName("caption")
+        shortcut_hint.setWordWrap(True)
+        layout.addWidget(shortcut_hint)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+
+        for i, (setting_key, name, default) in enumerate(SHORTCUTS):
+            row, col = divmod(i, 2)
+
+            label = QLabel(name)
+            grid.addWidget(label, row, col * 3)
+
+            button = QPushButton(str(self.settings.value(setting_key, default)))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumWidth(88)
+            button.setToolTip("点击修改快捷键")
+            button.clicked.connect(
+                lambda _checked, key=setting_key: self.set_shortcut(key)
+            )
+            grid.addWidget(button, row, col * 3 + 1)
+
+            grid.setColumnStretch(col * 3 + 2, 1)
+            self.shortcut_buttons[setting_key] = button
+
+        layout.addLayout(grid)
         return group
-    
-    def set_shortcut(self, setting_key: str, label: QLabel):
-        """设置快捷键"""
-        from PyQt6.QtWidgets import QInputDialog
-        
-        key, ok = QInputDialog.getText(self, "设置快捷键", f"请输入新的快捷键 (单个字母或数字):")
-        if ok and key:
-            # 只取第一个字符
-            new_key = key.upper()[0]
-            self.settings.setValue(setting_key, new_key)
-            label.setText(new_key)
-            QMessageBox.information(self, "设置成功", f"快捷键已设置为: {new_key}")
-    
+
+    def create_action_bar(self) -> QWidget:
+        """底部操作栏：状态说明 + 两个按钮"""
+        bar = QWidget()
+
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(24, 12, 24, 16)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel(HINT_IDLE)
+        self.status_label.setObjectName("caption")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label, 1)
+
+        self.btn_reset = QPushButton("恢复默认")
+        self.btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reset.clicked.connect(self.reset_settings)
+        layout.addWidget(self.btn_reset)
+
+        self.btn_save = QPushButton("保存设置")
+        self.btn_save.setObjectName("primary")
+        self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save.clicked.connect(self.save_settings)
+        layout.addWidget(self.btn_save)
+
+        return bar
+
+    # ==================== 状态 ====================
+
+    def showEvent(self, event):
+        """每次进设置页都重新读一次自动标注配置，显示的状态才是真的。"""
+        super().showEvent(event)
+        self.refresh_ai_status()
+
+    def refresh_ai_status(self):
+        """把自动标注当前用的模型显示出来（只读，不写配置）。"""
+        sam = read_config(SAM_CONFIG_FILE)
+        if sam:
+            model_file = sam.get("model_file") or "未指定权重"
+            self.sam_status.setText(f"{sam.get('sam_type', 'SAM')} · {model_file}")
+            self.sam_status.setStyleSheet(f"color: {COLORS['text_primary']};")
+        else:
+            self.sam_status.setText("还没配置过，首次自动标注时用默认设置")
+            self.sam_status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+        llm = read_config(LLM_CONFIG_FILE)
+        model_name = llm.get("model_name") or ""
+        if not model_name:
+            self.llm_status.setText("还没配置过")
+            self.llm_status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        elif llm.get("api_key"):
+            self.llm_status.setText(f"{model_name} · 已填写 API Key")
+            self.llm_status.setStyleSheet(f"color: {COLORS['text_primary']};")
+        else:
+            self.llm_status.setText(f"{model_name} · 还没填 API Key，用它标注前要先填")
+            self.llm_status.setStyleSheet(f"color: {COLORS['warning']};")
+
+    def set_status(self, text: str, tone: str = 'muted'):
+        """底部那行字：说清楚现在是「改了没存」还是「已经存了」。"""
+        color = {
+            'success': COLORS['success'],
+            'warning': COLORS['warning'],
+        }.get(tone, COLORS['text_secondary'])
+
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"font-size: 12px; color: {color};")
+
+    def mark_dirty(self, *_args):
+        self.set_status("有改动还没保存，点「保存设置」写入。", 'warning')
+
+    def on_auto_save_toggled(self, checked: bool):
+        self.auto_save_interval.setEnabled(checked)
+        self.mark_dirty()
+
+    # ==================== 读写 ====================
+
+    def set_shortcut(self, setting_key: str):
+        """设置快捷键（立即写入）"""
+        button = self.shortcut_buttons[setting_key]
+
+        key, ok = QInputDialog.getText(
+            self, "设置快捷键",
+            "请输入新的快捷键：\n单个字母或数字（如 W、3），"
+            "或键位名（如 DELETE、BACKSPACE、SPACE、UP）",
+            text=button.text(),
+        )
+        if not (ok and key):
+            return
+
+        new_key = normalize_shortcut(key)
+        if not new_key:
+            if "+" in key:
+                reason = "标注快捷键只收单个键，不支持组合键"
+            else:
+                reason = "不是认得的键位"
+            self.set_status(f"「{key}」{reason}，快捷键没改。", 'warning')
+            return
+
+        self.settings.setValue(setting_key, new_key)
+        button.setText(new_key)
+        self.set_status(f"快捷键已改为 {new_key}，已经生效。", 'success')
+
     def browse_path(self, setting_key: str, dialog_title: str):
         """浏览路径"""
-        from PyQt6.QtWidgets import QFileDialog
-        
         path = QFileDialog.getExistingDirectory(
-            self, dialog_title, 
+            self, dialog_title,
             self.settings.value(setting_key, ""),
             QFileDialog.Option.ShowDirsOnly
         )
-        
+
         if path:
             if setting_key == "pretrained_path":
-                self.pretrained_path.setText(path)
-    
+                self._pretrained_path_value = path
+                self._refresh_pretrained_path_display()
+                self.mark_dirty()
+
     def save_settings(self):
         """保存设置"""
-        # 保存主题
-        new_theme = self.theme_combo.currentText()
-        self.settings.setValue("theme", new_theme)
-        
-        # 发送主题变化信号
-        theme_key = 'light' if new_theme == '浅色主题' else 'dark'
-        self.theme_changed.emit(theme_key)
-        
+        # 保存主题（固定浅色）
+        self.settings.setValue("theme", THEME_NAME)
+        self.theme_changed.emit('light')
+
         # 保存路径
-        self.settings.setValue("pretrained_path", self.pretrained_path.text())
-        
+        self.settings.setValue("pretrained_path", self._pretrained_path_value)
+
         # 保存自动保存设置
         self.settings.setValue("auto_save_interval", self.auto_save_interval.value())
         self.settings.setValue("auto_save_enabled", self.auto_save_enabled.isChecked())
-        
-        QMessageBox.information(self, "保存成功", "设置已保存！")
-    
+
+        self.set_status("设置已保存。", 'success')
+
     def reset_settings(self):
         """恢复默认设置"""
-        # 恢复默认值
-        self.theme_combo.setCurrentText("深色主题")
-        from pathlib import Path
-        app_root = Path(__file__).parent.parent.parent  # 向上三级到EzYOLO根目录
-        default_pretrained_path = app_root / "pretrained"
-        self.pretrained_path.setText(str(default_pretrained_path))
-        self.auto_save_interval.setValue(5)
         self.auto_save_enabled.setChecked(True)
-        
-        # 恢复默认快捷键
-        if hasattr(self, 'reset_view_shortcut'):
-            self.reset_view_shortcut.setText("R")
-        if hasattr(self, 'rect_tool_shortcut'):
-            self.rect_tool_shortcut.setText("W")
-        if hasattr(self, 'poly_tool_shortcut'):
-            self.poly_tool_shortcut.setText("P")
-        if hasattr(self, 'move_tool_shortcut'):
-            self.move_tool_shortcut.setText("V")
-        if hasattr(self, 'prev_image_shortcut'):
-            self.prev_image_shortcut.setText("A")
-        if hasattr(self, 'next_image_shortcut'):
-            self.next_image_shortcut.setText("D")
-        if hasattr(self, 'delete_shortcut'):
-            self.delete_shortcut.setText("DELETE")
-        
-        # 保存默认快捷键设置
-        self.settings.setValue("reset_view_shortcut", "R")
-        self.settings.setValue("rect_tool_shortcut", "W")
-        self.settings.setValue("poly_tool_shortcut", "P")
-        self.settings.setValue("move_tool_shortcut", "V")
-        self.settings.setValue("prev_image_shortcut", "A")
-        self.settings.setValue("next_image_shortcut", "D")
-        self.settings.setValue("delete_shortcut", "DELETE")
-        
-        # 发送主题变化信号（默认是深色主题）
-        self.theme_changed.emit('dark')
-        
-        QMessageBox.information(self, "恢复默认", "已恢复默认设置！")
+        self.auto_save_interval.setValue(5)
+        self._pretrained_path_value = str(DEFAULT_PRETRAINED_PATH)
+        self._refresh_pretrained_path_display()
+
+        # 快捷键和别处一样：改完立即写入
+        for setting_key, _name, default in SHORTCUTS:
+            self.settings.setValue(setting_key, default)
+            self.shortcut_buttons[setting_key].setText(default)
+
+        self.theme_changed.emit('light')
+
+        self.set_status("已恢复默认值，路径和自动保存点「保存设置」后写入。", 'warning')

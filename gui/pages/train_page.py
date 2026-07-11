@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSlider, QProgressBar, QTextEdit, QSplitter,
     QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame,
     QInputDialog, QRadioButton, QListWidget, QListWidgetItem, QButtonGroup,
+    QMenu,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
 import os
@@ -14,7 +15,11 @@ import json
 import shutil
 from typing import Dict, List, Optional
 
-from gui.styles import COLORS
+from gui.styles import COLORS, mono_font_family_css
+from gui.workflow import (
+    STEP_IMPORT, STEP_ANNOTATE, STEP_RESULT,
+    get_project_snapshot,
+)
 from models.database import db
 
 UNGROUPED_GROUP_ID = 0
@@ -157,6 +162,44 @@ class NoWheelSlider(QSlider):
             super().wheelEvent(event)
         else:
             event.ignore()
+
+
+class CollapsibleSection(QWidget):
+    """默认收起的区域：点标题才展开，避免一进页面就是一堵参数墙。"""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._title = title
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.toggle = QPushButton()
+        self.toggle.setObjectName("ghost")
+        self.toggle.setCheckable(True)
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setMinimumHeight(34)
+        self.toggle.setStyleSheet("text-align: left; padding-left: 6px;")
+        self.toggle.toggled.connect(self._on_toggled)
+        layout.addWidget(self.toggle)
+
+        self.content = QWidget()
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(12)
+        self.content.setVisible(False)
+        layout.addWidget(self.content)
+
+        self._content_layout = content_layout
+        self._on_toggled(False)
+
+    def _on_toggled(self, checked: bool):
+        self.content.setVisible(checked)
+        self.toggle.setText(f"{'▾' if checked else '▸'} {self._title}")
+
+    def add_widget(self, widget: QWidget):
+        self._content_layout.addWidget(widget)
 
 
 class TrainingThread(QThread):
@@ -342,7 +385,13 @@ class TrainingThread(QThread):
                 
                 if metrics.get('map50'):
                     self.log_message.emit(f"  验证指标 - mAP50: {metrics['map50']:.4f}, mAP50-95: {metrics.get('map50_95', 0):.4f}")
-            
+
+                # 用户点了停止：让 Ultralytics 在本轮收尾后自己退出循环。
+                # 界面线程因此不需要 wait() 干等到整个训练跑完。
+                if not self._is_running:
+                    trainer.stop = True
+                    self.log_message.emit("已收到停止请求，本轮结束后停止训练")
+
             def on_fit_epoch_end(trainer):
                 """每个fit epoch结束时调用（包含验证）"""
                 pass
@@ -705,10 +754,16 @@ class TrainPage(QWidget):
         self.training_history = []
         self.settings = QSettings("EzYOLO", "Settings")
         self.training_templates = {}
-        
+
+        # 当前项目的进度事实 + 「为什么还不能训练」
+        self.snapshot = get_project_snapshot(None)
+        self.blocker = None
+        self.stop_requested = False
+        self.total_epochs = 0
+
         self.init_ui()
         self.load_training_templates()
-    
+
     def set_project(self, project_id: int):
         """设置当前项目"""
         self.current_project_id = project_id
@@ -719,31 +774,71 @@ class TrainPage(QWidget):
                 print(f"[TrainPage] 已切换到项目: {project_name} (ID: {project_id})")
         else:
             print("[TrainPage] 项目已取消选择")
-        if hasattr(self, 'refresh_split_group_lists'):
-            self.refresh_split_group_lists()
-    
+
+        self.refresh_split_group_lists()
+        # 训练进行中就别动界面状态，免得把「停止」按钮换回「开始」
+        if not self.is_training_active():
+            self.reset_ui_state()
+        self.refresh_readiness()
+
     def init_ui(self):
-        """初始化界面"""
+        """初始化界面：左边按顺序配置并开始，右边看进度、曲线和日志。"""
         main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(16)
-        
-        # 创建分割器
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # 左侧：配置面板
+        # 两侧都不许被拖没：主操作和日志任何时候都要看得见
+        splitter.setChildrenCollapsible(False)
+
         left_panel = self.create_config_panel()
+        left_panel.setMinimumWidth(380)
         splitter.addWidget(left_panel)
-        
-        # 右侧：监控面板
+
         right_panel = self.create_monitor_panel()
+        right_panel.setMinimumWidth(340)
         splitter.addWidget(right_panel)
-        
-        # 设置分割比例
-        splitter.setSizes([400, 800])
-        
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 450])
+
         main_layout.addWidget(splitter)
-    
+
+        self.connect_config_signals()
+        self.refresh_readiness()
+
+    def is_training_active(self) -> bool:
+        return self.training_thread is not None and self.training_thread.isRunning()
+
+    def goto_step(self, index: int):
+        """跳到主流程的某一步（主窗口负责真正的切换）。"""
+        window = self.window()
+        if hasattr(window, 'switch_page'):
+            window.switch_page(index)
+
+    def make_card(self, title: str, subtitle: str = "") -> tuple:
+        """一张卡片 = 一个步骤：标题 + 一句大白话 + 内容。"""
+        card = QFrame()
+        card.setObjectName("card")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel(title)
+        heading.setObjectName("h2")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        if subtitle:
+            note = QLabel(subtitle)
+            note.setObjectName("caption")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        return card, layout
+
     def _init_model_lists(self):
         """初始化型号和任务列表"""
         version = self.model_version.currentText()
@@ -769,144 +864,154 @@ class TrainPage(QWidget):
                 self.task_type.addItem(display_name, task)
     
     def create_config_panel(self) -> QWidget:
-        """创建配置面板"""
+        """左栏：① 确认数据 → ② 基础配置 → ③ 高级参数（可选）→ ④ 摘要，⑤ 开始/停止固定在底部。"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-        
-        # 标题
-        title = QLabel("训练配置")
-        title.setObjectName("title")
-        title.setStyleSheet("font-size: 20px; font-weight: bold;")
-        layout.addWidget(title)
+        layout.setSpacing(12)
 
-        template_bar = self.create_template_bar()
-        layout.addWidget(template_bar)
-        
-        # 创建滚动区域
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setSpacing(16)
-        
-        # 模型选择组
-        model_group = self.create_model_group()
-        scroll_layout.addWidget(model_group)
-        
-        # 训练参数组
-        params_group = self.create_params_group()
-        scroll_layout.addWidget(params_group)
-        
-        # 数据增强组
-        augment_group = self.create_augment_group()
-        scroll_layout.addWidget(augment_group)
-        
-        # 数据集划分组
-        split_group = self.create_split_group()
-        scroll_layout.addWidget(split_group)
-        
-        # 控制按钮组
-        control_group = self.create_control_group()
-        scroll_layout.addWidget(control_group)
-        
+
+        self.scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(self.scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 6, 0)
+        scroll_layout.setSpacing(12)
+
+        scroll_layout.addWidget(self.create_prep_card())
+        scroll_layout.addWidget(self.create_basic_card())
+        scroll_layout.addWidget(self.create_advanced_section())
+        scroll_layout.addWidget(self.create_summary_card())
         scroll_layout.addStretch()
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll)
-        
+
+        scroll.setWidget(self.scroll_content)
+        layout.addWidget(scroll, 1)
+
+        # 开始 / 停止不放进滚动区：窗口再小也不会被滚没
+        layout.addWidget(self.create_run_panel())
+
         return panel
 
-    def create_template_bar(self) -> QWidget:
-        """创建训练模板工具条。"""
-        bar = QFrame()
-        bar.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['panel']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-            }}
-        """)
-        layout = QVBoxLayout(bar)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(8)
+    def create_prep_card(self) -> QFrame:
+        """① 数据准备情况：图片、标注、类别齐了没有，缺什么、去哪补。"""
+        card, layout = self.make_card("数据准备")
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
-        top_row.addWidget(QLabel("训练模板:"))
+        self.prep_labels = {}
+        for key in ('images', 'annotated', 'classes', 'model'):
+            label = QLabel("")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            self.prep_labels[key] = label
 
-        self.template_combo = NoWheelComboBox()
-        self.template_combo.currentTextChanged.connect(self.on_template_selection_changed)
-        top_row.addWidget(self.template_combo, 1)
-        layout.addLayout(top_row)
+        self.prep_hint = QLabel("")
+        self.prep_hint.setWordWrap(True)
+        self.prep_hint.setStyleSheet(f"color: {COLORS['warning']};")
+        self.prep_hint.hide()
+        layout.addWidget(self.prep_hint)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
-        self.btn_apply_template = QPushButton("套用模板")
-        self.btn_apply_template.clicked.connect(self.apply_selected_template)
-        button_row.addWidget(self.btn_apply_template)
+        goto_row = QHBoxLayout()
+        goto_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_prep_goto = QPushButton("")
+        self.btn_prep_goto.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prep_goto.clicked.connect(self.on_prep_goto_clicked)
+        self.btn_prep_goto.hide()
+        goto_row.addWidget(self.btn_prep_goto)
+        goto_row.addStretch()
+        layout.addLayout(goto_row)
 
-        self.btn_save_template = QPushButton("保存为模板")
-        self.btn_save_template.clicked.connect(self.save_current_as_template)
-        button_row.addWidget(self.btn_save_template)
+        return card
 
-        self.btn_update_template = QPushButton("更新模板")
-        self.btn_update_template.clicked.connect(self.update_selected_template)
-        button_row.addWidget(self.btn_update_template)
+    def on_prep_goto_clicked(self):
+        """「去补上」：跳到缺东西的那一步。"""
+        if self.blocker:
+            self.goto_step(self.blocker['action_index'])
 
-        self.btn_delete_template = QPushButton("删除模板")
-        self.btn_delete_template.clicked.connect(self.delete_selected_template)
-        button_row.addWidget(self.btn_delete_template)
+    def create_basic_card(self) -> QFrame:
+        """② 基础配置：只放小白必须做的选择，其余都有默认值。"""
+        card, layout = self.make_card("基础配置")
 
-        layout.addLayout(button_row)
-        return bar
-    
-    def get_group_style(self) -> str:
-        """获取分组框样式"""
-        return f"""
-            QGroupBox {{
-                font-weight: bold;
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
-        """
-    
-    def create_model_group(self) -> QGroupBox:
-        """创建模型选择组"""
-        group = QGroupBox("模型选择")
-        group.setStyleSheet(self.get_group_style())
-        
-        layout = QFormLayout(group)
-        layout.setSpacing(10)
-        
-        # YOLO版本选择
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        # 模板行也走表单：以前它是卡片里单独一条 QHBoxLayout，标签列和字段列
+        # 都比下面的表单窄一截，六行控件的左边缘对不上一条线
+        form.addRow("训练模板:", self.create_template_row())
+
         self.model_version = NoWheelComboBox()
         self.model_version.addItems(sorted(ULTRALYTICS_MODELS.keys()))
+        self.model_version.setToolTip("YOLO 的版本。不清楚选哪个就用默认的。")
         self.model_version.currentTextChanged.connect(self.on_version_changed)
-        layout.addRow("版本:", self.model_version)
-        
-        # 模型型号选择
+        form.addRow("YOLO 版本:", self.model_version)
+
         self.model_size = NoWheelComboBox()
-        layout.addRow("型号:", self.model_size)
-        
-        # 任务类型
+        self.model_size.setToolTip("模型越大越准，但训练更慢、更吃显存。第一次建议用 nano。")
+        form.addRow("模型大小:", self.model_size)
+
         self.task_type = NoWheelComboBox()
-        layout.addRow("任务:", self.task_type)
-        
-        # 立即初始化型号和任务列表
+        self.task_type.setToolTip("要和你的标注方式对上：画框选「目标检测」，描轮廓选「实例分割」。")
+        form.addRow("任务类型:", self.task_type)
+
+        # 型号和任务列表依赖版本，先建好三个下拉再填
         self._init_model_lists()
-        
-        return group
-    
+
+        self.epochs = NoWheelSpinBox()
+        self.epochs.setRange(1, 1000)
+        self.epochs.setValue(100)
+        self.epochs.setToolTip("模型把所有训练图片反复看多少遍。轮数越多越慢，也不是越多越好。")
+        form.addRow("训练轮数:", self.epochs)
+
+        self.device = NoWheelComboBox()
+        self.device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
+        self.device.setToolTip("自动选择：有 NVIDIA 显卡就用显卡，没有就用 CPU（会慢很多）。")
+        form.addRow("计算设备:", self.device)
+
+        layout.addLayout(form)
+
+        return card
+
+    def create_template_row(self) -> QWidget:
+        """训练模板：一行「选择 + 套用」，增删改收进菜单，不在页面上堆四个同级按钮。"""
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.template_combo = NoWheelComboBox()
+        self.template_combo.setToolTip("把一套调好的参数存下来，下次直接套用。")
+        self.template_combo.currentTextChanged.connect(self.on_template_selection_changed)
+        row.addWidget(self.template_combo, 1)
+
+        self.btn_apply_template = QPushButton("套用")
+        self.btn_apply_template.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_template.clicked.connect(self.apply_selected_template)
+        row.addWidget(self.btn_apply_template)
+
+        # 文案里不再自己写 ▾：挂了菜单的按钮，Qt 会再画一个箭头，写死一个就成了双箭头
+        self.btn_template_menu = QPushButton("管理")
+        self.btn_template_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = QMenu(self.btn_template_menu)
+        self.action_save_template = menu.addAction("把当前参数保存为模板…")
+        self.action_save_template.triggered.connect(self.save_current_as_template)
+        self.action_update_template = menu.addAction("用当前参数更新所选模板")
+        self.action_update_template.triggered.connect(self.update_selected_template)
+        self.action_delete_template = menu.addAction("删除所选模板")
+        self.action_delete_template.triggered.connect(self.delete_selected_template)
+        self.btn_template_menu.setMenu(menu)
+        row.addWidget(self.btn_template_menu)
+
+        return holder
+
+    def create_advanced_section(self) -> QWidget:
+        """③ 高级参数：默认收起。"""
+        section = CollapsibleSection("高级参数")
+        section.add_widget(self.create_params_group())
+        section.add_widget(self.create_augment_group())
+        section.add_widget(self.create_split_group())
+        self.advanced_section = section
+        return section
+
     def on_version_changed(self, version: str):
         """版本改变时更新型号和任务"""
         if not version or version not in ULTRALYTICS_MODELS:
@@ -933,67 +1038,60 @@ class TrainPage(QWidget):
             return
     
     def create_params_group(self) -> QGroupBox:
-        """创建训练参数组"""
-        group = QGroupBox("训练参数")
-        group.setStyleSheet(self.get_group_style())
-        
+        """训练细节：影响明显，所以收在高级里，默认值适合大多数情况。"""
+        group = QGroupBox("训练细节")
+
         layout = QFormLayout(group)
         layout.setSpacing(10)
-        
-        # Epochs
-        self.epochs = NoWheelSpinBox()
-        self.epochs.setRange(1, 1000)
-        self.epochs.setValue(100)
-        layout.addRow("Epochs:", self.epochs)
-        
+        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
         # Batch Size
         self.batch_size = NoWheelSpinBox()
         self.batch_size.setRange(1, 128)
         self.batch_size.setValue(16)
-        layout.addRow("Batch Size:", self.batch_size)
-        
+        self.batch_size.setToolTip("一次同时看多少张图。显存不够（日志里报 out of memory）就往小调：16 → 8 → 4。")
+        layout.addRow("批大小:", self.batch_size)
+
         # Image Size
         self.img_size = NoWheelSpinBox()
         self.img_size.setRange(320, 1280)
         self.img_size.setValue(640)
         self.img_size.setSingleStep(32)
-        layout.addRow("Image Size:", self.img_size)
-        
+        self.img_size.setToolTip("训练时把图片统一缩放到这个大小。越大越慢；要认的东西很小可以调大。")
+        layout.addRow("图片尺寸:", self.img_size)
+
         # Learning Rate
         self.lr = NoWheelDoubleSpinBox()
         self.lr.setRange(0.0001, 0.1)
         self.lr.setValue(0.01)
         self.lr.setDecimals(4)
         self.lr.setSingleStep(0.001)
-        layout.addRow("Learning Rate:", self.lr)
-        
+        self.lr.setToolTip("模型每一步调整的幅度。没有把握就别改。")
+        layout.addRow("学习率:", self.lr)
+
         # Optimizer
         self.optimizer = NoWheelComboBox()
         self.optimizer.addItems(["SGD", "Adam", "AdamW", "LION"])
-        layout.addRow("Optimizer:", self.optimizer)
-        
-        # Device
-        self.device = NoWheelComboBox()
-        self.device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
-        layout.addRow("Device:", self.device)
-        
+        self.optimizer.setToolTip("模型的「调参策略」。默认 SGD 最稳。")
+        layout.addRow("优化器:", self.optimizer)
+
         # Workers
         self.workers = NoWheelSpinBox()
         self.workers.setRange(0, 32)
         self.workers.setValue(4)
         self.workers.setSingleStep(1)
-        layout.addRow("Workers:", self.workers)
-        
+        self.workers.setToolTip("读图片的并行线程数。Windows 上如果训练一开始就卡住，可以设为 0。")
+        layout.addRow("数据加载线程:", self.workers)
+
         return group
-    
+
     def create_augment_group(self) -> QGroupBox:
         """创建数据增强组"""
         group = QGroupBox("数据增强")
-        group.setStyleSheet(self.get_group_style())
-        
+
         layout = QFormLayout(group)
         layout.setSpacing(10)
-        
+
         # Mosaic
         self.mosaic = QCheckBox("启用 Mosaic 增强")
         self.mosaic.setChecked(True)
@@ -1028,8 +1126,7 @@ class TrainPage(QWidget):
     def create_split_group(self) -> QGroupBox:
         """创建数据集划分组"""
         group = QGroupBox("数据集划分")
-        group.setStyleSheet(self.get_group_style())
-        
+
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -1053,6 +1150,7 @@ class TrainPage(QWidget):
         self.train_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.train_split.setRange(50, 95)
         self.train_split.setValue(80)
+        self.train_split.setMinimumWidth(120)
         self.train_split.valueChanged.connect(self.on_split_changed)
         self.train_label = QLabel("80%")
         split_layout = QHBoxLayout()
@@ -1064,6 +1162,7 @@ class TrainPage(QWidget):
         self.val_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.val_split.setRange(5, 30)
         self.val_split.setValue(10)
+        self.val_split.setMinimumWidth(120)
         self.val_split.valueChanged.connect(self.on_split_changed)
         self.val_label = QLabel("10%")
         split_layout = QHBoxLayout()
@@ -1075,6 +1174,7 @@ class TrainPage(QWidget):
         self.test_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.test_split.setRange(0, 20)
         self.test_split.setValue(10)
+        self.test_split.setMinimumWidth(120)
         self.test_split.valueChanged.connect(self.on_split_changed)
         self.test_label = QLabel("10%")
         split_layout = QHBoxLayout()
@@ -1084,6 +1184,7 @@ class TrainPage(QWidget):
         
         # 总和提示
         self.split_warning = QLabel("")
+        self.split_warning.setWordWrap(True)
         self.split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
         ratio_layout.addRow(self.split_warning)
         layout.addWidget(self.ratio_split_widget)
@@ -1105,6 +1206,7 @@ class TrainPage(QWidget):
         group_layout.addRow("测试集分组:", self.test_group_list)
 
         self.group_split_warning = QLabel("")
+        self.group_split_warning.setWordWrap(True)
         self.group_split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
         group_layout.addRow(self.group_split_warning)
 
@@ -1119,6 +1221,7 @@ class TrainPage(QWidget):
 
     def _create_group_check_list(self) -> QListWidget:
         widget = QListWidget()
+        widget.itemChanged.connect(self.on_group_selection_changed)
         widget.setMaximumHeight(110)
         widget.setStyleSheet(f"""
             QListWidget {{
@@ -1139,6 +1242,20 @@ class TrainPage(QWidget):
         self.group_split_widget.setVisible(use_groups)
         if use_groups:
             self.refresh_split_group_lists()
+        self.update_group_split_warning()
+        self.update_summary()
+
+    def on_group_selection_changed(self, _item: QListWidgetItem):
+        """勾选分组时立刻回报问题，别等到点了开始才报错。"""
+        self.update_group_split_warning()
+        self.update_summary()
+
+    def update_group_split_warning(self):
+        if not hasattr(self, 'group_split_warning') or not self.split_mode_groups.isChecked():
+            return
+        # 只做不查库的快速检查，勾一下就查一次图片数会卡
+        error = self._validate_group_split_selection(check_images=False)
+        self.group_split_warning.setText(f"⚠️ {error}" if error else "")
 
     def refresh_split_group_lists(self):
         """刷新按分组划分时的分组列表。"""
@@ -1194,7 +1311,7 @@ class TrainPage(QWidget):
                 group_ids.append(item.data(Qt.ItemDataRole.UserRole))
         return group_ids
 
-    def _validate_group_split_selection(self) -> Optional[str]:
+    def _validate_group_split_selection(self, check_images: bool = True) -> Optional[str]:
         train_ids = self._get_checked_group_ids(self.train_group_list)
         val_ids = self._get_checked_group_ids(self.val_group_list)
         test_ids = self._get_checked_group_ids(self.test_group_list)
@@ -1212,7 +1329,7 @@ class TrainPage(QWidget):
             if overlap:
                 return f"{name_a}与{name_b}选择了重复的分组，请调整"
 
-        if self.current_project_id:
+        if check_images and self.current_project_id:
             train_count = len(db.get_project_images_by_groups(self.current_project_id, train_ids))
             val_count = len(db.get_project_images_by_groups(self.current_project_id, val_ids))
             if train_count == 0:
@@ -1221,79 +1338,280 @@ class TrainPage(QWidget):
                 return "验证集所选分组中没有图片"
 
         return None
-    
+
     def on_split_changed(self):
         """数据集划分改变"""
         train = self.train_split.value()
         val = self.val_split.value()
         test = self.test_split.value()
-        
+
         self.train_label.setText(f"{train}%")
         self.val_label.setText(f"{val}%")
         self.test_label.setText(f"{test}%")
-        
+
         total = train + val + test
         if total != 100:
             self.split_warning.setText(f"⚠️ 总和为 {total}%，应为 100%")
         else:
             self.split_warning.setText("")
+
+        self.update_summary()
     
-    def create_control_group(self) -> QGroupBox:
-        """创建控制按钮组"""
-        group = QGroupBox("训练控制")
-        group.setStyleSheet(self.get_group_style())
-        
-        layout = QVBoxLayout(group)
-        layout.setSpacing(10)
-        
-        # 进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: {COLORS['sidebar']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 4px;
-                text-align: center;
-                color: white;
-                height: 20px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {COLORS['primary']};
-                border-radius: 3px;
-            }}
-        """)
-        layout.addWidget(self.progress_bar)
-        
-        # 状态标签
-        self.status_label = QLabel("就绪")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+    def create_summary_card(self) -> QFrame:
+        """④ 训练摘要：开始前把这次要跑的东西用人话摆出来。"""
+        card, layout = self.make_card("训练摘要")
+
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        return card
+
+    def update_summary(self):
+        """把当前表单翻译成几行人话。"""
+        if not hasattr(self, 'summary_label'):
+            return
+
+        if self.split_mode_groups.isChecked():
+            split_text = (
+                f"按分组指定 · 训练 {len(self._get_checked_group_ids(self.train_group_list))} 组 / "
+                f"验证 {len(self._get_checked_group_ids(self.val_group_list))} 组 / "
+                f"测试 {len(self._get_checked_group_ids(self.test_group_list))} 组"
+            )
+        else:
+            split_text = (
+                f"按比例随机划分 · 训练 {self.train_split.value()}% / "
+                f"验证 {self.val_split.value()}% / 测试 {self.test_split.value()}%"
+            )
+
+        augments = []
+        if self.mosaic.isChecked():
+            augments.append("Mosaic")
+        if self.mixup.isChecked():
+            augments.append("MixUp")
+        if self.flip.isChecked():
+            augments.append("水平翻转")
+        if self.rotate.isChecked():
+            augments.append("随机旋转")
+        if self.hsv.isChecked():
+            augments.append(f"HSV {self.hsv_strength.value()}%")
+
+        lines = [
+            f"模型：{self.model_version.currentText()} · "
+            f"{self.model_size.currentText() or '-'} · {self.task_type.currentText() or '-'}",
+            f"训练轮数：{self.epochs.value()} 轮　　计算设备：{self.device.currentText()}",
+            f"数据划分：{split_text}",
+            f"数据增强：{'、'.join(augments) if augments else '全部关闭'}",
+            f"其他：批大小 {self.batch_size.value()} · 图片尺寸 {self.img_size.value()} · "
+            f"学习率 {self.lr.value():.4f} · 优化器 {self.optimizer.currentText()} · "
+            f"加载线程 {self.workers.value()}",
+        ]
+        self.summary_label.setText("\n".join(lines))
+
+    def connect_config_signals(self):
+        """任何配置改动都要反映到摘要里，否则摘要就是骗人的。"""
+        for combo in (self.model_version, self.model_size, self.task_type,
+                      self.optimizer, self.device):
+            combo.currentIndexChanged.connect(self.update_summary)
+
+        for spin in (self.epochs, self.batch_size, self.img_size, self.workers):
+            spin.valueChanged.connect(self.update_summary)
+        self.lr.valueChanged.connect(self.update_summary)
+
+        for check in (self.mosaic, self.mixup, self.flip, self.rotate, self.hsv):
+            check.toggled.connect(self.update_summary)
+        self.hsv_strength.valueChanged.connect(self.update_summary)
+
+    def create_run_panel(self) -> QFrame:
+        """⑤ 开始 / 停止 / 完成后去哪。固定在左栏底部，永远看得见。"""
+        card, layout = self.make_card("开始训练")
+
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.status_label)
-        
-        # 按钮布局
-        btn_layout = QHBoxLayout()
-        
-        # 开始按钮
-        self.btn_start = QPushButton("▶ 开始训练")
-        self.btn_start.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {COLORS['success']};
-                color: white;
-                font-weight: bold;
-                padding: 12px 30px;
-                font-size: 14px;
-            }}
-        """)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.btn_start = QPushButton("开始训练")
+        self.btn_start.setObjectName("primary")
+        self.btn_start.setMinimumHeight(40)
+        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start.clicked.connect(self.start_training)
-        btn_layout.addWidget(self.btn_start)
-        
-        # 居中布局
-        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        layout.addLayout(btn_layout)
-        
-        return group
+        layout.addWidget(self.btn_start)
+
+        # 训练中才出现，和「开始」互斥，不和别的按钮挤在一排
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setObjectName("danger")
+        self.btn_stop.setMinimumHeight(40)
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setToolTip("会在当前这一轮跑完后停下。已经跑完的轮次仍然保留。")
+        self.btn_stop.clicked.connect(self.stop_training)
+        self.btn_stop.hide()
+        layout.addWidget(self.btn_stop)
+
+        # 训练完成后出现：模型在哪、下一步去哪
+        self.done_label = QLabel("")
+        self.done_label.setWordWrap(True)
+        self.done_label.hide()
+        layout.addWidget(self.done_label)
+
+        done_row = QHBoxLayout()
+        done_row.setContentsMargins(0, 0, 0, 0)
+        done_row.setSpacing(8)
+
+        self.btn_goto_result = QPushButton("查看训练结果")
+        self.btn_goto_result.setObjectName("primary")
+        self.btn_goto_result.setMinimumHeight(36)
+        self.btn_goto_result.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_goto_result.clicked.connect(lambda: self.goto_step(STEP_RESULT))
+        self.btn_goto_result.hide()
+        done_row.addWidget(self.btn_goto_result, 1)
+
+        self.btn_train_again = QPushButton("再训练一次")
+        self.btn_train_again.setMinimumHeight(36)
+        self.btn_train_again.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_train_again.clicked.connect(self.reset_ui_state)
+        self.btn_train_again.hide()
+        done_row.addWidget(self.btn_train_again)
+
+        layout.addLayout(done_row)
+
+        return card
+
+    def set_status(self, text: str, color: str = None):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color or COLORS['text_secondary']};")
+
+    def show_done_panel(self):
+        """训练完成：说清楚产出在哪、下一步该去哪。"""
+        weights = self.snapshot.get('weights')
+        lines = ["✓ 训练完成。"]
+        if weights:
+            # 绝对路径可能很长，省略中段显示，完整路径放进 tooltip，避免硬换行截断
+            metrics = self.done_label.fontMetrics()
+            elided = metrics.elidedText(str(weights), Qt.TextElideMode.ElideMiddle, 320)
+            lines.append(f"模型权重（best.pt）：{elided}")
+            self.done_label.setToolTip(str(weights))
+        else:
+            self.done_label.setToolTip("")
+        lines.append("下一步：到「4. 结果分析」看曲线和指标；确认可用后再去「5. 模型测试」拿新图片试。")
+        self.done_label.setText("\n".join(lines))
+
+        # 完成后主操作变成「查看训练结果」，所以开始按钮先让位
+        self.btn_start.hide()
+        self.done_label.show()
+        self.btn_goto_result.show()
+        self.btn_train_again.show()
+
+    def hide_done_panel(self):
+        self.done_label.hide()
+        self.btn_goto_result.hide()
+        self.btn_train_again.hide()
+
+    def refresh_readiness(self):
+        """重新读项目事实，回答「现在能不能训练」，不能就说清缺什么、去哪补。"""
+        self.snapshot = get_project_snapshot(self.current_project_id)
+
+        images = self.snapshot.get('image_count', 0)
+        annotated = self.snapshot.get('annotated_count', 0)
+        classes = self.snapshot.get('class_count', 0)
+        weights = self.snapshot.get('weights')
+
+        ok = COLORS['success']
+        bad = COLORS['error']
+        muted = COLORS['text_secondary']
+
+        if not self.current_project_id:
+            self.set_prep_row('images', "✗ 还没有选择项目", bad)
+            self.set_prep_row('annotated', "标注情况：等选好项目再看", muted)
+            self.set_prep_row('classes', "类别情况：等选好项目再看", muted)
+            self.set_prep_row('model', "", muted)
+            self.blocker = {
+                'reason': "还没有选择项目。先在左上角选一个，或去「1. 数据导入」新建。",
+                'action_text': "去数据导入",
+                'action_index': STEP_IMPORT,
+            }
+        else:
+            if images:
+                self.set_prep_row('images', f"✓ 已导入 {images} 张图片", ok)
+            else:
+                self.set_prep_row('images', "✗ 项目里还没有图片", bad)
+
+            if annotated == 0:
+                self.set_prep_row('annotated', "✗ 一张标注也没有，模型没有可学的材料", bad)
+            elif annotated < images:
+                self.set_prep_row(
+                    'annotated',
+                    f"✓ 已标注 {annotated}/{images} 张",
+                    ok,
+                    tooltip=f"没标注的那 {images - annotated} 张也会送去训练，当成「里面没有目标」的背景图。",
+                )
+            else:
+                self.set_prep_row('annotated', f"✓ {images} 张图片全部标注完成", ok)
+
+            if classes:
+                self.set_prep_row('classes', f"✓ 已设置 {classes} 个类别", ok)
+            else:
+                self.set_prep_row('classes', "✗ 还没有类别，模型不知道要认什么", bad)
+
+            if weights:
+                self.set_prep_row(
+                    'model',
+                    "· 再次训练会覆盖上一次的结果目录（runs/train/exp_"
+                    f"{self.current_project_id}）。",
+                    muted,
+                )
+            else:
+                self.set_prep_row('model', "", muted)
+
+            if images == 0:
+                self.blocker = {
+                    'reason': "项目里还没有图片，去「1. 数据导入」导入。",
+                    'action_text': "去导入图片",
+                    'action_index': STEP_IMPORT,
+                }
+            elif annotated == 0:
+                self.blocker = {
+                    'reason': "还没有标注，去「2. 数据标注」标注几张图片。",
+                    'action_text': "去标注图片",
+                    'action_index': STEP_ANNOTATE,
+                }
+            elif classes == 0:
+                self.blocker = {
+                    'reason': "还没有设置类别，去「2. 数据标注」添加类别。",
+                    'action_text': "去添加类别",
+                    'action_index': STEP_ANNOTATE,
+                }
+            else:
+                self.blocker = None
+
+        if self.blocker:
+            self.prep_hint.setText(self.blocker['reason'])
+            self.prep_hint.show()
+            self.btn_prep_goto.setText(self.blocker['action_text'])
+            self.btn_prep_goto.show()
+        else:
+            self.prep_hint.hide()
+            self.btn_prep_goto.hide()
+
+        if not self.is_training_active():
+            self.btn_start.setEnabled(self.blocker is None)
+            self.btn_start.setToolTip(
+                self.blocker['reason'] if self.blocker else "用上面的配置开始训练"
+            )
+
+        self.update_summary()
+
+    def set_prep_row(self, key: str, text: str, color: str, tooltip: str = ""):
+        label = self.prep_labels[key]
+        label.setText(text)
+        label.setVisible(bool(text))
+        label.setStyleSheet(f"color: {color};")
+        label.setToolTip(tooltip)
 
     def load_training_templates(self):
         """加载全局训练模板。"""
@@ -1342,8 +1660,8 @@ class TrainPage(QWidget):
         current_name = self.template_combo.currentText() if hasattr(self, "template_combo") else NO_TEMPLATE_OPTION
         has_template = current_name in self.training_templates
         self.btn_apply_template.setEnabled(has_template)
-        self.btn_update_template.setEnabled(has_template)
-        self.btn_delete_template.setEnabled(has_template)
+        self.action_update_template.setEnabled(has_template)
+        self.action_delete_template.setEnabled(has_template)
 
     def collect_training_form_config(self) -> dict:
         """收集当前表单配置。"""
@@ -1450,6 +1768,9 @@ class TrainPage(QWidget):
         _apply_checks(self.train_group_list, config.get('train_group_ids'))
         _apply_checks(self.val_group_list, config.get('val_group_ids'))
         _apply_checks(self.test_group_list, config.get('test_group_ids'))
+
+        self.update_group_split_warning()
+        self.update_summary()
         return True
 
     def save_current_as_template(self):
@@ -1592,54 +1913,23 @@ class TrainPage(QWidget):
         }
     
     def create_monitor_panel(self) -> QWidget:
-        """创建监控面板"""
+        """右栏：训练过程中发生了什么。"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-        
-        # 标题
-        title = QLabel("训练监控")
+        layout.setSpacing(10)
+
+        title = QLabel("训练过程")
         title.setObjectName("title")
-        title.setStyleSheet("font-size: 20px; font-weight: bold;")
         layout.addWidget(title)
-        
-        # 标签页
-        tabs = QTabWidget()
-        tabs.setStyleSheet(f"""
-            QTabWidget::pane {{
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-                background-color: {COLORS['panel']};
-            }}
-            QTabBar::tab {{
-                background-color: {COLORS['sidebar']};
-                color: {COLORS['text_secondary']};
-                padding: 8px 16px;
-                margin-right: 4px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }}
-            QTabBar::tab:selected {{
-                background-color: {COLORS['primary']};
-                color: white;
-            }}
-        """)
-        
-        # 损失曲线标签页
-        loss_tab = self.create_loss_tab()
-        tabs.addTab(loss_tab, "📉 损失曲线")
-        
-        # mAP曲线标签页
-        map_tab = self.create_map_tab()
-        tabs.addTab(map_tab, "📈 mAP曲线")
-        
-        # 日志标签页
-        log_tab = self.create_log_tab()
-        tabs.addTab(log_tab, "📝 训练日志")
-        
-        layout.addWidget(tabs)
-        
+
+        self.monitor_tabs = QTabWidget()
+        self.monitor_tabs.addTab(self.create_loss_tab(), "损失曲线")
+        self.monitor_tabs.addTab(self.create_map_tab(), "mAP 曲线")
+        self.log_tab_index = self.monitor_tabs.addTab(self.create_log_tab(), "训练日志")
+
+        layout.addWidget(self.monitor_tabs, 1)
+
         return panel
     
     def create_loss_tab(self) -> QWidget:
@@ -1660,23 +1950,23 @@ class TrainPage(QWidget):
         self.loss_ax.set_xlabel('Epoch', color=COLORS['text_primary'])
         self.loss_ax.set_ylabel('Loss', color=COLORS['text_primary'])
         self.loss_ax.tick_params(colors=COLORS['text_primary'])
-        self.loss_ax.grid(True, alpha=0.3)
-        
+        for spine in self.loss_ax.spines.values():
+            spine.set_color(COLORS['border'])
+        self.loss_ax.grid(True, alpha=0.3, color=COLORS['border'])
+
         # 初始化空曲线
         self.loss_lines = {
-            'box': self.loss_ax.plot([], [], 'b-', label='Box Loss', linewidth=2)[0],
-            'cls': self.loss_ax.plot([], [], 'r-', label='Cls Loss', linewidth=2)[0],
-            'dfl': self.loss_ax.plot([], [], 'g-', label='DFL Loss', linewidth=2)[0],
+            'box': self.loss_ax.plot([], [], color=COLORS['primary'], label='Box Loss', linewidth=2)[0],
+            'cls': self.loss_ax.plot([], [], color=COLORS['error_fill'], label='Cls Loss', linewidth=2)[0],
+            'dfl': self.loss_ax.plot([], [], color=COLORS['success_fill'], label='DFL Loss', linewidth=2)[0],
         }
-        # 设置标签颜色为白色
-        self.loss_ax.legend(loc='upper right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor='white')
-        # 设置坐标轴文字颜色为白色
-        self.loss_ax.xaxis.label.set_color('white')
-        self.loss_ax.yaxis.label.set_color('white')
-        # 设置刻度文字颜色为白色
-        self.loss_ax.tick_params(axis='x', colors='white')
-        self.loss_ax.tick_params(axis='y', colors='white')
-        
+        # 图例、坐标轴文字、刻度统一用主文字色，浅色背景下才看得清（不能再写死白色）
+        self.loss_ax.legend(loc='upper right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor=COLORS['text_primary'])
+        self.loss_ax.xaxis.label.set_color(COLORS['text_primary'])
+        self.loss_ax.yaxis.label.set_color(COLORS['text_primary'])
+        self.loss_ax.tick_params(axis='x', colors=COLORS['text_primary'])
+        self.loss_ax.tick_params(axis='y', colors=COLORS['text_primary'])
+
         return tab
     
     def create_map_tab(self) -> QWidget:
@@ -1697,23 +1987,23 @@ class TrainPage(QWidget):
         self.map_ax.set_xlabel('Epoch', color=COLORS['text_primary'])
         self.map_ax.set_ylabel('mAP', color=COLORS['text_primary'])
         self.map_ax.tick_params(colors=COLORS['text_primary'])
-        self.map_ax.grid(True, alpha=0.3)
+        for spine in self.map_ax.spines.values():
+            spine.set_color(COLORS['border'])
+        self.map_ax.grid(True, alpha=0.3, color=COLORS['border'])
         self.map_ax.set_ylim(0, 1)
-        
+
         # 初始化空曲线
         self.map_lines = {
-            'map50': self.map_ax.plot([], [], 'b-', label='mAP50', linewidth=2)[0],
-            'map50_95': self.map_ax.plot([], [], 'r-', label='mAP50-95', linewidth=2)[0],
+            'map50': self.map_ax.plot([], [], color=COLORS['primary'], label='mAP50', linewidth=2)[0],
+            'map50_95': self.map_ax.plot([], [], color=COLORS['error_fill'], label='mAP50-95', linewidth=2)[0],
         }
-        # 设置标签颜色为白色
-        self.map_ax.legend(loc='lower right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor='white')
-        # 设置坐标轴文字颜色为白色
-        self.map_ax.xaxis.label.set_color('white')
-        self.map_ax.yaxis.label.set_color('white')
-        # 设置刻度文字颜色为白色
-        self.map_ax.tick_params(axis='x', colors='white')
-        self.map_ax.tick_params(axis='y', colors='white')
-        
+        # 图例、坐标轴文字、刻度统一用主文字色，浅色背景下才看得清（不能再写死白色）
+        self.map_ax.legend(loc='lower right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor=COLORS['text_primary'])
+        self.map_ax.xaxis.label.set_color(COLORS['text_primary'])
+        self.map_ax.yaxis.label.set_color(COLORS['text_primary'])
+        self.map_ax.tick_params(axis='x', colors=COLORS['text_primary'])
+        self.map_ax.tick_params(axis='y', colors=COLORS['text_primary'])
+
         return tab
     
     def create_log_tab(self) -> QWidget:
@@ -1724,6 +2014,7 @@ class TrainPage(QWidget):
         # 日志文本框
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        mono = mono_font_family_css()
         self.log_text.setStyleSheet(f"""
             QTextEdit {{
                 background-color: {COLORS['sidebar']};
@@ -1731,7 +2022,7 @@ class TrainPage(QWidget):
                 border: 1px solid {COLORS['border']};
                 border-radius: 6px;
                 padding: 10px;
-                font-family: 'Consolas', 'Monaco', monospace;
+                {f'font-family: {mono};' if mono else ''}
                 font-size: 12px;
             }}
         """)
@@ -1740,11 +2031,11 @@ class TrainPage(QWidget):
         # 日志按钮
         btn_layout = QHBoxLayout()
         
-        self.btn_clear_log = QPushButton("🗑 清空日志")
+        self.btn_clear_log = QPushButton("清空")
         self.btn_clear_log.clicked.connect(self.clear_log)
         btn_layout.addWidget(self.btn_clear_log)
-        
-        self.btn_save_log = QPushButton("💾 保存日志")
+
+        self.btn_save_log = QPushButton("保存")
         self.btn_save_log.clicked.connect(self.save_log)
         btn_layout.addWidget(self.btn_save_log)
         
@@ -1755,9 +2046,10 @@ class TrainPage(QWidget):
     
     def start_training(self):
         """开始训练"""
-        # 检查是否选择了项目
-        if not self.current_project_id:
-            QMessageBox.warning(self, "错误", "请先选择一个项目")
+        # 前置条件：项目、图片、标注、类别，缺一样就说清楚缺什么
+        self.refresh_readiness()
+        if self.blocker:
+            QMessageBox.warning(self, "还不能开始训练", self.blocker['reason'])
             return
 
         form_config = self.maybe_confirm_template_before_training()
@@ -1778,16 +2070,6 @@ class TrainPage(QWidget):
                 QMessageBox.warning(self, "配置错误", "数据集划分比例总和必须等于100%")
                 return
 
-        project = db.get_project(self.current_project_id)
-        if project:
-            classes = json.loads(project.get('classes') or '[]')
-            if not classes:
-                QMessageBox.warning(
-                    self, "配置错误",
-                    "项目未设置类别，请先在标注页添加任务类别后再训练"
-                )
-                return
-
         config = self.build_training_runtime_config(form_config)
         if not config:
             QMessageBox.warning(self, "错误", "请选择有效的模型版本和型号")
@@ -1796,14 +2078,14 @@ class TrainPage(QWidget):
         version = config['version']
         model_size = config['model_size']
         task = config['task']
-        
+
         # 清空历史
         self.training_history = []
         self.log_text.clear()
-        
+
         # 清空曲线数据
         self.clear_plots()
-        
+
         # 创建训练线程
         self.training_thread = TrainingThread(config, self.current_project_id)
         self.training_thread.epoch_started.connect(self.on_epoch_started)
@@ -1812,61 +2094,87 @@ class TrainPage(QWidget):
         self.training_thread.training_finished.connect(self.on_training_finished)
         self.training_thread.log_message.connect(self.on_log_message)
         self.training_thread.metrics_updated.connect(self.on_metrics_updated)
-        
-        # 更新UI状态
-        self.btn_start.setEnabled(False)
+
+        # 更新UI状态：开始让位给停止，配置区锁住（改了也不会生效，别让人误会）
+        self.stop_requested = False
+        self.total_epochs = config['epochs']
+        self.hide_done_panel()
+        self.scroll_content.setEnabled(False)
+        self.btn_start.hide()
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.show()
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(config['epochs'])
         self.progress_bar.setValue(0)
-        self.status_label.setText("训练中...")
-        self.status_label.setStyleSheet(f"color: {COLORS['primary']}; font-size: 12px;")
-        
+        self.set_status(
+            "正在准备数据、加载模型…第一轮开始前要复制图片，可能要等一会。",
+            COLORS['accent_text'],
+        )
+
+        # 曲线要等第一轮跑完才有数据，先让用户看到日志在动
+        self.monitor_tabs.setCurrentIndex(self.log_tab_index)
+
         # 启动训练
         self.training_thread.start()
-        
+
         self.log_message("=" * 50)
         self.log_message("训练开始！")
         self.log_message(f"模型: {version} {model_size} ({task})")
         self.log_message(f"Epochs: {config['epochs']}, Batch: {config['batch_size']}")
         self.log_message("=" * 50)
-    
-    def pause_training(self):
-        """暂停/恢复训练"""
-        if self.training_thread:
-            if self.btn_pause.text() == "⏸ 暂停":
-                self.training_thread.pause()
-                self.btn_pause.setText("▶ 继续")
-                self.status_label.setText("已暂停")
-                self.status_label.setStyleSheet(f"color: {COLORS['warning']}; font-size: 12px;")
-            else:
-                self.training_thread.resume()
-                self.btn_pause.setText("⏸ 暂停")
-                self.status_label.setText("训练中...")
-                self.status_label.setStyleSheet(f"color: {COLORS['primary']}; font-size: 12px;")
-    
+
     def stop_training(self):
-        """停止训练"""
-        if self.training_thread:
-            self.training_thread.stop()
-            self.training_thread.wait()
-        
-        self.reset_ui_state()
-        self.log_message("训练已停止")
-    
+        """停止训练：只发请求，不阻塞界面。"""
+        if not self.is_training_active():
+            self.reset_ui_state()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "停止训练",
+            "确定要停止这次训练吗？\n\n"
+            "会在当前这一轮跑完后停下（可能还要等几分钟）。\n"
+            "已经跑完的轮次会保留在 runs 目录里，但这次训练不会再继续。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.stop_requested = True
+        self.training_thread.stop()
+        self.btn_stop.setEnabled(False)
+        self.set_status("正在停止…当前这一轮跑完就会停下。", COLORS['warning'])
+        self.log_message("已请求停止训练，等待当前轮次结束…")
+
     def reset_ui_state(self):
-        """重置UI状态"""
-        self.btn_start.setEnabled(True)
+        """回到「可以开始训练」的样子。"""
+        self.hide_done_panel()
+        self.btn_stop.hide()
+        self.btn_start.show()
+        self.btn_start.setEnabled(self.blocker is None)
         self.progress_bar.setVisible(False)
-        self.status_label.setText("就绪")
-        self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
-    
+        self.scroll_content.setEnabled(True)
+        self.set_status("准备就绪")
+
     def on_epoch_started(self, epoch: int, total: int):
         """Epoch开始"""
+        self.total_epochs = total
+        self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(epoch - 1)
-        self.status_label.setText(f"训练中... Epoch {epoch}/{total}")
-    
+        if self.stop_requested:
+            return
+        self.set_status(f"训练中… 第 {epoch}/{total} 轮", COLORS['accent_text'])
+
     def on_epoch_finished(self, epoch: int, metrics: dict):
         """Epoch完成"""
+        self.progress_bar.setValue(epoch)
+        if not self.stop_requested:
+            text = f"训练中… 已完成 {epoch}/{self.total_epochs} 轮"
+            if metrics.get('map50'):
+                text += f"，当前 mAP50 {metrics['map50']:.3f}"
+            self.set_status(text, COLORS['accent_text'])
+
         # 确保所有指标值都是标量
         def to_scalar(value):
             import torch
@@ -1945,13 +2253,33 @@ class TrainPage(QWidget):
         pass
     
     def on_training_finished(self, success: bool, message: str):
-        """训练完成"""
-        self.reset_ui_state()
-        
+        """训练结束：完成、被停止、或者失败。"""
+        self.btn_stop.hide()
+        self.progress_bar.setVisible(False)
+        self.scroll_content.setEnabled(True)
+
         if success:
+            # 重新读一次项目事实，才知道模型落在哪里
+            self.refresh_readiness()
+            self.set_status("训练完成", COLORS['success'])
+            self.show_done_panel()
             QMessageBox.information(self, "训练完成", message)
+            return
+
+        self.reset_ui_state()
+
+        if self.stop_requested:
+            self.set_status("已停止训练", COLORS['warning'])
+            QMessageBox.information(
+                self, "已停止训练",
+                "训练已停止。已经跑完的轮次结果保留在 runs 目录里，随时可以重新开始一次训练。"
+            )
         else:
-            QMessageBox.warning(self, "训练结束", message)
+            self.set_status("训练失败，看右边的训练日志找原因", COLORS['error'])
+            QMessageBox.warning(
+                self, "训练没能完成",
+                f"{message}\n\n右边「训练日志」里有完整报错，可以保存下来再排查。"
+            )
     
     def on_log_message(self, message: str):
         """日志消息"""
