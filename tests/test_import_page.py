@@ -1413,6 +1413,47 @@ def test_stale_preview_results_never_land_on_the_current_project():
     db.delete_project(project_b)
 
 
+def test_thumbnail_loading_does_not_dismiss_the_annotation_import_overlay():
+    """「正在导入标注…」的遮罩只能由标注导入自己收尾，缩略图线程不许代劳。
+
+    导入 YOLO / COCO / VOC 标注的过程里会重建缩略图列表，缩略图加载线程先跑完，
+    以前就顺手把这个遮罩删了——用户看到的是提示刚亮起来就没了，而标注其实还在导；
+    这个遮罩也是唯一挡住重复点击的东西。
+    """
+    from gui.widgets.loading_dialog import LoadingOverlay
+
+    project_id = _make_box_project()
+    paths = _make_images(_TMP_DIR / "overlay_owner", 2)
+    for path in paths:
+        db.add_image(project_id, Path(path).name, path, width=32, height=32)
+
+    page = _loaded_page(project_id)
+
+    # 标注导入起手做的就是这两句（见 import_yolo_annotations）
+    page.loading_overlay = LoadingOverlay(page, "正在导入YOLO标注...")
+    page.loading_overlay.show_loading()
+
+    # 让缩略图真的再读一遍盘：底图还在缓存里的话根本不会起线程，也就测不到
+    page.thumbnail_cache.clear()
+    page.force_refresh_images()
+    assert page.load_worker is not None, "前提没成立：缩略图加载线程没起来"
+
+    _settle_thumbnails(page)
+
+    assert hasattr(page, 'loading_overlay'), "缩略图加载完成把标注导入的遮罩删掉了"
+    assert not page.loading_overlay.isHidden(), "遮罩还在，却已经被缩略图线程隐藏了"
+
+    # 反过来也要守住：标注导入真的完成时，遮罩必须被收掉，不能漏收
+    with _silent_dialogs():
+        page.on_annotation_import_finished(True, "导入成功", 3, 0)
+    _settle_thumbnails(page)
+
+    assert not hasattr(page, 'loading_overlay'), "标注导入完成后遮罩没有被收掉"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
 def test_selected_item_text_stays_dark_under_fusion():
     """Fusion 下选中一张图，格子里的文件名不能变成白字、直接消失。
 
