@@ -810,6 +810,33 @@ QMenu::separator {{
     margin: 4px 8px;
 }}
 
+/* 自动标注这类「选一个操作」的菜单（objectName = actionMenu）。
+   默认的 QMenu 是给命令列表用的：一行 20 出头像素、裸文字，点开像系统临时弹层，
+   而这里每一项的份量差得很远——「设置」只是打开一个窗口，「批量标注…」会跑一整批。
+   所以行高抬到 40px、图标 16px 各就各位、文字左对齐；hover 只用浅蓝底，
+   靠 1px 边框分层，不加厚阴影。 */
+QMenu#actionMenu {{
+    background-color: {c['panel']};
+    border: 1px solid {c['border_strong']};
+    border-radius: {RADIUS_SM}px;
+    padding: 6px;
+}}
+
+QMenu#actionMenu::item {{
+    min-height: 40px;
+    padding: 0px 24px 0px 8px;
+    border-radius: 6px;
+}}
+
+QMenu#actionMenu::item:selected {{
+    background-color: {c['selected']};
+    color: {c['text_primary']};
+}}
+
+QMenu#actionMenu::icon {{
+    padding-left: 12px;
+}}
+
 /* ---------- 分组框 ---------- */
 /* 标题整行落在卡片外面（margin 区），不再骑在边框线上。
    原来 margin-top 只有 14px，标题盒子比它高，边框就从字的下半截穿过去——
