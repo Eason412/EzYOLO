@@ -1246,10 +1246,13 @@ def _seed_light_image(project_id, folder: Path, name: str, size=(40, 20)) -> str
 
 
 def test_annotation_previews_are_read_off_the_gui_thread():
-    """600 张图的框 + 版本号：各查一次，而且是在后台线程里查的。
+    """600 张图的框 + 版本号：一次读快照读回来，而且是在后台线程里读的。
 
-    这两次查询压在 GUI 线程上时，打开一个大项目就是「界面先僵一下」。查完之前
+    这两条查询压在 GUI 线程上时，打开一个大项目就是「界面先僵一下」。查完之前
     列表必须已经建好、能滚动——所以查询发出去的那一刻，主线程手上还没有任何框。
+
+    后台只准走 get_project_bbox_preview_snapshot：分两次调那两个老 API 会各拿一个
+    读快照，中途有人挪框就会读到「旧框 + 新版本号」（见 tests/test_bbox_preview_snapshot.py）。
     """
     project_id = _make_box_project()
     _seed_boxed_images(project_id, _BIG_COUNT)
@@ -1257,21 +1260,30 @@ def test_annotation_previews_are_read_off_the_gui_thread():
     page = _page_with_cached_thumbnails(project_id)
 
     reader_threads = []
-    real_bboxes = database_module.Database.get_project_bbox_previews
-    real_versions = database_module.Database.get_project_annotation_versions
+    split_reads = []
+    real_snapshot = database_module.Database.get_project_bbox_preview_snapshot
 
-    def traced_bboxes(self, pid):
+    def traced_snapshot(self, pid):
         reader_threads.append(threading.current_thread().ident)
-        return real_bboxes(self, pid)
+        return real_snapshot(self, pid)
 
-    def traced_versions(self, pid):
-        reader_threads.append(threading.current_thread().ident)
-        return real_versions(self, pid)
+    def traced_split_read(name, real):
+        # 只记账不抛错：在后台线程里抛异常只会让信号发不出来，测试卡在超时上，
+        # 看不出真正的原因
+        def traced(self, pid):
+            split_reads.append(name)
+            return real(self, pid)
+        return traced
 
     statements = []
     with _traced_sql(statements), \
-         patch.object(database_module.Database, "get_project_bbox_previews", traced_bboxes), \
-         patch.object(database_module.Database, "get_project_annotation_versions", traced_versions):
+         patch.object(database_module.Database, "get_project_bbox_preview_snapshot", traced_snapshot), \
+         patch.object(database_module.Database, "get_project_bbox_previews",
+                      traced_split_read("get_project_bbox_previews",
+                                        database_module.Database.get_project_bbox_previews)), \
+         patch.object(database_module.Database, "get_project_annotation_versions",
+                      traced_split_read("get_project_annotation_versions",
+                                        database_module.Database.get_project_annotation_versions)):
         page.set_project(project_id)
 
         # set_project 返回的这一刻：600 个格子已经在了，框还在后台查
@@ -1287,6 +1299,7 @@ def test_annotation_previews_are_read_off_the_gui_thread():
     assert reader_threads, "根本没去查框"
     assert all(ident != main_ident for ident in reader_threads), \
         "框 / 版本号是在 GUI 线程里查的"
+    assert not split_reads, f"后台没走原子快照，而是分开读了：{split_reads}"
 
     annotation_selects = [s for s in statements if 'FROM annotations' in s]
     assert len(annotation_selects) == 2, (

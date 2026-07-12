@@ -708,6 +708,44 @@ class Database:
                 annotations.append(ann)
             return annotations
     
+    def _read_bbox_previews(self, cursor, project_id: int) -> Dict[int, List[Dict]]:
+        """在给定 cursor 上读框。调用方负责事务边界。"""
+        cursor.execute("""
+            SELECT image_id, class_id, data
+            FROM annotations
+            WHERE project_id = ? AND type = 'bbox'
+            ORDER BY image_id, id
+        """, (project_id,))
+
+        previews: Dict[int, List[Dict]] = {}
+        for row in cursor.fetchall():
+            try:
+                data = json.loads(row['data'])
+            except (TypeError, ValueError):
+                continue  # 坏掉的一条标注不该让整页缩略图画不出来
+            previews.setdefault(row['image_id'], []).append({
+                'type': 'bbox',
+                'class_id': row['class_id'],
+                'data': data,
+            })
+        return previews
+
+    def _read_annotation_versions(self, cursor, project_id: int) -> Dict[int, Tuple[int, int, str]]:
+        """在给定 cursor 上读版本号。调用方负责事务边界。"""
+        cursor.execute("""
+            SELECT image_id,
+                   COUNT(*) AS box_count,
+                   MAX(id) AS max_id,
+                   MAX(COALESCE(updated_at, created_at)) AS last_changed
+            FROM annotations
+            WHERE project_id = ?
+            GROUP BY image_id
+        """, (project_id,))
+        return {
+            row['image_id']: (row['box_count'], row['max_id'], row['last_changed'])
+            for row in cursor.fetchall()
+        }
+
     def get_project_bbox_previews(self, project_id: int) -> Dict[int, List[Dict]]:
         """整个项目的 bbox，一次查完，按 image_id 分好组。
 
@@ -718,26 +756,7 @@ class Database:
         只返回 bbox；缩略图预览不画多边形和关键点。
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT image_id, class_id, data
-                FROM annotations
-                WHERE project_id = ? AND type = 'bbox'
-                ORDER BY image_id, id
-            """, (project_id,))
-
-            previews: Dict[int, List[Dict]] = {}
-            for row in cursor.fetchall():
-                try:
-                    data = json.loads(row['data'])
-                except (TypeError, ValueError):
-                    continue  # 坏掉的一条标注不该让整页缩略图画不出来
-                previews.setdefault(row['image_id'], []).append({
-                    'type': 'bbox',
-                    'class_id': row['class_id'],
-                    'data': data,
-                })
-            return previews
+            return self._read_bbox_previews(conn.cursor(), project_id)
 
     def get_project_annotation_versions(self, project_id: int) -> Dict[int, Tuple[int, int, str]]:
         """每张图的标注版本号：(框数, 最大标注 id, 最近改动时间)，同样只查一次。
@@ -752,20 +771,28 @@ class Database:
         改完框图片还是 annotated，界面永远不刷新。
         """
         with self.get_connection() as conn:
+            return self._read_annotation_versions(conn.cursor(), project_id)
+
+    def get_project_bbox_preview_snapshot(
+        self, project_id: int
+    ) -> Tuple[Dict[int, List[Dict]], Dict[int, Tuple[int, int, str]]]:
+        """框和版本号必须来自同一个读快照，所以只能一起读。
+
+        分两次调 get_project_bbox_previews / get_project_annotation_versions 会各开
+        一条连接、各拿一个快照：sqlite 默认对 SELECT 不开事务。中间只要有人挪了一
+        个框，读到的就是「旧框 + 新版本号」——缩略图按新版本号缓存住旧框，从此再也
+        不会失效，框在界面上永远停在旧位置。
+
+        显式 BEGIN 把两条 SELECT 圈进同一个读事务：第一条 SELECT 定下快照，第二条
+        看到的还是它。旧框配旧版本号，下一轮刷新照样能发现版本变了、把它换掉。
+        """
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT image_id,
-                       COUNT(*) AS box_count,
-                       MAX(id) AS max_id,
-                       MAX(COALESCE(updated_at, created_at)) AS last_changed
-                FROM annotations
-                WHERE project_id = ?
-                GROUP BY image_id
-            """, (project_id,))
-            return {
-                row['image_id']: (row['box_count'], row['max_id'], row['last_changed'])
-                for row in cursor.fetchall()
-            }
+            cursor.execute("BEGIN")  # 没有它，两条 SELECT 各自 autocommit，各看各的库
+            return (
+                self._read_bbox_previews(cursor, project_id),
+                self._read_annotation_versions(cursor, project_id),
+            )
 
     def delete_annotation(self, annotation_id: int) -> bool:
         """删除标注"""
