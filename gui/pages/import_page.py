@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable
 import os
 
-from gui.styles import COLORS
+from gui.styles import COLORS, set_menu_indicator
 from gui.display_names import display_name, display_names
 from gui.thumbnail_overlay import bbox_preview_boxes, draw_boxes_on_thumbnail
 from models.database import db
@@ -371,9 +371,10 @@ class ImportPage(QWidget):
 
         layout = QHBoxLayout(toolbar)
         layout.setContentsMargins(14, 10, 14, 10)
-        # 4 而不是 6：加了「显示标注框」之后，1100px（支持的最窄窗口）下右边这一排
-        # 差十几个像素就要开始切「任务：目标检测」的字。收紧 2px × 9 个间隙正好补上。
-        layout.setSpacing(4)
+        # 2 而不是 4：统一箭头视觉后下拉框的箭头专用区变宽（padding-right 28→34），
+        # 1100px（支持的最窄窗口）下右边这一排又要开始切「任务：目标检测」的字，
+        # 再收紧 2px × 9 个间隙补上。
+        layout.setSpacing(2)
 
         # 主操作：绝大多数人是导入一个文件夹
         self.btn_import_folder = QPushButton("导入文件夹")
@@ -450,21 +451,18 @@ class ImportPage(QWidget):
         return toolbar
 
     def create_manage_button(self) -> QToolButton:
-        """「管理 ▾」：不常用的和会删东西的都收在这里。
+        """「管理」：不常用的和会删东西的都收在这里。
 
         破坏性的两个（清空图片、删除项目）单独放在一段里，前面一个红点——
         Qt 的菜单项没法单独染色（QAction 不是控件，样式表选不中它），
         图标是唯一能把「这一条会删东西」标出来的位置。
         """
         self.btn_manage = QToolButton()
-        self.btn_manage.setText("管理 ▾")
+        self.btn_manage.setText("管理")
         self.btn_manage.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.btn_manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.btn_manage.setToolTip("移动分组、删除图片、删除项目")
-        # 文字里已经有 ▾ 了，别让 Qt 再画一个自带的箭头
-        self.btn_manage.setStyleSheet("""
-            QToolButton::menu-indicator { image: none; width: 0px; }
-        """)
+        set_menu_indicator(self.btn_manage)
 
         self.manage_menu = QMenu(self)
 
