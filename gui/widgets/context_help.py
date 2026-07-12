@@ -79,7 +79,7 @@ class ContextHelp(QFrame):
                 border: none;
                 border-radius: {RADIUS_SM}px;
                 text-align: left;
-                padding: 6px 10px;
+                padding: 9px 10px;
             }}
             QPushButton#contextHelpToggle:hover {{
                 background-color: {COLORS['hover']};
@@ -102,7 +102,7 @@ class ContextHelp(QFrame):
 
         row.addStretch(1)
 
-        self._chevron = _icon_label("chevron_down.svg", 12)
+        self._chevron = _icon_label("chevron_down.svg", 16)
         row.addWidget(self._chevron)
 
         outer.addWidget(self.toggle)
@@ -122,7 +122,7 @@ class ContextHelp(QFrame):
     def _on_toggled(self, checked: bool):
         self.content.setVisible(checked)
         self._chevron.setPixmap(
-            _svg_pixmap("chevron_up.svg" if checked else "chevron_down.svg", 12)
+            _svg_pixmap("chevron_up.svg" if checked else "chevron_down.svg", 16)
         )
 
     def set_steps(self, steps, risk_steps=None):

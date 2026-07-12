@@ -190,16 +190,16 @@ def test_annotate_tool_menu_arrows_have_roles_and_space():
         assert 'QToolButton::menu-indicator' in draw_style
         assert 'chevron_down.svg' in draw_style
         assert 'chevron_down_disabled.svg' in draw_style
-        assert 'width: 24px;' in draw_style
-        assert 'width: 12px;' in draw_style
+        assert 'width: 34px;' in draw_style
+        assert 'width: 16px;' in draw_style
         assert 'background-color: #FFFFFF;' in draw_style
 
         assert 'QToolButton::menu-arrow' in delete_style
         assert 'QToolButton::menu-indicator' in delete_style
         assert 'chevron_down_red.svg' in delete_style
         assert 'chevron_down_disabled.svg' in delete_style
-        assert 'width: 24px;' in delete_style
-        assert 'width: 12px;' in delete_style
+        assert 'width: 34px;' in delete_style
+        assert 'width: 16px;' in delete_style
 
         for button in (annotate.btn_draw_tool, annotate.btn_delete):
             assert button.width() >= button.minimumSizeHint().width()

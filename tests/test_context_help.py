@@ -117,6 +117,32 @@ def test_toggle_is_focusable():
     help_widget.close()
 
 
+def test_toggle_row_hit_area_is_at_least_32px_tall():
+    help_widget = ContextHelp(STEPS)
+    help_widget.show()
+    _settle()
+    assert help_widget.toggle.sizeHint().height() >= 32, (
+        f"整行开关的可点击高度只有 {help_widget.toggle.sizeHint().height()}px，不足 32px"
+    )
+    help_widget.close()
+
+
+def test_chevron_icon_is_16px_collapsed_and_expanded():
+    help_widget = ContextHelp(STEPS)
+    help_widget.show()
+    _settle()
+
+    collapsed_pixmap = help_widget._chevron.pixmap()
+    assert collapsed_pixmap.width() == 16 and collapsed_pixmap.height() == 16
+
+    QTest.mouseClick(help_widget.toggle, Qt.MouseButton.LeftButton)
+    _settle()
+    expanded_pixmap = help_widget._chevron.pixmap()
+    assert expanded_pixmap.width() == 16 and expanded_pixmap.height() == 16
+
+    help_widget.close()
+
+
 def test_steps_are_numbered_in_order():
     help_widget = ContextHelp(STEPS)
     help_widget.set_expanded(True)
