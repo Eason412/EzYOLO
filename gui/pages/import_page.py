@@ -1277,7 +1277,13 @@ class ImportPage(QWidget):
         self.progress_bar.setValue(current)
 
     def on_load_finished(self, generation: int, on_finished: Callable[[], None] = None):
-        """加载完成回调"""
+        """加载完成回调。
+
+        只收自己这条线的尾：进度条是缩略图加载的，收掉；loading_overlay 不是——
+        那是「正在导入 YOLO/COCO/VOC 标注」的遮罩，由 on_annotation_import_finished
+        收。缩略图加载在标注导入期间本来就会被触发（导入完要重建列表），以前这里
+        顺手把它删掉，用户看到的就是「导入提示刚亮起来就没了」，而标注其实还在导。
+        """
         if generation != self._image_load_generation:
             return
         worker = self.load_worker
@@ -1289,11 +1295,6 @@ class ImportPage(QWidget):
             # 真正结束，避免它在还在运行时被 GC 掉。
             worker.wait()
         self.progress_bar.setVisible(False)
-
-        if hasattr(self, 'loading_overlay'):
-            self.loading_overlay.hide_loading()
-            self.loading_overlay.deleteLater()
-            delattr(self, 'loading_overlay')
 
         if on_finished:
             on_finished()
