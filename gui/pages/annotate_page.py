@@ -21,6 +21,9 @@ import copy
 from gui.pages.auto_label_dialog import AutoLabelDialog
 from gui.pages.batch_process_dialog import BatchProcessDialog
 from gui.pages.settings_page import event_matches_shortcut
+from gui.widgets.batch_confirm_dialog import (
+    BatchPlan, SCOPE_ALL, SCOPE_RANGE, SCOPE_UNLABELED, confirm_batch_plan,
+)
 from core.auto_labeler import BatchLabelingManager
 from core.model_manager import ModelManager
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect, QEvent
@@ -2599,10 +2602,16 @@ class AnnotatePage(QWidget):
         self.llm_worker = None
         self.llm_batch_worker = None
         self._retired_llm_workers = []
-        self.llm_batch_progress = None
         self.llm_batch_total = 0
         self.llm_batch_added = 0
-        self.llm_batch_class_id = 0
+
+        # 批量标注（YOLO / LLM 共用这一组状态）。
+        # 正在跑的那份快照留在这儿：写库时读它，不读 self.current_project_id ——
+        # 用户完全可能在跑批的时候切到别的项目去，那时页面上的 current_project_id
+        # 已经是另一个项目了，照它写就会把标注写进错的项目。
+        self._active_batch_plan = None
+        self._batch_running = False
+        self._batch_status_text = ""
 
         self.init_ui()
 
@@ -3556,18 +3565,16 @@ class AnnotatePage(QWidget):
 
         # 已有 YOLO 权重 → 自动画框
         self.btn_auto_label = QPushButton("用已有模型标注")
-        self.btn_auto_label.setToolTip("用一个已经训练好的 .pt 模型自动标注\n菜单：设置 / 单张推理 / 批量推理")
-        self.btn_auto_label.setMenu(self.create_auto_label_menu())
-        set_menu_indicator(self.btn_auto_label)
+        self.btn_auto_label.setToolTip("用一个已经训练好的 .pt 模型自动标注\n菜单：设置 / 标注当前图片 / 批量标注…")
+        self._attach_action_menu(self.btn_auto_label, self.create_auto_label_menu())
 
         # SAM：点一下就分割（文本和菜单由 apply_sam_button_mode 按设置决定）
         self.btn_sam = QPushButton("SAM")
 
         # 多模态大模型
         self.btn_llm_label = QPushButton("大模型标注")
-        self.btn_llm_label.setToolTip("用多模态大模型识别图片里的目标\n菜单：单张推理 / 批量推理")
-        self.btn_llm_label.setMenu(self.create_llm_menu())
-        set_menu_indicator(self.btn_llm_label)
+        self.btn_llm_label.setToolTip("用多模态大模型识别图片里的目标\n菜单：设置 / 标注当前图片 / 批量标注…")
+        self._attach_action_menu(self.btn_llm_label, self.create_llm_menu())
 
         # 批处理不在这里：它不是「让模型帮你标」，是按像素点批量改图，
         # 归到下面的样本管理（进阶）里，见 _create_sample_group
@@ -3678,37 +3685,83 @@ class AnnotatePage(QWidget):
 
         return export_group
     
+    def _new_action_menu(self) -> QMenu:
+        """「选一个操作」用的菜单外壳：40px 行高、16px 图标、浅色 hover。
+
+        样式挂在 objectName 上（见 gui/styles.py 的 QMenu#actionMenu），
+        不在这里写一次性样式表。
+        """
+        menu = QMenu(self)
+        menu.setObjectName("actionMenu")
+        return menu
+
+    def _attach_action_menu(self, button: QPushButton, menu: QMenu):
+        """把菜单挂到按钮上，并保证菜单不比按钮窄。
+
+        菜单比入口按钮还窄的话，看着就像点歪了弹出来的系统菜单，而不是这个按钮
+        本身展开的操作列表。宽度要等按钮真的布局完才知道，所以推迟到弹出前再量。
+        """
+        menu.aboutToShow.connect(
+            lambda m=menu, b=button: m.setMinimumWidth(max(m.minimumWidth(), b.width()))
+        )
+        button.setMenu(menu)
+        set_menu_indicator(button)
+
     def create_auto_label_menu(self) -> QMenu:
-        """创建自动标注下拉菜单"""
-        menu = QMenu()
-        
-        # 设置选项
-        action_settings = menu.addAction("设置")
+        """「用已有模型标注」的操作菜单。
+
+        三项的份量完全不同，所以文字和图标都要把这件事说清楚：
+        「设置」只是打开一个窗口；「标注当前图片」当场跑一张；
+        「批量标注…」——省略号是承诺后面还有一步——会动到一整批图片，
+        点它只会打开确认框，绝不会直接开跑。
+        """
+        menu = self._new_action_menu()
+
+        action_settings = menu.addAction(_asset_icon("action_settings.svg"), "设置")
+        action_settings.setToolTip("选择模型、置信度、IoU 和覆盖规则")
         action_settings.triggered.connect(self.show_auto_label_settings)
 
-        # 单张推理选项
-        action_single = menu.addAction("单张推理")
+        action_single = menu.addAction(_asset_icon("action_single.svg"), "标注当前图片")
+        action_single.setToolTip("只处理当前这一张，立刻执行")
         action_single.triggered.connect(self.run_single_inference)
 
-        # 批量推理选项
-        action_batch = menu.addAction("批量推理")
+        action_batch = menu.addAction(_asset_icon("action_batch.svg"), "批量标注…")
+        action_batch.setToolTip("先显示范围和参数，确认后才开始")
         action_batch.triggered.connect(self.run_batch_inference)
-        
+
+        self.auto_label_actions = {
+            'settings': action_settings,
+            'single': action_single,
+            'batch': action_batch,
+        }
         return menu
-    
+
     def create_llm_menu(self) -> QMenu:
-        """创建LLM自动标注下拉菜单"""
-        menu = QMenu()
-        
-        # 单张推理选项
-        action_single = menu.addAction("单张推理")
+        """大模型标注的操作菜单：和 YOLO 那个一模一样的三项，不让人重新学一遍。"""
+        menu = self._new_action_menu()
+
+        action_settings = menu.addAction(_asset_icon("action_settings.svg"), "设置")
+        action_settings.setToolTip("填 API Key、模型名和提示词")
+        action_settings.triggered.connect(self.show_llm_settings)
+
+        action_single = menu.addAction(_asset_icon("action_single.svg"), "标注当前图片")
+        action_single.setToolTip("只处理当前这一张，立刻执行")
         action_single.triggered.connect(self.run_llm_single_inference)
 
-        # 批量推理选项
-        action_batch = menu.addAction("批量推理")
+        action_batch = menu.addAction(_asset_icon("action_batch.svg"), "批量标注…")
+        action_batch.setToolTip("先显示范围和参数，确认后才开始")
         action_batch.triggered.connect(self.run_llm_batch_inference)
-        
+
+        self.llm_actions = {
+            'settings': action_settings,
+            'single': action_single,
+            'batch': action_batch,
+        }
         return menu
+
+    def show_llm_settings(self):
+        """打开自动标注设置，直接落在 LLM 那一页。"""
+        self.open_auto_label_config('llm')
     
     def create_status_bar(self) -> QFrame:
         """创建状态栏：图片、进度、类别、工具和临时批处理状态。"""
@@ -3768,6 +3821,20 @@ class AnnotatePage(QWidget):
         self.status_batch.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._register_elided_label(self.status_batch)
         layout.addWidget(self.status_batch, 1)
+
+        # 批量任务的取消入口就挂在进度文字旁边，只在跑着的时候露出来。
+        # 不用模态的 QProgressDialog：那东西会把整个页面按住，用户连切去看看
+        # 设置都做不到，而批量推理恰恰是最该让人边跑边干别的事的地方。
+        self.btn_cancel_batch = QPushButton("取消")
+        self.btn_cancel_batch.setObjectName("ghost")
+        self.btn_cancel_batch.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_cancel_batch.setStyleSheet(
+            "QPushButton#ghost { padding: 1px 8px; min-height: 0px; font-size: 12px; }"
+        )
+        self.btn_cancel_batch.setFixedHeight(24)
+        self.btn_cancel_batch.setVisible(False)
+        self.btn_cancel_batch.clicked.connect(self.cancel_active_batch)
+        layout.addWidget(self.btn_cancel_batch)
 
         # 快捷键表以前是一整条常驻文字，窗口一窄就被切断；现在收进这个按钮的提示里
         self.btn_shortcut_help = QPushButton("快捷键")
@@ -3898,10 +3965,13 @@ class AnnotatePage(QWidget):
         if hasattr(self, 'btn_undo'):
             self.btn_undo.setEnabled(has_image and self.history_index >= 0)
 
-        # AI 入口只要求有项目：它们的菜单里还有「设置」和「批量推理」，
+        # AI 入口只要求有项目：它们的菜单里还有「设置」和「批量标注…」，
         # 没选图片也该点得开；只对当前图片生效的那些，处理函数自己会提示先选图片。
+        # 但正在跑一批的时候一律关掉：这是防重复启动的一环，而且 update_status_bar
+        # 会反复调到这里，不带上 _batch_running 的话刚禁掉的按钮转头又被打开了。
+        batch_running = getattr(self, '_batch_running', False)
         for button in getattr(self, 'ai_action_buttons', []):
-            button.setEnabled(has_project)
+            button.setEnabled(has_project and not batch_running)
 
         if hasattr(self, 'btn_add_class'):
             self.btn_add_class.setEnabled(has_project)
@@ -4445,6 +4515,80 @@ class AnnotatePage(QWidget):
         if box.clickedButton() is not config_btn:
             return False
         return self.open_auto_label_config(section)
+
+    # ==================== 批量标注：状态、取消、前置条件 ====================
+
+    def _refresh_batch_status(self):
+        """把批量任务的状态写回状态栏。
+
+        单独一个方法，是因为 update_status_bar / set_project / 切页回来都会经过
+        状态栏刷新——它们必须重画这一格，而不是把它清空。
+        """
+        self._set_elided_text(self.status_batch, self._batch_status_text)
+        self.btn_cancel_batch.setVisible(self._batch_running)
+
+    def _set_batch_status(self, text: str, running: bool):
+        self._batch_status_text = text
+        self._batch_running = running
+        self._refresh_batch_status()
+        self._update_action_availability()
+
+    def _batch_in_progress(self) -> bool:
+        """现在有没有一批在跑（YOLO 或 LLM 都算）。
+
+        防双击的第一层：页面这边先拦一道。第二层在 BatchLabelingManager 里，
+        因为「确认之后、线程真正起来之前」还有一个窗口期，光看 isRunning() 拦不住。
+        """
+        if self._batch_running:
+            return True
+        manager = self.batch_labeling_manager
+        if manager is not None and manager.is_running():
+            return True
+        if self.llm_batch_worker is not None and self.llm_batch_worker.isRunning():
+            return True
+        return False
+
+    def cancel_active_batch(self):
+        """取消正在跑的这一批：只发请求，界面线程不等它退出。"""
+        self.btn_cancel_batch.setEnabled(False)
+        self._set_batch_status("正在取消…", True)
+
+        manager = self.batch_labeling_manager
+        if manager is not None and manager.is_running():
+            manager.request_cancel()
+
+        if self.llm_batch_worker is not None and self.llm_batch_worker.isRunning():
+            self.llm_batch_worker.cancel()
+
+    def _finish_batch_ui(self):
+        """一批跑完（或被取消）之后，把界面收回常态。"""
+        self._active_batch_plan = None
+        self.btn_cancel_batch.setEnabled(True)
+        self._set_batch_status("", False)
+
+    def _require_yolo_settings(self) -> Optional[dict]:
+        """拿到用户保存过的 YOLO 设置；没有就把设置页打开，让他先选个模型。
+
+        以前没有设置时会悄悄退回 "yolov8n"。那不是一个无害的默认值：
+        ultralytics 拿到这个名字会去联网下载一个 COCO 通用模型，然后把它认识的
+        80 个类别（人、车、猫……）写进用户的标注里——而用户的项目类别可能是
+        「安全帽」。宁可拦下来让他选，也不能替他决定要跑哪个模型。
+        """
+        settings = getattr(self, 'auto_label_settings', None)
+        if settings and settings.get('model_path'):
+            return settings
+
+        if not self._offer_auto_label_config(
+            "还没有配置模型",
+            "自动标注要先在「YOLO 检测」里选好模型和推理参数。",
+            'yolo',
+        ):
+            return None
+
+        settings = getattr(self, 'auto_label_settings', None)
+        if not settings or not settings.get('model_path'):
+            return None
+        return settings
 
     @staticmethod
     def _load_llm_config() -> dict:
@@ -5182,36 +5326,31 @@ class AnnotatePage(QWidget):
         return inside
     
     def run_single_inference(self):
-        """运行单张图像推理"""
+        """标注当前图片：单张不弹二次确认，直接跑——但模型必须是用户自己选过的。"""
         if not self.current_image_data:
             QMessageBox.warning(self, "提示", "请先选择一张图片")
             return
-        
+
+        # 没有保存过设置就不能开跑：宁可把设置页推到用户面前，也不能拿一个
+        # 他没选过的模型去写他的标注。这一步必须在加载动画之前，否则设置窗口
+        # 会开在一块「正在推理…」的遮罩后面。
+        settings = self._require_yolo_settings()
+        if not settings:
+            return
+
+        model_path = settings['model_path']
+        model_task = settings.get('model_task', 'detect')
+        conf_threshold = settings.get('conf_threshold', 0.5)
+        iou_threshold = settings.get('iou_threshold', 0.45)
+        class_mapping = settings.get('class_mapping', {})
+        overwrite_labels = settings.get('overwrite_labels', False)
+
         # 显示加载动画
-        self.show_loading_animation("正在进行单张推理...")
-        
-        # 使用保存的参数或默认参数运行推理
+        self.show_loading_animation("正在标注当前图片...")
+
         try:
             from core.auto_labeler import AutoLabeler
-            
-            # 获取模型参数（优先使用保存的参数）
-            if hasattr(self, 'auto_label_settings'):
-                settings = self.auto_label_settings
-                model_path = settings.get('model_path', "yolov8n")
-                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
-                conf_threshold = settings.get('conf_threshold', 0.5)
-                iou_threshold = settings.get('iou_threshold', 0.45)
-                class_mapping = settings.get('class_mapping', {})
-                overwrite_labels = settings.get('overwrite_labels', False)
-            else:
-                # 默认模型参数
-                model_path = "yolov8n"
-                model_task = 'detect'
-                conf_threshold = 0.5
-                iou_threshold = 0.45
-                class_mapping = {}
-                overwrite_labels = False
-            
+
             # 使用process_single_image方法，支持model_task
             labeler = AutoLabeler(model_path, self.model_manager)
             
@@ -5312,58 +5451,88 @@ class AnnotatePage(QWidget):
             # 隐藏加载动画
             self.hide_loading_animation()
     
+    def _build_yolo_batch_plan(self, settings: dict) -> Optional[BatchPlan]:
+        """把「保存过的 YOLO 设置 + 当前图片列表」冻成一份计划快照。"""
+        only_unlabeled = settings.get('only_unlabeled', True)
+        if only_unlabeled:
+            # status 可能是 None 或空字符串（老数据），一并当成未标注
+            targets = [
+                img for img in self.images
+                if img.get('status') not in ('annotated', 'completed')
+            ]
+            scope = SCOPE_UNLABELED
+        else:
+            targets = list(self.images)
+            scope = SCOPE_ALL
+
+        if not targets:
+            QMessageBox.information(
+                self, "没有要处理的图片",
+                f"当前范围是「{'仅未标注的图片' if only_unlabeled else '全部图片'}」，"
+                f"里面一张图片都没有。\n项目共 {len(self.images)} 张图片。",
+            )
+            return None
+
+        return BatchPlan(
+            project_id=self.current_project_id,
+            engine='yolo',
+            images=targets,
+            scope=scope,
+            model_label=settings['model_path'],
+            model_path=settings['model_path'],
+            model_task=settings.get('model_task', 'detect'),
+            conf=settings.get('conf_threshold', 0.5),
+            iou=settings.get('iou_threshold', 0.45),
+            overwrite=settings.get('overwrite_labels', False),
+            class_mapping=settings.get('class_mapping', {}),
+        )
+
     def run_batch_inference(self):
-        """运行批量推理"""
+        """批量标注：只负责问清楚、拿到确认，然后把那份快照交出去。
+
+        这里绝不会「顺手就开跑」——菜单项后面的省略号承诺的就是这一步。
+        """
         if not self.current_project_id or len(self.images) == 0:
             QMessageBox.warning(self, "提示", "项目中没有图片")
             return
-        
-        # 显示加载动画
-        self.show_loading_animation("正在进行批量推理...")
-        
-        # 使用保存的参数或默认参数运行批量推理
-        try:
-            # 获取模型参数（优先使用保存的参数）
-            if hasattr(self, 'auto_label_settings'):
-                settings = self.auto_label_settings
-                model_path = settings.get('model_path', "yolov8n")
-                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
-                conf_threshold = settings.get('conf_threshold', 0.5)
-                iou_threshold = settings.get('iou_threshold', 0.45)
-                class_mapping = settings.get('class_mapping', {})
-                only_unlabeled = settings.get('only_unlabeled', True)
-            else:
-                # 默认模型参数
-                model_path = "yolov8n"
-                model_task = 'detect'
-                conf_threshold = 0.5
-                iou_threshold = 0.45
-                class_mapping = {}
-                only_unlabeled = True
-            
-            # 过滤图像（如果只处理未标注的）
-            if only_unlabeled:
-                # 更宽松的过滤逻辑，包括status为None或空的情况
-                filtered_images = [img for img in self.images if img.get('status') not in ['annotated', 'completed']]
-            else:
-                filtered_images = self.images
-            
-            if not filtered_images:
-                QMessageBox.warning(self, "提示", f"没有符合条件的图片\n总图片数: {len(self.images)}\n未标注图片数: {len([img for img in self.images if img.get('status') not in ['annotated', 'completed']])}")
-                return
-            
-            # 开始批量处理，传递model_task
-            self.batch_labeling_manager.start_batch_processing(
-                model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
-            )
-            
-            # 批量处理是异步的，通过信号处理完成事件
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"批量推理失败: {str(e)}")
-        finally:
-            # 隐藏加载动画
-            self.hide_loading_animation()
-    
+
+        if self._batch_in_progress():
+            QMessageBox.information(self, "提示", "上一批还在跑，等它结束或者先取消。")
+            return
+
+        settings = self._require_yolo_settings()
+        if not settings:
+            return
+
+        plan = self._build_yolo_batch_plan(settings)
+        if plan is None:
+            return
+
+        confirmed = confirm_batch_plan(self, plan)
+        if confirmed is None:
+            # 取消：没建线程、没写库、没动任何图片状态
+            return
+
+        self._start_yolo_batch(confirmed)
+
+    def _start_yolo_batch(self, plan: BatchPlan) -> bool:
+        """按快照开跑。执行用的就是确认框还回来的那一份，不再回头读界面。"""
+        if self._batch_in_progress():
+            return False
+
+        self.init_auto_label_components()
+
+        self._active_batch_plan = plan
+        self._set_batch_status(f"准备中：{plan.count} 张图片", True)
+
+        started = self.batch_labeling_manager.start_batch_processing(
+            plan, self.model_manager,
+        )
+        if not started:
+            self._finish_batch_ui()
+        return started
+
+
     def on_single_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, image_path, model_task='detect'):
         """单张推理请求回调"""
         from core.auto_labeler import AutoLabeler
@@ -5458,39 +5627,58 @@ class AnnotatePage(QWidget):
             QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
     
     def on_batch_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, images, only_unlabeled, model_task='detect'):
-        """批量推理请求回调"""
-        # 过滤图像（如果只处理未标注的）
+        """设置窗口发来的批量推理请求：也要先过确认框，不能绕过去。"""
         if only_unlabeled:
             filtered_images = [img for img in images if img.get('status') != 'annotated']
         else:
             filtered_images = images
-        
+
         if not filtered_images:
             QMessageBox.warning(self, "提示", "没有符合条件的图片")
             return
-        
-        # 开始批量处理
-        self.batch_labeling_manager.start_batch_processing(
-            model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
+
+        if self._batch_in_progress():
+            QMessageBox.information(self, "提示", "上一批还在跑，等它结束或者先取消。")
+            return
+
+        plan = BatchPlan(
+            project_id=self.current_project_id,
+            engine='yolo',
+            images=filtered_images,
+            scope=SCOPE_UNLABELED if only_unlabeled else SCOPE_ALL,
+            model_label=model_path,
+            model_path=model_path,
+            model_task=model_task,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            overwrite=(getattr(self, 'auto_label_settings', None) or {}).get('overwrite_labels', False),
+            class_mapping=class_mapping,
         )
-    
+
+        confirmed = confirm_batch_plan(self, plan)
+        if confirmed is None:
+            return
+
+        self._start_yolo_batch(confirmed)
+
     def on_batch_inference_progress(self, progress, current, total, image_name):
         """批量推理进度回调"""
-        self._set_elided_text(self.status_batch, f"批处理: {current}/{total} · {image_name}")
-        self.repaint()
-    
-    def on_batch_inference_completed(self, success, message, processed_count):
-        """批量推理完成回调"""
-        if success:
+        self._set_batch_status(f"批量标注: {current}/{total} · {image_name}", True)
+
+    def on_batch_inference_completed(self, success, message, processed_count, cancelled=False):
+        """批量推理完成回调。取消不是失败，别拿红色错误框砸用户一脸。"""
+        self._finish_batch_ui()
+
+        # 重新加载图片列表以更新状态
+        self.load_image_list()
+        self.update_status_bar()
+
+        if cancelled:
+            QMessageBox.information(self, "已取消", message)
+        elif success:
             QMessageBox.information(self, "成功", f"批量自动标注完成！\n处理了 {processed_count} 张图片")
         else:
             QMessageBox.critical(self, "错误", f"批量自动标注失败: {message}")
-        
-        # 重新加载图片列表以更新状态
-        self.load_image_list()
-        
-        # 重置状态栏
-        self.update_status_bar()
     
     def load_current_image_annotations(self):
         """加载当前图像的标注"""
@@ -6334,8 +6522,11 @@ class AnnotatePage(QWidget):
             'obb': '旋转矩形'
         }
         self.status_tool.setText(f"工具: {tool_names.get(self.canvas.current_tool, self.canvas.current_tool)}")
-        # 批量任务留下的临时进度文字到这里就该清掉
-        self._set_elided_text(self.status_batch, "")
+        # 批量任务的进度和取消入口不能被这里顺手抹掉。
+        # 以前这句是无条件 `self._set_elided_text(self.status_batch, "")` ——
+        # 而 update_status_bar 是每标一个框、每切一张图都会调的，于是正在跑的
+        # 批量任务刚写上一行进度就被清空，用户看着像是任务没了。
+        self._refresh_batch_status()
 
         self._update_context_bar()
         self._update_action_availability()
@@ -6738,7 +6929,7 @@ class AnnotatePage(QWidget):
             return
         
         # 已经在跑就别再起一批：两批同时写标注，谁都说不清结果
-        if self.llm_batch_worker is not None and self.llm_batch_worker.isRunning():
+        if self._batch_in_progress():
             QMessageBox.information(self, "提示", "上一批还在跑，等它结束或者先取消。")
             return
 
@@ -6749,111 +6940,82 @@ class AnnotatePage(QWidget):
         if not llm_config:
             return
 
-        # 选择图片范围
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QHBoxLayout, QPushButton
-        
-        dialog = QDialog(self)
-        dialog.setWindowTitle("LLM批量推理")
-        dialog.setMinimumWidth(300)
-        
-        layout = QVBoxLayout(dialog)
-        
-        layout.addWidget(QLabel(f"目标类别: {target_class}"))
-        layout.addWidget(QLabel(f"总图片数: {len(self.images)}"))
-        
-        # 起始索引
-        start_layout = QHBoxLayout()
-        start_layout.addWidget(QLabel("起始图片:"))
-        start_spin = QSpinBox()
-        start_spin.setRange(1, len(self.images))
-        start_spin.setValue(1)
-        start_layout.addWidget(start_spin)
-        layout.addLayout(start_layout)
-        
-        # 结束索引
-        end_layout = QHBoxLayout()
-        end_layout.addWidget(QLabel("结束图片:"))
-        end_spin = QSpinBox()
-        end_spin.setRange(1, len(self.images))
-        end_spin.setValue(len(self.images))
-        end_layout.addWidget(end_spin)
-        layout.addLayout(end_layout)
-        
-        # 按钮
-        btn_layout = QHBoxLayout()
-        btn_ok = QPushButton("开始")
-        btn_ok.clicked.connect(dialog.accept)
-        btn_cancel = QPushButton("取消")
-        btn_cancel.clicked.connect(dialog.reject)
-        btn_layout.addWidget(btn_ok)
-        btn_layout.addWidget(btn_cancel)
-        layout.addLayout(btn_layout)
-        
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        
-        start_idx = start_spin.value() - 1
-        end_idx = end_spin.value()
-        
-        images_to_process = self.images[start_idx:end_idx]
-        
-        if not images_to_process:
-            QMessageBox.warning(self, "提示", "没有选择要处理的图片")
-            return
-        
-        # 进度条：取消是「请求取消」，当前这张跑完就停，界面不等
-        from PyQt6.QtWidgets import QProgressDialog
-        self.llm_batch_progress = QProgressDialog(
-            "正在使用LLM进行批量检测...", "取消", 0, len(images_to_process), self
+        # 范围选择以前是一个单独的弹窗，选完范围直接就开跑了——用户从来没见过
+        # 「要用哪个模型、会不会覆盖」。现在它并进共享的确认框里：一个框看全，
+        # 一次决定。conf / IoU 对 LLM 不适用，确认框会照实写「不适用」。
+        plan = BatchPlan(
+            project_id=self.current_project_id,
+            engine='llm',
+            images=list(self.images),
+            scope=SCOPE_RANGE,
+            model_label=llm_config.get('model_name', '') or "未指定",
+            conf=None,
+            iou=None,
+            overwrite=False,   # LLM 这条路只追加标注，从不删已有的
+            class_id=self.current_class_id,
+            class_name=target_class,
         )
-        self.llm_batch_progress.setWindowTitle("LLM 批量推理")
-        self.llm_batch_progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.llm_batch_progress.setAutoClose(False)
-        self.llm_batch_progress.setAutoReset(False)
-        self.llm_batch_progress.setValue(0)
 
-        self.llm_batch_total = len(images_to_process)
+        confirmed = confirm_batch_plan(self, plan, allow_range=True)
+        if confirmed is None:
+            # 取消：没建线程、没写库、没动任何图片状态
+            return
+
+        self._start_llm_batch(confirmed, llm_config)
+
+    def _start_llm_batch(self, plan: BatchPlan, llm_config: dict) -> bool:
+        """按快照跑一批 LLM。进度和取消都在状态栏，不再拿模态进度框挡住页面。"""
+        if self._batch_in_progress():
+            return False
+
+        self._active_batch_plan = plan
+        self.llm_batch_total = plan.count
         self.llm_batch_added = 0
-        self.llm_batch_class_id = self.current_class_id
 
-        self.llm_batch_worker = LLMBatchWorker(llm_config, images_to_process, target_class)
-        self.llm_batch_progress.canceled.connect(self.llm_batch_worker.cancel)
+        self._set_batch_status(f"准备中：{plan.count} 张图片", True)
+
+        self.llm_batch_worker = LLMBatchWorker(
+            llm_config, list(plan.images), plan.class_name,
+        )
         self.llm_batch_worker.image_started.connect(self.on_llm_batch_image_started)
         self.llm_batch_worker.image_done.connect(self.on_llm_batch_image_done)
         self.llm_batch_worker.batch_finished.connect(self.on_llm_batch_finished)
         self._track_llm_worker(self.llm_batch_worker)
 
-        self.btn_llm_label.setEnabled(False)
-        self.llm_batch_progress.show()
         self.llm_batch_worker.start()
+        return True
 
     def on_llm_batch_image_started(self, position: int, filename: str):
-        """第几张、哪一张，写在进度条上。"""
-        if not self.llm_batch_progress:
-            return
-        self.llm_batch_progress.setLabelText(
-            f"正在处理第 {position}/{self.llm_batch_total} 张：{filename}"
+        """第几张、哪一张，写在状态栏上。"""
+        self._set_batch_status(
+            f"大模型标注: {position}/{self.llm_batch_total} · {filename}", True,
         )
 
     def on_llm_batch_image_done(self, image_id: int, detections: list, error: str):
-        """一张图片跑完：标注写库在界面线程做，进度往前走一格。"""
-        if self.llm_batch_progress:
-            self.llm_batch_progress.setValue(self.llm_batch_progress.value() + 1)
+        """一张图片跑完：标注写库在界面线程做。
 
+        写库用的是快照里的 project_id / 类别，不是 self.current_project_id ——
+        这一批可能跑好几分钟，用户完全来得及切到别的项目去。照页面上的当前项目写，
+        标注就落到别人家里去了。
+        """
         if error:
             # 失败的图片只记账，不打断整批；错误里的密钥已经在线程里抹掉了
             print(f"[LLM批量] 图片 {image_id} 处理失败: {error}")
             return
 
-        class_id = self.llm_batch_class_id
-        class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+        plan = self._active_batch_plan
+        if plan is None:
+            return
+
+        class_id = plan.class_id
+        class_name = plan.class_name
         added = 0
 
         for det in detections:
             xmin, ymin, xmax, ymax = det.get("bbox", [0, 0, 0, 0])
             ann_id = db.add_annotation(
                 image_id=image_id,
-                project_id=self.current_project_id,
+                project_id=plan.project_id,
                 class_id=class_id,
                 class_name=class_name,
                 annotation_type='bbox',
@@ -6873,10 +7035,6 @@ class AnnotatePage(QWidget):
 
     def on_llm_batch_finished(self, succeeded: int, failed: int, cancelled: bool):
         """整批结束：收尾、刷新界面、把成绩单一次说清楚。"""
-        if self.llm_batch_progress:
-            self.llm_batch_progress.close()
-            self.llm_batch_progress = None
-
         # 这里不销毁线程：batch_finished 是 run() 的最后一句，run() 还没返回，
         # 一销毁就是「QThread: Destroyed while thread is still running」。
         # 先挪到「等它退出」的列表里继续持有，_on_llm_worker_finished 再放手。
@@ -6885,14 +7043,14 @@ class AnnotatePage(QWidget):
         if worker is not None and worker not in self._retired_llm_workers:
             self._retired_llm_workers.append(worker)
 
-        self.btn_llm_label.setEnabled(True)
+        self._finish_batch_ui()
 
         self.load_annotations()
         self.update_image_list_display()
         self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
 
-        headline = "批量推理已取消。" if cancelled else "批量推理完成！"
+        headline = "批量标注已取消。" if cancelled else "批量标注完成！"
         QMessageBox.information(
             self, "完成",
             f"{headline}\n"

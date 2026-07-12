@@ -490,23 +490,98 @@ class BatchLabelingThread(QThread):
     # 信号定义
     progress_updated = pyqtSignal(int, int, int)  # 已处理数量, 总数量, 已标注数量
     image_processed = pyqtSignal(str, int)  # 图像路径, 生成的标注数量
-    batch_completed = pyqtSignal(bool, str)  # 是否成功, 消息
+    # 是否成功, 消息, 是否被取消。取消单独一个位——它不是失败，
+    # 以前混在 success=False 里，界面就只能弹一个红色的「批量标注失败」。
+    batch_completed = pyqtSignal(bool, str, bool)
     
-    def __init__(self, auto_labeler: AutoLabeler, images: List[Dict], config: Dict):
+    def __init__(self, plan, model_manager, config: Dict):
         super().__init__()
-        self.auto_labeler = auto_labeler
-        self.images = images
+        self.plan = plan
+        self.model_manager = model_manager
+        self.images = list(plan.images)
         self.config = config
+        # 标注器在 run() 里才建：创建它、把 .pt 读进显存/内存，都是几百毫秒起步的活，
+        # 在界面线程上做就是明晃晃的一次卡顿。
+        self.auto_labeler = None
         self._is_running = True
         self._is_paused = False
-    
+
+    def _resolve_local_model_path(self) -> Optional[str]:
+        """找出这次要用的本地 .pt；找不到就返回 None——绝不去网上取。
+
+        批量这条路只认磁盘上已经存在的权重。设置里选的如果是「yolov8n」这种官方
+        名字，只在本地预训练目录里按名字找同名文件；找不到就当作没有，直接报错。
+
+        这里刻意不碰 model_manager.load_model()：那个方法在本地文件不存在时会
+        转头执行 `YOTO(model_name)` 去联网下载一个 COCO 通用模型——用户按下的是
+        「开始批量标注」，不是「下载一个我没选过的模型再拿它改我的标注」。
+        """
+        candidate = (self.plan.model_path or '').strip()
+        if not candidate:
+            return None
+
+        # 已经是一个存在的本地权重：直接用
+        if candidate.lower().endswith('.pt') and os.path.isfile(candidate):
+            return candidate
+
+        # 官方名字（yolov8n / yolo11s …）：只做一次纯路径推算，看本地有没有下过
+        match = re.match(r'^yolo(?:v)?(\d+)([a-z])$', candidate.lower())
+        if match and self.model_manager is not None:
+            version = f"YOLOv{match.group(1)}"
+            size = match.group(2)
+            try:
+                local_path = self.model_manager.get_model_path(
+                    version, size, self.plan.model_task or 'detect',
+                )
+            except Exception:
+                return None
+            if local_path and os.path.isfile(str(local_path)):
+                return str(local_path)
+
+        return None
+
+    def _prepare_labeler(self):
+        """在后台线程里建标注器并把模型读进来。失败返回 (None, 原因)。"""
+        model_path = self._resolve_local_model_path()
+        if not model_path:
+            return None, (
+                f"找不到本地模型文件：{self.plan.model_path or '（未指定）'}。\n"
+                "请在「自动标注设置 → YOLO 检测」里选一个已经下载好的 .pt 模型。"
+            )
+
+        labeler = AutoLabeler(model_path, self.model_manager)
+        # 一律按「自定义模型」加载：这条分支只会从给定路径读文件，不会联网。
+        loaded = labeler.load_model({
+            'model_version': '',
+            'model_size': '',
+            'model_source': 'custom',
+            'model_task': self.plan.model_task or 'detect',
+            'custom_model_path': model_path,
+            'class_mappings': self.plan.class_mapping,
+        })
+        if not loaded or labeler.current_model is None:
+            return None, f"模型加载失败：{model_path}"
+
+        return labeler, ""
+
     def run(self):
-        """运行批量标注"""
+        """运行批量标注：建标注器、加载模型、逐图处理，全都在这个后台线程里。"""
         total = len(self.images)
         processed = 0
         labeled = 0
-        
+
         try:
+            self.auto_labeler, load_error = self._prepare_labeler()
+
+            # 模型加载期间用户就点了取消：别硬着头皮再跑一整批
+            if not self._is_running:
+                self.batch_completed.emit(True, "已取消，模型还没加载完就停下了", True)
+                return
+
+            if self.auto_labeler is None:
+                self.batch_completed.emit(False, load_error, False)
+                return
+
             for i, image in enumerate(self.images):
                 if not self._is_running:
                     break
@@ -547,11 +622,20 @@ class BatchLabelingThread(QThread):
             
             # 完成
             if self._is_running:
-                self.batch_completed.emit(True, f"批量标注完成，处理了 {processed}/{total} 张图像，生成了 {labeled} 个标注")
+                self.batch_completed.emit(
+                    True,
+                    f"批量标注完成，处理了 {processed}/{total} 张图像，生成了 {labeled} 个标注",
+                    False,
+                )
             else:
-                self.batch_completed.emit(False, f"批量标注被停止，已处理 {processed}/{total} 张图像")
+                # 用户主动喊停不是出错：照实说已经做了多少，不报错
+                self.batch_completed.emit(
+                    True,
+                    f"已取消，已处理 {processed}/{total} 张图像，生成了 {labeled} 个标注",
+                    True,
+                )
         except Exception as e:
-            self.batch_completed.emit(False, f"批量标注出错: {str(e)}")
+            self.batch_completed.emit(False, f"批量标注出错: {str(e)}", False)
     
     def pause(self):
         """暂停"""
@@ -568,126 +652,123 @@ class BatchLabelingThread(QThread):
 
 
 class BatchLabelingManager(QObject):
-    """批量标注管理器"""
-    
+    """批量标注管理器：按一份确认过的 BatchPlan 跑一批，一次只跑一批。"""
+
     # 信号定义
     progress_updated = pyqtSignal(int, int, int, str)  # 进度, 当前, 总数, 图像名称
-    batch_completed = pyqtSignal(bool, str, int)  # 成功, 消息, 处理数量
-    
+    batch_completed = pyqtSignal(bool, str, int, bool)  # 成功, 消息, 处理数量, 是否取消
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_thread = None
         self.auto_labeler = None
         self.model_manager = None
         self.images = []
-    
-    def start_batch_processing(self, model_path: str, images: list, conf_threshold: float, iou_threshold: float, class_mapping: dict, model_manager, model_task: str = 'detect'):
-        """开始批量处理
-        
-        Args:
-            model_path: 模型路径
-            images: 图像列表
-            conf_threshold: 置信度阈值
-            iou_threshold: IOU阈值
-            class_mapping: 类别映射
-            model_manager: 模型管理器实例
-            model_task: 模型任务类型，默认为'detect'
+        self.plan = None
+
+    def start_batch_processing(self, plan, model_manager) -> bool:
+        """按快照开跑；已经有一批在跑就直接拒绝。返回「这次是不是真的启动了」。
+
+        这个方法是界面线程调的，所以它只做三件轻活：记下快照、接好线程、把线程点着，
+        然后立刻返回。**不在这里创建 AutoLabeler，也不在这里 load_model** ——
+        读一个几十上百 MB 的 .pt 要几百毫秒到几秒，在界面线程上做就是一次肉眼可见的
+        卡死：用户刚点完「开始批量标注」，窗口就白了。那些活全在 BatchLabelingThread.run() 里。
+
+        参数只有一份快照（BatchPlan），不再是七个散装参数——确认框上给用户看的
+        和这里交给线程的，从此是同一个对象，不可能对不上。
+
+        `is_running()` 这道闸是防双击的第二层（第一层在页面上）：两批同时往
+        同一批图片里写标注，谁覆盖谁完全看运气。
         """
+        if self.is_running():
+            return False
+
         try:
             self.model_manager = model_manager
-            self.images = images  # 保存图像列表
-            
-            # 创建自动标注器
-            self.auto_labeler = AutoLabeler(model_path, model_manager)
-            
-            # 配置
+            self.plan = plan
+            self.images = list(plan.images)
+            self.auto_labeler = None  # 由线程自己建；线程收工时再取回来
+
+            # 覆盖与否只能来自用户确认过的快照。
+            # 这里以前硬编码 overwrite_labels=True —— 确认框上写着「保留已有标注」，
+            # 实际却把用户手标的框先删了个干净。
             config = {
-                'conf_threshold': conf_threshold,
-                'iou_threshold': iou_threshold,
-                'class_mappings': class_mapping,
-                'overwrite_labels': True
+                'conf_threshold': plan.conf,
+                'iou_threshold': plan.iou,
+                'class_mappings': plan.class_mapping,
+                'overwrite_labels': plan.overwrite,
             }
-            
-            # 加载模型
-            import re
-            match = re.match(r'(yolov)(\d+)([a-z])', model_path)
-            if match:
-                version_num = match.group(2)
-                size = match.group(3)
-                version = f"YOLOv{version_num}"
-                load_config = {
-                    'model_version': version,
-                    'model_size': size,
-                    'model_source': 'official',
-                    'model_task': model_task,
-                    'class_mappings': class_mapping
-                }
-                self.auto_labeler.load_model(load_config)
-            else:
-                # 自定义模型
-                if os.path.exists(model_path):
-                    # 对于自定义模型，也需要设置model_task
-                    load_config = {
-                        'model_version': '',  # 自定义模型不需要版本
-                        'model_size': '',  # 自定义模型不需要大小
-                        'model_source': 'custom',
-                        'model_task': model_task,  # 使用传入的任务类型
-                        'custom_model_path': model_path,
-                        'class_mappings': class_mapping
-                    }
-                    self.auto_labeler.load_model(load_config)
-            
-            # 创建并启动线程
-            self.current_thread = BatchLabelingThread(
-                self.auto_labeler, images, config
-            )
-            
+
+            self.current_thread = BatchLabelingThread(plan, model_manager, config)
+
             # 连接信号
             self.current_thread.progress_updated.connect(self.on_progress_updated)
             self.current_thread.batch_completed.connect(self.on_batch_completed)
-            
+            # QThread 原生 finished 才代表线程真的退出了：只有那时候放引用才安全
+            self.current_thread.finished.connect(self._on_thread_finished)
+
             # 启动线程
             self.current_thread.start()
+            return True
         except Exception as e:
-            print(f"Error starting batch processing: {e}")
-    
+            self.current_thread = None
+            self.batch_completed.emit(False, f"批量标注启动失败: {e}", 0, False)
+            return False
+
     def on_progress_updated(self, processed: int, total: int, labeled: int):
         """进度更新回调"""
-        # 发送进度信号
-        if hasattr(self, 'progress_updated'):
-            current_image = self.images[processed-1] if processed <= len(self.images) else {}
-            image_name = os.path.basename(current_image.get('storage_path', ''))
-            progress = int((processed / total) * 100)
-            self.progress_updated.emit(progress, processed, total, image_name)
-    
-    def on_batch_completed(self, success: bool, message: str):
+        current_image = self.images[processed-1] if processed <= len(self.images) else {}
+        image_name = os.path.basename(current_image.get('storage_path', ''))
+        progress = int((processed / total) * 100) if total else 0
+        self.progress_updated.emit(progress, processed, total, image_name)
+
+    def on_batch_completed(self, success: bool, message: str, cancelled: bool):
         """批量完成回调"""
-        # 发送完成信号
-        if hasattr(self, 'batch_completed'):
-            processed_count = len(self.images)
-            self.batch_completed.emit(success, message, processed_count)
-    
+        processed_count = len(self.images)
+        self.batch_completed.emit(success, message, processed_count, cancelled)
+
+    def _on_thread_finished(self):
+        """线程真正退出了，这里才是唯一安全释放引用的地方。"""
+        thread = self.sender() or self.current_thread
+        # 标注器是线程建的，收工时接回来，cleanup() 还要用它卸载模型
+        if thread is not None:
+            self.auto_labeler = getattr(thread, 'auto_labeler', None)
+        if thread is self.current_thread:
+            self.current_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def request_cancel(self):
+        """请求取消：只把标志放下去，立刻返回。
+
+        绝对不能在这里 wait()——这是界面线程调的，一等就是整个窗口卡住，
+        而「取消」恰恰是用户嫌它慢才点的。线程会在当前这张图跑完后自己退出。
+        """
+        if self.current_thread is not None:
+            self.current_thread.stop()
+
     def pause(self):
         """暂停"""
         if self.current_thread:
             self.current_thread.pause()
-    
+
     def resume(self):
         """恢复"""
         if self.current_thread:
             self.current_thread.resume()
-    
+
     def stop(self):
-        """停止"""
+        """停止并等线程退出。只给关窗/退出这种收尾路径用，不要在界面线程里调。"""
         if self.current_thread:
             self.current_thread.stop()
             self.current_thread.wait()
-    
+
     def is_running(self) -> bool:
         """检查是否正在运行"""
-        return self.current_thread and self.current_thread.isRunning()
-    
+        return bool(self.current_thread and self.current_thread.isRunning())
+
     def cleanup(self):
         """清理资源"""
         self.stop()
-        self.auto_labeler.unload_model()
+        if self.auto_labeler is not None:
+            self.auto_labeler.unload_model()
