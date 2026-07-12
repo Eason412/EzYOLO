@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 from PyQt6.QtGui import QIcon
 
 from gui.main_window import MainWindow
+from gui.styles import get_primary_font_family
 
 
 def qt_message_handler(msg_type, context, message):
@@ -48,7 +49,15 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("EzYOLO")
     app.setApplicationVersion("1.0.0")
-    
+
+    # 按当前系统真实存在的字体设置界面字体：
+    # macOS/Linux 上不会再去请求 Windows 才有的 "Microsoft YaHei"，字体缺失警告随之消失
+    font_family = get_primary_font_family()
+    if font_family:
+        app_font = app.font()
+        app_font.setFamily(font_family)
+        app.setFont(app_font)
+
     # 设置应用图标（使用相对路径）
     icon_path = app_root / "icon.png"
     if icon_path.exists():

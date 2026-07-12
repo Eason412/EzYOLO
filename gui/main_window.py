@@ -1,16 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 EzYOLO 主窗口
+
+窗口 = 左边一条固定的流程导航 + 右边「页头 + 当前步骤」。
+项目的选择放在窗口层（侧边栏顶部），所有页面共用同一个当前项目，
+不用在每个页面里再选一次。
 """
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QStackedWidget, QLabel, QPushButton, QFrame
+    QStackedWidget, QLabel, QPushButton, QFrame, QComboBox,
 )
 from PyQt6.QtCore import Qt, QSettings, QSize, QPoint
-from PyQt6.QtGui import QFont, QIcon
 
-from gui.styles import get_full_stylesheet, COLORS
+from gui.styles import get_full_stylesheet
+from gui.workflow import (
+    WORKFLOW_STEPS, STEP_BY_INDEX, PAGE_SETTINGS, PAGE_ABOUT,
+    STEP_IMPORT, STEP_ANNOTATE, STEP_TRAIN, STEP_RESULT, STEP_TEST,
+    get_project_snapshot, compute_step_states, step_status_text,
+    get_blocker, get_next_action,
+)
+from gui.widgets.workflow_widgets import StepNav, PageHeader, StepGate, NoticeBar
+from gui.widgets.elided_combo import ElidedComboBox
 from gui.pages.import_page import ImportPage
 from gui.pages.annotate_page import AnnotatePage
 from gui.pages.train_page import TrainPage
@@ -20,294 +31,417 @@ from gui.pages.settings_page import SettingsPage
 from gui.pages.about_page import AboutPage
 from models.database import db
 
+GATE_INDEX = 7  # 前置条件说明页在 content_stack 中的位置
+
+# 导入/标注是业务页：左侧 StepNav 已经承担了流程和下一步导航，PageHeader
+# 整块（标题/序号/说明/下一步按钮）在这两页上是和 StepNav 重复的第二套导航，
+# 隐藏掉、把页面内容往上提。其余页面（含前置条件不满足时显示的 Gate）
+# 仍然显示 PageHeader。
+HIDDEN_HEADER_STEPS = {STEP_IMPORT, STEP_ANNOTATE}
+
+AUX_PAGES = {
+    PAGE_SETTINGS: ("设置", "模型路径、自动保存与快捷键。"),
+    PAGE_ABOUT: ("关于 EzYOLO", ""),
+}
+
 
 class MainWindow(QMainWindow):
     """主窗口类"""
-    
+
     def __init__(self):
         super().__init__()
-        
-        # 加载设置
+
         self.settings = QSettings("EzYOLO", "MainWindow")
-        
-        # 初始化UI
+        self.current_project_id = None
+        self.current_index = STEP_IMPORT
+        self.snapshot = get_project_snapshot(None)
+        self.step_states = compute_step_states(self.snapshot)
+        self._bypassed_steps = set()
+
         self.init_ui()
-        
-        # 加载窗口状态
         self.load_window_state()
-    
+
+    # ==================== 界面搭建 ====================
+
     def init_ui(self):
         """初始化界面"""
-        # 设置窗口标题
-        self.setWindowTitle("EzYOLO - 全流程YOLO训练")
-        
-        # 设置最小尺寸
-        self.setMinimumSize(1200, 800)
-        
-        # 加载当前主题设置
-        current_theme = self.settings.value("theme", "深色主题")
-        theme_key = 'light' if current_theme == '浅色主题' else 'dark'
-        
-        # 应用样式表
-        self.setStyleSheet(get_full_stylesheet(theme_key))
-        
-        # 创建中央部件
+        self.setWindowTitle("EzYOLO - 本地YOLO训练全流程")
+        self.setMinimumSize(1100, 720)
+
+        self.setStyleSheet(get_full_stylesheet())
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
-        # 主布局
+
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
-        # 创建侧边栏
+
+        # 先建内容区（页面在这里创建），再建侧边栏，侧边栏要连到导入页
+        content = self.create_content_area()
+
         self.sidebar = self.create_sidebar()
         main_layout.addWidget(self.sidebar)
-        
-        # 创建内容区域
-        self.content_stack = self.create_content_area()
-        main_layout.addWidget(self.content_stack)
-        
-        # 连接主题变化信号
+        main_layout.addWidget(content, 1)
+
         self.settings_page.theme_changed.connect(self.on_theme_changed)
-        
+        self.settings_page.auto_label_config_requested.connect(self.open_auto_label_config)
+        self.import_page.projects_changed.connect(self.on_projects_changed)
+        self.import_page.project_data_changed.connect(self.refresh_workflow)
+
         # 启动时同步数据库与真实文件
         self.sync_database_files()
-        
-        # 设置布局比例
-        main_layout.setStretch(0, 0)  # 侧边栏固定宽度
-        main_layout.setStretch(1, 1)  # 内容区域自适应
-    
+
+        self.load_projects()
+        self.switch_page(STEP_IMPORT)
+
     def create_sidebar(self) -> QWidget:
-        """创建侧边栏"""
+        """创建侧边栏：品牌 → 当前项目 → 流程步骤 → 辅助入口"""
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(200)
-        
+        sidebar.setFixedWidth(216)
+
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 20, 0, 20)
-        layout.setSpacing(4)
-        
-        # 标题
-        title_label = QLabel("EzYOLO")
-        title_label.setObjectName("title")
-        title_label.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
-        title_label.setStyleSheet(f"color: {COLORS['primary']}; padding: 0 16px;")
-        layout.addWidget(title_label)
-        
-        # 副标题
-        subtitle_label = QLabel("YOLO训练工具")
-        subtitle_label.setObjectName("subtitle")
-        subtitle_label.setStyleSheet("padding: 0 16px; margin-bottom: 20px;")
-        layout.addWidget(subtitle_label)
-        
-        # 分隔线
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet(f"background-color: {COLORS['border']}; max-height: 1px;")
-        layout.addWidget(line)
-        
-        # 导航按钮组
-        self.nav_buttons = []
-        
-        # 导入按钮
-        btn_import = self.create_nav_button("① 导入", 0)
-        layout.addWidget(btn_import)
-        self.nav_buttons.append(btn_import)
-        
-        # 标注按钮
-        btn_annotate = self.create_nav_button("② 标注", 1)
-        layout.addWidget(btn_annotate)
-        self.nav_buttons.append(btn_annotate)
-        
-        # 训练按钮
-        btn_train = self.create_nav_button("③ 训练", 2)
-        layout.addWidget(btn_train)
-        self.nav_buttons.append(btn_train)
-        
-        # 训练结果按钮
-        btn_result = self.create_nav_button("④ 训练结果", 3)
-        layout.addWidget(btn_result)
-        self.nav_buttons.append(btn_result)
-        
-        # 测试按钮
-        btn_test = self.create_nav_button("⑤ 测试", 4)
-        layout.addWidget(btn_test)
-        self.nav_buttons.append(btn_test)
-        
-        # 添加弹性空间
+        layout.setContentsMargins(12, 16, 12, 12)
+        layout.setSpacing(0)
+
+        brand = QLabel("EzYOLO")
+        brand.setObjectName("brand")
+        layout.addWidget(brand)
+
+        layout.addSpacing(16)
+
+        # 当前项目：全窗口共用，切换项目后所有步骤跟着走
+        project_label = QLabel("项目")
+        project_label.setObjectName("nav_section")
+        layout.addWidget(project_label)
+        layout.addSpacing(6)
+
+        # 项目名可以很长，下拉框不能被它撑出侧栏；装不下时要省略号收尾，
+        # 不能像原生 QComboBox 那样把最后一个中文字切掉一半
+        self.project_combo = ElidedComboBox()
+        self.project_combo.setToolTip("图片、标注和训练结果都存在当前项目里")
+        self.project_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.project_combo.setMinimumContentsLength(8)
+        self.project_combo.currentIndexChanged.connect(self.on_project_combo_changed)
+        layout.addWidget(self.project_combo)
+
+        layout.addSpacing(6)
+
+        self.btn_new_project = QPushButton("新建项目")
+        self.btn_new_project.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_project.clicked.connect(self.import_page.create_new_project)
+        layout.addWidget(self.btn_new_project)
+
+        layout.addSpacing(18)
+
+        flow_label = QLabel("流程")
+        flow_label.setObjectName("nav_section")
+        layout.addWidget(flow_label)
+        layout.addSpacing(6)
+
+        self.step_nav = StepNav()
+        self.step_nav.step_clicked.connect(self.switch_page)
+        layout.addWidget(self.step_nav)
+
         layout.addStretch()
-        
-        # 底部按钮
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.Shape.HLine)
-        line2.setStyleSheet(f"background-color: {COLORS['border']}; max-height: 1px;")
-        layout.addWidget(line2)
-        
-        btn_settings = self.create_nav_button("⚙ 设置", 5)
-        layout.addWidget(btn_settings)
-        self.nav_buttons.append(btn_settings)
-        
-        btn_about = self.create_nav_button("ⓘ 关于", 6)
-        layout.addWidget(btn_about)
-        self.nav_buttons.append(btn_about)
-        
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        layout.addWidget(divider)
+        layout.addSpacing(8)
+
+        aux_row = QHBoxLayout()
+        aux_row.setContentsMargins(0, 0, 0, 0)
+        aux_row.setSpacing(6)
+
+        self.btn_settings = QPushButton("设置")
+        self.btn_settings.setObjectName("ghost")
+        self.btn_settings.setCheckable(True)
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.clicked.connect(lambda: self.switch_page(PAGE_SETTINGS))
+        aux_row.addWidget(self.btn_settings)
+
+        self.btn_about = QPushButton("关于")
+        self.btn_about.setObjectName("ghost")
+        self.btn_about.setCheckable(True)
+        self.btn_about.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_about.clicked.connect(lambda: self.switch_page(PAGE_ABOUT))
+        aux_row.addWidget(self.btn_about)
+
+        layout.addLayout(aux_row)
+
         return sidebar
-    
-    def create_nav_button(self, text: str, index: int) -> QPushButton:
-        """创建导航按钮"""
-        btn = QPushButton(text)
-        btn.setObjectName("nav_button")
-        btn.setCheckable(True)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        
-        if index >= 0:
-            btn.clicked.connect(lambda checked, idx=index: self.switch_page(idx))
-        
-        return btn
-    
-    def create_content_area(self) -> QStackedWidget:
-        """创建内容区域"""
-        stack = QStackedWidget()
-        
-        # 导入页面
+
+    def create_content_area(self) -> QWidget:
+        """创建内容区：页头 + 页面堆栈"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.header = PageHeader()
+        self.header.next_clicked.connect(self.switch_page)
+        layout.addWidget(self.header)
+
+        # 启动自检这类「说一声就行」的消息落在这里，默认不占位
+        self.notice = NoticeBar()
+        layout.addWidget(self.notice)
+
+        self.content_stack = QStackedWidget()
+
         self.import_page = ImportPage()
-        stack.addWidget(self.import_page)
-        
-        # 标注页面
+        self.content_stack.addWidget(self.import_page)          # 0
+
         self.annotate_page = AnnotatePage()
-        stack.addWidget(self.annotate_page)
-        
-        # 训练页面
+        self.content_stack.addWidget(self.annotate_page)        # 1
+
         self.train_page = TrainPage()
-        stack.addWidget(self.train_page)
-        
-        # 训练结果页面
+        self.content_stack.addWidget(self.train_page)           # 2
+
         self.result_page = ResultPage()
-        stack.addWidget(self.result_page)
-        
-        # 测试页面
+        self.content_stack.addWidget(self.result_page)          # 3
+
         self.test_page = TestPage()
-        stack.addWidget(self.test_page)
-        
-        # 设置页面
+        self.content_stack.addWidget(self.test_page)            # 4
+
         self.settings_page = SettingsPage()
-        stack.addWidget(self.settings_page)
-        
-        # 关于页面
+        self.content_stack.addWidget(self.settings_page)        # 5
+
         self.about_page = AboutPage()
-        stack.addWidget(self.about_page)
-        
-        # 默认选中第一个页面
-        self.nav_buttons[0].setChecked(True)
-        
-        return stack
-    
+        self.content_stack.addWidget(self.about_page)           # 6
+
+        self.gate = StepGate()
+        self.gate.goto_requested.connect(self.switch_page)
+        self.gate.bypass_requested.connect(self.on_gate_bypassed)
+        self.content_stack.addWidget(self.gate)                 # 7
+
+        layout.addWidget(self.content_stack, 1)
+        return container
+
+    # ==================== 项目 ====================
+
+    def load_projects(self, select_id: int = None):
+        """把项目列表灌进侧边栏下拉框。"""
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+
+        projects = db.get_all_projects()
+        if projects:
+            self.project_combo.addItem("请选择项目…", None)
+            for project in projects:
+                self.project_combo.addItem(project['name'], project['id'])
+                # 名字长到要省略时，完整名字至少还能在悬停里看到
+                self.project_combo.setItemData(
+                    self.project_combo.count() - 1,
+                    project['name'],
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+        else:
+            self.project_combo.addItem("还没有项目", None)
+
+        target = select_id if select_id is not None else self.current_project_id
+        index = self.project_combo.findData(target) if target else -1
+        self.project_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.project_combo.blockSignals(False)
+
+        self.set_active_project(self.project_combo.currentData())
+
+    def on_project_combo_changed(self, _index: int):
+        self.set_active_project(self.project_combo.currentData())
+
+    def set_active_project(self, project_id):
+        """切换当前项目：导入页立刻跟着换，其余页面在进入时同步。"""
+        self.current_project_id = project_id
+        self._bypassed_steps.clear()
+        self.import_page.set_project(project_id)
+        self.refresh_workflow()
+        if self.current_index != STEP_IMPORT:
+            self.apply_page_project(self.current_index)
+
+    def on_projects_changed(self, project_id):
+        """导入页新建 / 删除项目后，刷新下拉框。"""
+        self.load_projects(select_id=project_id)
+
+    # ==================== 页面切换 ====================
+
     def switch_page(self, index: int):
-        """切换页面"""
-        # 更新按钮状态
-        for i, btn in enumerate(self.nav_buttons):
-            btn.setChecked(i == index)
-        
-        # 切换页面
-        self.content_stack.setCurrentIndex(index)
-        
-        # 同步项目信息到各页面
-        current_project_id = self.import_page.current_project_id
-        
-        if index == 1:  # 标注页面
-            if current_project_id:
-                self.annotate_page.set_project(current_project_id)
+        """切换到某一步。前置条件不满足时不再弹窗，而是就地说明原因并给出入口。"""
+        self.refresh_workflow(update_views=False)
+        self.current_index = index
+
+        blocker = None
+        if index not in self._bypassed_steps:
+            blocker = get_blocker(index, self.snapshot)
+
+        if blocker:
+            self.gate.set_blocker(blocker)
+            self.content_stack.setCurrentIndex(GATE_INDEX)
+        else:
+            self.apply_page_project(index)
+            self.content_stack.setCurrentIndex(index)
+
+        self.update_header(index)
+        self.update_nav(index)
+
+    def apply_page_project(self, index: int):
+        """把当前项目同步给将要显示的页面。"""
+        if index == STEP_IMPORT:
+            # 别的步骤可能改过标注状态，回到导入页时对一下
+            self.import_page.refresh_project_images()
+            return
+
+        page_setters = {
+            STEP_ANNOTATE: self.annotate_page.set_project,
+            STEP_TRAIN: self.train_page.set_project,
+            STEP_RESULT: self.result_page.set_project,
+            STEP_TEST: self.test_page.set_project,
+        }
+        setter = page_setters.get(index)
+        if setter and self.current_project_id:
+            setter(self.current_project_id)
+
+    def open_auto_label_config(self, section: str = ""):
+        """设置页点「打开自动标注配置」→ 就在这儿把配置窗口开出来。
+
+        配置窗口是标注页那一个实例（AutoLabelDialog），但用户不用先切到标注页、
+        再去工具栏里找按钮——设置页发信号，窗口层直接开。SAM / LLM 的配置是
+        全局文件，没有项目也能配。
+
+        关窗之后回到「打开它的那个页面」，而不是跳去别的步骤：从设置页点开的，
+        保存完还留在设置页，并且就地把 AI 状态刷新成刚存的值 + 给一句「已保存」——
+        否则用户点完保存，窗口一关，界面上没有任何东西变过，跟没保存一样。
+        """
+        origin_index = self.current_index
+
+        saved = self.annotate_page.open_auto_label_config(section)
+
+        # 配置窗口开着的这段时间里页面不该被换掉；真被换了（以后有人加了新逻辑）
+        # 也要回到用户点开配置的那一页，不能把人甩到别的步骤去。
+        if self.current_index != origin_index:
+            self.switch_page(origin_index)
+
+        self.settings_page.refresh_ai_status()
+
+        if origin_index == PAGE_SETTINGS:
+            if saved:
+                self.settings_page.set_status("自动标注设置已保存。", 'success')
             else:
-                # 如果没有选择项目，提示用户
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
-        
-        elif index == 2:  # 训练页面
-            if current_project_id:
-                self.train_page.set_project(current_project_id)
-            else:
-                # 如果没有选择项目，提示用户
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
-        
-        elif index == 3:  # 训练结果页面
-            if current_project_id:
-                self.result_page.set_project(current_project_id)
-            else:
-                # 如果没有选择项目，提示用户
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
-        
-        elif index == 4:  # 测试页面
-            if current_project_id:
-                self.test_page.set_project(current_project_id)
-            else:
-                # 如果没有选择项目，提示用户
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
-        
-        elif index == 5:  # 设置页面
-            # 设置页面不需要项目信息
-            pass
-        
-        elif index == 6:  # 关于页面
-            # 关于页面不需要项目信息
-            pass
-    
+                self.settings_page.set_status("没有改动自动标注设置。")
+
+    def on_gate_bypassed(self):
+        """用户选择「我有现成的模型，直接测试」这类跳过。"""
+        self._bypassed_steps.add(self.current_index)
+        self.switch_page(self.current_index)
+
+    # ==================== 流程状态 ====================
+
+    def refresh_workflow(self, update_views: bool = True):
+        """重新读取项目事实（图片数、标注数、训练结果），刷新侧边栏与页头。"""
+        self.snapshot = get_project_snapshot(self.current_project_id)
+        self.step_states = compute_step_states(self.snapshot)
+        if update_views:
+            self.update_nav(self.current_index)
+            self.update_header(self.current_index)
+
+    def update_nav(self, index: int):
+        status_texts = {
+            step['index']: step_status_text(step['index'], self.snapshot, self.step_states)
+            for step in WORKFLOW_STEPS
+        }
+        # 停留在设置/关于时，主流程不高亮任何一步
+        highlight = -1 if index in AUX_PAGES else index
+        self.step_nav.update_states(self.step_states, status_texts, highlight)
+
+        self.btn_settings.setChecked(index == PAGE_SETTINGS)
+        self.btn_about.setChecked(index == PAGE_ABOUT)
+
+    def update_header(self, index: int):
+        """页头数据永远按「请求的那一步」来算，不受 Gate 遮挡影响；
+        只有显示与否才看 content_stack 实际显示的是业务页还是 Gate。
+        """
+        if index in AUX_PAGES:
+            title, desc = AUX_PAGES[index]
+            self.header.set_step(index, title, desc)
+            self.header.set_next_action(None)
+        elif index in STEP_BY_INDEX:
+            self.header.set_step(index)
+            self.header.set_next_action(
+                get_next_action(self.snapshot, self.step_states, index)
+            )
+        else:
+            return
+
+        self.header.setVisible(self.content_stack.currentIndex() not in HIDDEN_HEADER_STEPS)
+
+    # ==================== 窗口状态 ====================
+
     def load_window_state(self):
         """加载窗口状态"""
-        # 恢复窗口大小
-        size = self.settings.value("size", QSize(1400, 900))
+        size = self.settings.value("size", QSize(1440, 900))
         self.resize(size)
-        
-        # 恢复窗口位置
+
         pos = self.settings.value("pos", QPoint(100, 100))
         self.move(pos)
-        
-        # 恢复窗口状态（最大化等）
+
         state = self.settings.value("windowState")
         if state:
             self.restoreState(state)
-    
+
     def save_window_state(self):
         """保存窗口状态"""
         self.settings.setValue("size", self.size())
         self.settings.setValue("pos", self.pos())
         self.settings.setValue("windowState", self.saveState())
-    
-    def on_theme_changed(self, theme_key):
-        """处理主题变化（固定为深色主题）"""
-        # 始终使用深色主题
-        dark_theme_key = 'dark'
-        # 应用深色主题样式表
-        self.setStyleSheet(get_full_stylesheet(dark_theme_key))
-        
-        # 保存主题设置为深色主题
-        self.settings.setValue("theme", "深色主题")
-    
+
+    def on_theme_changed(self, _theme_key=None):
+        """主题变化（应用只有一套浅色外观，重新套一遍样式表即可）"""
+        self.setStyleSheet(get_full_stylesheet())
+
     def closeEvent(self, event):
-        """关闭事件"""
+        """关闭事件：后台线程先停干净，再让窗口销毁。
+
+        QThread 还在 run() 里时被销毁会直接崩，所以推理和 LLM 批量这两条
+        长任务在这里各自收工（都带超时，不会把退出流程拖住）。
+        """
+        for page in (self.test_page, self.annotate_page):
+            shutdown = getattr(page, 'shutdown', None)
+            if shutdown:
+                shutdown()
+
         self.save_window_state()
         event.accept()
 
     def sync_database_files(self):
-        """同步数据库与真实文件"""
+        """启动自检：只看数据库和磁盘对不对得上，不动任何数据。
+
+        数据层只扫描、只报数（orphan_db_count / orphan_disk_count / issues），
+        删不删由用户自己决定。所以这里也只是「说一声」：
+        对得上就什么都不显示；对不上就在窗口里留一条可关掉的通知，
+        不弹窗、不阻塞启动，更不会替用户删东西。
+        """
         try:
-            # 调用数据库同步方法
-            result = db.sync_files_with_database()
-            
-            deleted_db_count = result.get('deleted_db_count', 0)
-            deleted_file_count = result.get('deleted_file_count', 0)
-            total_deleted = result.get('total_deleted', 0)
-            
-            if total_deleted > 0:
-                print(f"[同步] 删除了 {deleted_db_count} 个数据库中不存在的文件记录")
-                print(f"[同步] 删除了 {deleted_file_count} 个文件夹中不存在于数据库的文件")
-                print(f"[同步] 总共删除了 {total_deleted} 个项目")
-                # 可以在这里添加一个通知，告知用户同步结果
-                # 例如：QMessageBox.information(self, "同步完成", f"删除了 {deleted_file_count} 个不存在于数据库的文件和 {deleted_db_count} 个无效记录")
-            else:
-                print("[同步] 数据库与文件系统一致，无需删除")
-        except Exception as e:
-            print(f"[同步] 同步过程中出现错误: {str(e)}")
+            result = db.sync_files_with_database() or {}
+        except Exception as exc:  # noqa: BLE001  自检失败不该拦住启动
+            print(f"[自检] 跳过：{exc}")
+            return
+
+        orphan_db = result.get('orphan_db_count', 0)
+        orphan_disk = result.get('orphan_disk_count', 0)
+        if not (orphan_db or orphan_disk):
+            return
+
+        parts = []
+        if orphan_db:
+            parts.append(f"{orphan_db} 条记录找不到对应文件")
+        if orphan_disk:
+            parts.append(f"{orphan_disk} 个文件不在数据库里")
+
+        issues = result.get('issues') or []
+        detail = "\n".join(str(item) for item in issues[:20])
+        self.notice.show_message(
+            "数据自检：" + "，".join(parts) + "。未做任何改动。",
+            detail,
+        )

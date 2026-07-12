@@ -6,7 +6,7 @@
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
+    QScrollArea, QGridLayout, QFrame, QFileDialog,
     QMenu, QMessageBox, QComboBox, QLineEdit, QSplitter,
     QListWidget, QListWidgetItem, QButtonGroup,
     QRadioButton, QSpinBox, QDoubleSpinBox, QFormLayout,
@@ -19,25 +19,71 @@ import math
 # 导入自动标注相关模块
 from gui.pages.auto_label_dialog import AutoLabelDialog
 from gui.pages.batch_process_dialog import BatchProcessDialog
+from gui.pages.settings_page import event_matches_shortcut
 from core.auto_labeler import BatchLabelingManager
 from core.model_manager import ModelManager
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush, QShortcut, QKeySequence
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect, QEvent
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QFontMetrics, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush, QShortcut, QKeySequence
 import cv2
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import os
 import gc
+import json
 import threading
 import random
+import sys
 
-from gui.styles import COLORS
+from gui.styles import COLORS, RADIUS_SM, get_primary_font_family, set_menu_indicator
+from gui.display_names import display_name, display_names
+from gui.widgets.collapsible_section import CollapsibleSection
 from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
+from gui.view_zoom import (
+    ZOOM_MAX, ZOOM_MIN, native_zoom_factor, pinch_zoom_factor,
+    wheel_zoom_factor, zoom_at,
+)
 
 SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
 NEGATIVE_SAMPLE_CLASS_ID = -1
+
+_ASSETS_DIR = Path(__file__).parent.parent / "assets"
+
+
+def _asset_icon(name: str) -> QIcon:
+    """gui/assets 下的 SVG 图标。"""
+    return QIcon(str(_ASSETS_DIR / name))
+
+# 工具栏按钮基础高度：实际高度还会按当前字体和 sizeHint 动态向上增长。
+# QToolButton（带下拉箭头）和 QPushButton 的默认高度不一致，所以需要统一下限。
+TOOLBAR_BUTTON_HEIGHT = 32
+
+
+def _readable_on_light(color: str) -> str:
+    """把类别色压到浅底上读得出来的程度。
+
+    类别色是用户挑给「画在图片上的框」用的，亮黄、亮青这类颜色画在照片上很显眼，
+    但直接拿去当白底上的文字色就糊了。这里只在太亮时压暗，色相保持不变——
+    当前类别的颜色线索还在，字也还看得清。
+    """
+    if not color:
+        return COLORS['text_primary']
+
+    qcolor = QColor(color)
+    if not qcolor.isValid():
+        return COLORS['text_primary']
+
+    # 感知亮度（ITU-R BT.601）：白底上超过这个值的颜色基本没法当正文看
+    luminance = (
+        0.299 * qcolor.red() + 0.587 * qcolor.green() + 0.114 * qcolor.blue()
+    ) / 255
+    while luminance > 0.55:
+        qcolor = qcolor.darker(130)
+        luminance = (
+            0.299 * qcolor.red() + 0.587 * qcolor.green() + 0.114 * qcolor.blue()
+        ) / 255
+    return qcolor.name()
 
 
 class SAMModelManager:
@@ -335,6 +381,119 @@ class SAMInferenceWorker(QThread):
                 self.inference_finished.emit(False, f"推理出错: {str(e)}", None)
 
 
+def redact_secret(text: str, secret: str) -> str:
+    """把 API Key 从要显示/打印的文字里抹掉。
+
+    异常信息里偶尔会带上请求参数；密钥不该进日志、不该进弹窗、更不该进测试输出。
+    """
+    if not secret or not text:
+        return text
+    return text.replace(secret, "***")
+
+
+def llm_detect(config: dict, image_path: str, target: str) -> List[Dict]:
+    """调一次视觉大模型，返回 [{'label', 'bbox'}]。
+
+    只做网络请求和解析，不碰界面也不碰数据库——单张和批量共用同一条路径，
+    调用方负责把它放进后台线程。
+    """
+    import base64
+    import re
+    from openai import OpenAI
+
+    with open(image_path, "rb") as f:
+        img_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+    client = OpenAI(api_key=config['api_key'], base_url=config['base_url'])
+
+    completion = client.chat.completions.create(
+        model=config['model_name'],
+        messages=[
+            {"role": "system", "content": config['system_prompt']},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": config['user_prompt'].format(target=target)},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
+                    }
+                ]
+            }
+        ]
+    )
+
+    response_text = completion.choices[0].message.content or ""
+
+    # 约定的返回格式: target,[xmin,ymin,xmax,ymax]
+    detections = []
+    for label, xmin, ymin, xmax, ymax in re.findall(
+        r'([^,\n]+),\[(\d+),(\d+),(\d+),(\d+)\]', response_text
+    ):
+        detections.append({
+            "label": label.strip(),
+            "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)],
+        })
+    return detections
+
+
+class LLMBatchWorker(QThread):
+    """LLM 批量推理：一整批图片的网络请求都在这个线程里跑。
+
+    原来这段是在界面线程里 for 循环逐张发请求，靠 QProgressDialog 撑场面——
+    每张图要等几秒，这几秒里窗口是死的（拖不动、点不了、取消键也要等当前这张
+    回来才轮得到）。搬到后台之后：进度实时、取消立刻生效、失败的图片单独记账。
+
+    线程只负责「发请求 + 解析」；标注写库仍然回到界面线程做（signal 带回结果），
+    数据库的写入路径不多一个并发来源。
+    """
+
+    image_started = pyqtSignal(int, str)     # 第几张（从 1 数）, 文件名
+    image_done = pyqtSignal(int, list, str)  # image_id, 检测结果, 出错原因（''=成功）
+    batch_finished = pyqtSignal(int, int, bool)  # 成功数, 失败数, 是否被取消
+
+    def __init__(self, config: dict, images: List[Dict], target: str):
+        super().__init__()
+        self.config = config
+        self.images = images
+        self.target = target
+        self._cancelled = False
+
+    def cancel(self):
+        """请求取消：只置标志，调用方不阻塞等待。"""
+        self._cancelled = True
+
+    def run(self):
+        succeeded = 0
+        failed = 0
+
+        for i, image_data in enumerate(self.images):
+            if self._cancelled:
+                break
+
+            image_id = image_data['id']
+            self.image_started.emit(i + 1, image_data.get('filename', ''))
+
+            image_path = image_data.get('storage_path', '')
+            if not image_path or not os.path.exists(image_path):
+                failed += 1
+                self.image_done.emit(image_id, [], "图片文件不存在")
+                continue
+
+            try:
+                detections = llm_detect(self.config, image_path, self.target)
+            except Exception as e:  # noqa: BLE001  单张失败不该中断整批
+                failed += 1
+                reason = redact_secret(str(e), self.config.get('api_key', ''))
+                self.image_done.emit(image_id, [], reason or "推理失败")
+                continue
+
+            succeeded += 1
+            self.image_done.emit(image_id, detections, "")
+
+        self.batch_finished.emit(succeeded, failed, self._cancelled)
+
+
 class AnnotateImageLoadWorker(QThread):
     """标注页面图片加载工作线程"""
     
@@ -481,7 +640,11 @@ class AnnotationCanvas(QFrame):
         self.current_image_path = None
         self.image_scale = 1.0
         self.image_offset = QPoint(0, 0)
-        
+
+        # 视图锁：锁上之后切换图片不再重新适配窗口，保持当前缩放和位置
+        self.view_locked = False
+        self.lock_button = None
+
         # 标注数据
         self.annotations = []  # 当前图像的所有标注
         self.selected_annotation_id = None
@@ -553,7 +716,10 @@ class AnnotationCanvas(QFrame):
         # SAM记忆模式显示列表
         self.memory_display_points = []  # [{"x": x, "y": y, "obj_id": id}, ...]
         self.memory_display_bboxes = []  # [{"x1": x1, "y1": y1, "x2": x2, "y2": y2, "obj_id": id}, ...]
-        
+
+        # 没有图片时画布中央显示的话，由页面按当前状态填写
+        self.empty_hint = "请选择一张图片开始标注"
+
         self.init_ui()
     
     def init_ui(self):
@@ -569,29 +735,137 @@ class AnnotationCanvas(QFrame):
         # 设置鼠标追踪
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-    
+
+        # macOS 的 Cocoa ZoomNativeGesture 已经是原生捏合输入；再让 Qt 合成
+        # PinchGesture 会把同一次手势缩放两遍。其他平台保留 Qt Pinch 作为入口。
+        self.pinch_gesture_registered = sys.platform != 'darwin'
+        if self.pinch_gesture_registered:
+            self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+            self.grabGesture(Qt.GestureType.PinchGesture)
+
+        # 视图锁按钮：浮在画布右上角
+        self.lock_button = QToolButton(self)
+        self.lock_button.setCheckable(True)
+        self.lock_button.setFixedSize(28, 28)
+        self.lock_button.setIconSize(QSize(16, 16))
+        self.lock_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lock_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.lock_button.toggled.connect(self._on_view_lock_toggled)
+        self.lock_button.hide()
+        self._refresh_lock_button()
+
+    def _refresh_lock_button(self):
+        """锁按钮的图标、提示、配色跟着锁的状态走。"""
+        if self.lock_button is None:
+            return
+
+        locked = self.lock_button.isChecked()
+        self.lock_button.setIcon(
+            _asset_icon('lock-closed.svg' if locked else 'lock-open.svg')
+        )
+        self.lock_button.setToolTip(
+            "已锁定：切换图片保持缩放和位置" if locked else "锁定视图"
+        )
+        background = COLORS['selected'] if locked else COLORS['panel']
+        border = COLORS['primary'] if locked else COLORS['border']
+        # padding 必须显式清零：全局 QToolButton 给了 5px 10px，28px 的方按钮会把
+        # 图标压成一个小点
+        self.lock_button.setStyleSheet(f"""
+            QToolButton {{
+                background-color: {background};
+                border: 1px solid {border};
+                border-radius: {RADIUS_SM}px;
+                padding: 0px;
+            }}
+            QToolButton:hover {{
+                border-color: {COLORS['primary']};
+            }}
+        """)
+
+    def _on_view_lock_toggled(self, checked: bool):
+        """只改锁的状态，不动当前视图——锁上是为了保住现在看到的画面。"""
+        self.view_locked = checked
+        self._refresh_lock_button()
+
+    def _position_lock_button(self):
+        """右上角，距离右边和上边各 8px。"""
+        if self.lock_button is None:
+            return
+        self.lock_button.move(self.width() - self.lock_button.width() - 8, 8)
+        self.lock_button.raise_()
+
+    def _sync_lock_button(self):
+        """没有图片就没有视图可锁，按钮跟着藏起来。"""
+        if self.lock_button is None:
+            return
+        self.lock_button.setVisible(self.current_image is not None)
+        self._position_lock_button()
+
+    def _capture_locked_view(self) -> Optional[Tuple[float, float, float]]:
+        """锁定时记下缩放，以及视口中心落在当前图上的归一化位置（0~1）。"""
+        if not self.view_locked or self.current_image is None or self.image_scale <= 0:
+            return None
+
+        center = self.rect().center()
+        img_x, img_y = self.widget_to_image(center.x(), center.y())
+        return (
+            self.image_scale,
+            img_x / max(self.current_image.width(), 1),
+            img_y / max(self.current_image.height(), 1),
+        )
+
+    def _apply_locked_view(self, view: Tuple[float, float, float]):
+        """把上一张图的缩放和归一化中心搬到新图上：同尺寸时等于原样保留。"""
+        scale, norm_x, norm_y = view
+        self.image_scale = scale
+
+        width = self.current_image.width()
+        height = self.current_image.height()
+        center = self.rect().center()
+        self.image_offset = QPoint(
+            self._clamp_offset(center.x() - norm_x * width * scale, width * scale, self.width()),
+            self._clamp_offset(center.y() - norm_y * height * scale, height * scale, self.height()),
+        )
+
+    @staticmethod
+    def _clamp_offset(offset: float, scaled_length: float, viewport_length: int) -> int:
+        """新旧图尺寸差得离谱时，别让图整个滑出画布——至少留一条边在视口里。"""
+        overlap = min(40.0, scaled_length)
+        low = overlap - scaled_length
+        high = viewport_length - overlap
+        return int(round(min(max(offset, low), high)))
+
     def load_image(self, image_path: str):
         """加载图像"""
         if not image_path or not os.path.exists(image_path):
             self.current_image = None
             self.current_image_path = None
+            self._sync_lock_button()
             self.update()
             return
-        
+
         # 使用OpenCV加载图像
         img = cv2.imread(image_path)
         if img is not None:
+            # 换图之前先问上一张：锁着就把它的缩放和视口中心留下来
+            locked_view = self._capture_locked_view()
+
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = img.shape
             bytes_per_line = ch * w
             qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             self.current_image = QPixmap.fromImage(qt_image)
             self.current_image_path = image_path
-            
-            # 重置视图
-            self.reset_view()
+
+            if locked_view is None:
+                # 没锁（或上一张压根没图）：照旧适配窗口
+                self.reset_view()
+            else:
+                self._apply_locked_view(locked_view)
+
+            self._sync_lock_button()
             self.update()
-    
+
     def reset_view(self):
         """重置视图"""
         if self.current_image is None:
@@ -672,8 +946,12 @@ class AnnotationCanvas(QFrame):
         if self.current_image is None:
             # 显示提示文字
             painter.setPen(QColor(COLORS['text_secondary']))
-            painter.setFont(QFont("Microsoft YaHei", 14))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "请选择一张图片开始标注")
+            painter.setFont(QFont(get_primary_font_family(), 14))
+            painter.drawText(
+                self.rect().adjusted(40, 0, -40, 0),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                self.empty_hint
+            )
             return
         
         # 绘制图像
@@ -750,7 +1028,7 @@ class AnnotationCanvas(QFrame):
                 
                 # 绘制ID
                 painter.setPen(QColor(255, 255, 255))
-                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+                painter.setFont(QFont(get_primary_font_family(), 10, QFont.Weight.Bold))
                 painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, f"ID:{obj_id}")
         
         # 绘制记忆对象的所有框
@@ -790,7 +1068,7 @@ class AnnotationCanvas(QFrame):
                 label_rect = QRect(p1.x(), p1.y() - 20, 40, 20)
                 painter.drawRect(label_rect)
                 painter.setPen(QColor(255, 255, 255))
-                painter.setFont(QFont("Microsoft YaHei", 9))
+                painter.setFont(QFont(get_primary_font_family(), 9))
                 painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, f"ID:{obj_id}")
         
         # 绘制当前正在添加的点（临时标记）
@@ -802,7 +1080,7 @@ class AnnotationCanvas(QFrame):
             painter.drawEllipse(widget_pos, radius, radius)
             # 绘制点编号
             painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+            painter.setFont(QFont(get_primary_font_family(), 10, QFont.Weight.Bold))
             painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, str(i + 1))
             painter.setPen(QPen(QColor(0, 255, 0), 2))
             painter.setBrush(QBrush(QColor(0, 255, 0)))
@@ -833,7 +1111,7 @@ class AnnotationCanvas(QFrame):
             
             # 绘制点编号
             painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+            painter.setFont(QFont(get_primary_font_family(), 10, QFont.Weight.Bold))
             painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, str(i + 1))
             
             # 恢复绘制样式
@@ -1765,32 +2043,65 @@ class AnnotationCanvas(QFrame):
     
     def wheelEvent(self, event: QWheelEvent):
         """鼠标滚轮事件 - 缩放"""
-        if self.current_image is None:
-            return
-        
-        # 获取鼠标位置
-        mouse_pos = event.position().toPoint()
-        
-        # 计算缩放前鼠标对应的图像坐标
-        img_x_before = (mouse_pos.x() - self.image_offset.x()) / self.image_scale
-        img_y_before = (mouse_pos.y() - self.image_offset.y()) / self.image_scale
-        
-        # 计算缩放因子
         delta = event.angleDelta().y()
-        zoom_factor = 1.1 if delta > 0 else 0.9
-        
-        # 应用缩放
-        new_scale = self.image_scale * zoom_factor
-        new_scale = max(0.1, min(5.0, new_scale))  # 限制缩放范围
-        
-        # 调整偏移量，使鼠标位置对应的图像点保持不变
-        self.image_offset = QPoint(
-            int(mouse_pos.x() - img_x_before * new_scale),
-            int(mouse_pos.y() - img_y_before * new_scale)
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        self._zoom_by_factor(wheel_zoom_factor(delta), event.position())
+        event.accept()
+
+    def event(self, event):
+        """统一接住原生捏合和 Qt PinchGesture，避免平台分支各自算缩放。"""
+        event_type = event.type()
+        if event_type == QEvent.Type.NativeGesture:
+            gesture_type = event.gestureType()
+            if gesture_type in (
+                Qt.NativeGestureType.BeginNativeGesture,
+                Qt.NativeGestureType.EndNativeGesture,
+            ):
+                event.accept()
+                return True
+            if gesture_type == Qt.NativeGestureType.ZoomNativeGesture:
+                self._zoom_by_factor(native_zoom_factor(event.value()), event.position())
+                event.accept()
+                return True
+            return super().event(event)
+
+        if event_type == QEvent.Type.Gesture:
+            pinch = event.gesture(Qt.GestureType.PinchGesture)
+            if pinch is None:
+                return super().event(event)
+
+            anchor = self.mapFromGlobal(pinch.centerPoint().toPoint())
+            if not self.rect().contains(anchor):
+                anchor = self.rect().center()
+            self._zoom_by_factor(pinch_zoom_factor(pinch.scaleFactor()), anchor)
+            event.accept(pinch)
+            return True
+
+        return super().event(event)
+
+    def _zoom_by_factor(self, factor: float, anchor) -> bool:
+        """所有缩放入口共用这里；只在最终落到像素坐标时取整，并至多刷新一次。"""
+        if self.current_image is None:
+            return False
+
+        new_scale, offset_x, offset_y = zoom_at(
+            self.image_scale,
+            self.image_offset.x(),
+            self.image_offset.y(),
+            anchor.x(),
+            anchor.y(),
+            factor,
+            (ZOOM_MIN, ZOOM_MAX),
         )
+        new_offset = QPoint(int(round(offset_x)), int(round(offset_y)))
+        if new_scale == self.image_scale and new_offset == self.image_offset:
+            return False
+
         self.image_scale = new_scale
-        
+        self.image_offset = new_offset
         self.update()
+        return True
     
     def keyPressEvent(self, event: QKeyEvent):
         """键盘事件"""
@@ -1798,10 +2109,10 @@ class AnnotationCanvas(QFrame):
         
         # 获取快捷键设置
         settings = QSettings("EzYOLO", "Settings")
-        reset_view_key = settings.value("reset_view_shortcut", "R").upper()
+        reset_view_key = str(settings.value("reset_view_shortcut", "R"))
         
         # 重置视图快捷键
-        if event.text().upper() == reset_view_key:
+        if event_matches_shortcut(event, reset_view_key):
             self.reset_view()
             self.update()
             return
@@ -2224,7 +2535,9 @@ class AnnotationCanvas(QFrame):
     def resizeEvent(self, event):
         """窗口大小改变"""
         super().resizeEvent(event)
-        if self.current_image:
+        self._position_lock_button()
+        # 锁定时不重新适配：用户锁的就是当前这个缩放和位置
+        if self.current_image and not self.view_locked:
             self.reset_view()
 
 
@@ -2250,57 +2563,214 @@ class AnnotatePage(QWidget):
         self._negative_sample_count_cache = 0
         self._sample_stats_dirty = True
         self.default_draw_tool = 'rectangle'
-        
+        # 图片栏收起前的三栏宽度，展开时照着还回去；初值和 init_ui 里的初始比例一致
+        self._splitter_sizes = [205, 412, 247]
+
         # 自动标注相关属性
         self.auto_label_dialog = None
         self.model_manager = None
         self.batch_labeling_manager = None
+        # 批处理对话框（非模态）。同名属性在 AnnotationCanvas 上也有一份，
+        # 但页面自己这份必须先存在：show_batch_process_dialog 一进来就要读它。
+        self.batch_process_dialog = None
         self.sam_memory_objects = []
         self.sam_memory_dialog = None
         self.prev_image_shortcut = None
         self.next_image_shortcut = None
-        
+
+        # LLM 推理：单张一个线程，批量一个线程；引用留在页面上，别让它跑着就被回收。
+        # 已经收工、但线程还没真正退出的那些，先挪进 _retired_llm_workers 继续持有，
+        # 等 QThread.finished 再销毁——见 _on_llm_worker_finished。
+        self.llm_worker = None
+        self.llm_batch_worker = None
+        self._retired_llm_workers = []
+        self.llm_batch_progress = None
+        self.llm_batch_total = 0
+        self.llm_batch_added = 0
+        self.llm_batch_class_id = 0
+
         self.init_ui()
+
+    def shutdown(self):
+        """关窗前收工：正在跑的 LLM 线程先请它停，再等它退出。
+
+        QThread 对象在 run() 还没结束时被销毁会直接崩；等待给上限，
+        不让一个卡住的网络请求把整个退出流程拖死。
+        """
+        workers = [self.llm_batch_worker, self.llm_worker, *self._retired_llm_workers]
+        for worker in workers:
+            if worker is None or not worker.isRunning():
+                continue
+            if hasattr(worker, 'cancel'):
+                worker.cancel()
+            worker.wait(5000)
+
+    def _track_llm_worker(self, worker):
+        """所有 LLM 线程都从这里登记生命周期。"""
+        worker.finished.connect(self._on_llm_worker_finished)
+
+    def _on_llm_worker_finished(self):
+        """线程真的退出了才销毁它。
+
+        业务信号（image_done / batch_finished）是 run() 里的最后几句，那会儿
+        run() 还没返回；在那里 deleteLater() 或者把最后一个引用丢掉，QThread
+        就会在自己还在跑的时候被销毁——直接崩。QThread.finished 是 run() 返回
+        之后才发的，只有这里放手才安全。
+        """
+        worker = self.sender()
+        if worker is None:
+            return
+        if worker is self.llm_worker:
+            self.llm_worker = None
+        if worker is self.llm_batch_worker:
+            self.llm_batch_worker = None
+        if worker in self._retired_llm_workers:
+            self._retired_llm_workers.remove(worker)
+        worker.deleteLater()
     
     def init_ui(self):
-        """初始化界面"""
+        """初始化界面
+
+        自上而下四层：
+            信息条 —— 现在在哪个项目、标哪张图、标了多少、当前是什么类别
+            主区   —— 左：图片列表 / 中：工具栏 + 画布 + 翻页 / 右：类别、AI、样本、导出
+            状态栏 —— 位置、本图标注数、当前工具（快捷键收进「快捷键」按钮的提示里）
+        """
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
-        
+
+        # 顶部信息条（任务类型选择器在这里创建，中间面板初始化时要读它）
+        self.context_bar = self.create_context_bar()
+        self.main_layout.addWidget(self.context_bar)
+
         # 创建分割器
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
+        splitter.setChildrenCollapsible(False)
+        self.splitter = splitter
+
         # 左侧：图片列表
         self.left_panel = self.create_left_panel()
         splitter.addWidget(self.left_panel)
-        
+
         # 中间：标注画布
         self.center_panel = self.create_center_panel()
         splitter.addWidget(self.center_panel)
-        
+
         # 右侧：属性面板
         self.right_panel = self.create_right_panel()
         splitter.addWidget(self.right_panel)
-        
-        # 设置分割器比例
-        splitter.setSizes([250, 700, 250])
+
+        # 初始比例要落在三个面板各自的 min/max 区间内（左 175~320 / 中 ≥412 / 右 232~280），
+        # 否则第一次绘制时会被重新夹紧，看起来像「跳」了一下。这里按 1100px 窗口的可用宽度分
+        # （内容区约 884）：中栏先拿够画布要的 412，剩下的给图片栏和属性栏。
+        splitter.setSizes([205, 412, 247])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        
-        self.main_layout.addWidget(splitter)
-        
+
+        self.main_layout.addWidget(splitter, 1)
+
         # 底部状态栏
         self.status_bar = self.create_status_bar()
         self.main_layout.addWidget(self.status_bar)
 
         self._init_navigation_shortcuts()
+        self._restore_image_list_collapsed()
+        self._update_context_bar()
+        self._update_action_availability()
 
     def showEvent(self, event):
         """显示页面时刷新快捷键配置。"""
         self._refresh_navigation_shortcuts()
         super().showEvent(event)
+
+    def create_context_bar(self) -> QWidget:
+        """顶部信息条：当前图片 / 工具 / 标注方式。
+
+        这里不再放「当前项目」——左侧流程栏一直显示着当前项目，同一屏写两遍
+        不会让人更清楚自己在哪，只是把宽度从「当前图片」那一格里抠走。
+
+        「标注方式」留着并放在最右：它决定工具栏给的是方框、多边形还是关键点，
+        不是纯展示，撤掉的话用户就没有地方换标注形状了。
+        """
+        bar = QWidget()
+        bar.setObjectName("page_header")
+
+        layout = QGridLayout(bar)
+        layout.setContentsMargins(16, 6, 16, 6)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(2)
+
+        # 当前图片：第几张 + 是哪张 + 标没标。文件名可省略，但不会挤动工具。
+        self.image_name_label = QLabel()
+        self.image_name_label.setObjectName("title")
+        self.image_name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.image_name_label.setMinimumWidth(240)
+        self.image_name_label.setMaximumWidth(320)
+        self.image_name_label.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
+        self._register_elided_label(self.image_name_label)
+        self._set_elided_text(self.image_name_label, "未选择图片")
+
+        # 标注方式（任务类型）：决定用什么形状标注。
+        self.task_combo = QComboBox()
+        self.task_combo.addItems(["detect", "segment", "pose", "classify"])
+        self.task_combo.setFixedWidth(128)
+        self.task_combo.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
+        self.task_combo.setToolTip(
+            "决定用什么形状标注：\n"
+            "detect 检测 = 画矩形框\n"
+            "segment 分割 = 画多边形\n"
+            "pose 姿态 = 点关键点\n"
+            "classify 分类 = 整张图给一个类别"
+        )
+        self.task_combo.currentTextChanged.connect(self.on_task_changed)
+
+        # 工具栏直接落在顶栏的值行，不再占画布上方的一整行。
+        # 高度不钉死；赋值完成后再刷新一次，这时 refresh 方法才能拿到
+        # self.toolbar，并把按钮按字体算出的共同最小高度同步给容器。
+        self.toolbar = self.create_toolbar()
+        self.refresh_toolbar_button_layout()
+
+        for column, caption in ((0, "当前图片"), (1, "工具"), (3, "标注方式")):
+            label = QLabel(caption)
+            label.setObjectName("caption")
+            layout.addWidget(label, 0, column)
+        layout.addWidget(self.image_name_label, 1, 0)
+        layout.addWidget(self.toolbar, 1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.addWidget(self.task_combo, 1, 3)
+
+        return bar
+
+    def _register_elided_label(self, label: QLabel):
+        """登记一个会随宽度打省略号的标签：自己变宽变窄时重算。"""
+        if not hasattr(self, '_elided_labels'):
+            self._elided_labels = []
+        if label not in self._elided_labels:
+            self._elided_labels.append(label)
+            label.installEventFilter(self)
+
+    def _set_elided_text(self, label: QLabel, text: str, tooltip: Optional[str] = None):
+        """给标签设文本：显示时按当前宽度截断，完整内容放进 tooltip。"""
+        label.setProperty('_full_text', text)
+        label.setToolTip(text if tooltip is None else tooltip)
+        self._apply_elide(label)
+
+    def _apply_elide(self, label: QLabel):
+        """按标签当前宽度重新截断，永远不会切在半个字上。"""
+        full = label.property('_full_text')
+        if full is None:
+            return
+        metrics = QFontMetrics(label.font())
+        available = max(label.width(), 32)
+        label.setText(metrics.elidedText(str(full), Qt.TextElideMode.ElideRight, available))
+
+    def eventFilter(self, obj, event):
+        """信息条上的标签一变宽/变窄，就重新算省略号。"""
+        if event.type() == QEvent.Type.Resize and obj in getattr(self, '_elided_labels', ()):
+            self._apply_elide(obj)
+        return super().eventFilter(obj, event)
 
     def _init_navigation_shortcuts(self):
         """初始化翻页快捷键，避免依赖控件焦点。"""
@@ -2314,15 +2784,56 @@ class AnnotatePage(QWidget):
 
         self._refresh_navigation_shortcuts()
 
-    def _refresh_navigation_shortcuts(self):
-        """读取设置中的翻页快捷键。"""
+    def _shortcut_keys(self) -> Dict[str, str]:
+        """当前生效的快捷键，与 keyPressEvent 读的是同一份设置。"""
         from PyQt6.QtCore import QSettings
 
         settings = QSettings("EzYOLO", "Settings")
-        prev_image_key = str(settings.value("prev_image_shortcut", "A")).upper()
-        next_image_key = str(settings.value("next_image_shortcut", "D")).upper()
-        self.prev_image_shortcut.setKey(QKeySequence(prev_image_key))
-        self.next_image_shortcut.setKey(QKeySequence(next_image_key))
+        return {
+            'prev': str(settings.value("prev_image_shortcut", "A")).upper(),
+            'next': str(settings.value("next_image_shortcut", "D")).upper(),
+            'rect': str(settings.value("rect_tool_shortcut", "W")).upper(),
+            'poly': str(settings.value("poly_tool_shortcut", "P")).upper(),
+            'move': str(settings.value("move_tool_shortcut", "V")).upper(),
+            'delete': str(settings.value("delete_shortcut", "DELETE")).upper(),
+        }
+
+    def _refresh_navigation_shortcuts(self):
+        """读取设置中的快捷键，并同步到翻页按钮和各处工具提示。"""
+        keys = self._shortcut_keys()
+        self.prev_image_shortcut.setKey(QKeySequence(keys['prev']))
+        self.next_image_shortcut.setKey(QKeySequence(keys['next']))
+
+        if hasattr(self, 'btn_prev'):
+            self.btn_prev.setText(f"◀ 上一张 ({keys['prev']})")
+            self.btn_next.setText(f"下一张 ({keys['next']}) ▶")
+            self._sync_navigation_button_sizes()
+
+        if hasattr(self, 'btn_move'):
+            self.btn_move.setToolTip(f"拖动画布和已有标注\n快捷键: {keys['move']}")
+        if hasattr(self, 'btn_delete'):
+            self.btn_delete.setToolTip(
+                f"删除当前选中的标注\n快捷键: {keys['delete']}\n下拉菜单里可以删除整张图片"
+            )
+        if hasattr(self, 'btn_draw_tool'):
+            self.refresh_draw_tool_button()
+
+        # 快捷键表不再常驻状态栏（1100px 下会被切断），改挂在「快捷键」按钮的提示里
+        shortcut_text = "\n".join([
+            f"{keys['prev']} / {keys['next']}　上一张 / 下一张",
+            f"{keys['rect']}　矩形",
+            f"{keys['poly']}　多边形",
+            f"{keys['move']}　移动",
+            "1-9　切换类别",
+            f"{keys['delete']}　删除标注",
+            "Ctrl+Z　撤销",
+        ])
+        if hasattr(self, 'btn_shortcut_help'):
+            self.btn_shortcut_help.setToolTip(shortcut_text)
+        if hasattr(self, 'status_bar'):
+            self.status_bar.setToolTip(shortcut_text)
+
+        self._update_canvas_placeholder()
 
     def _should_handle_navigation_shortcut(self) -> bool:
         """在当前焦点状态下是否允许触发翻页快捷键。"""
@@ -2354,89 +2865,125 @@ class AnnotatePage(QWidget):
 
     def create_left_panel(self) -> QWidget:
         """创建左侧面板 - 图片列表"""
-        panel = QFrame()
-        panel.setFrameStyle(QFrame.Shape.StyledPanel)
-        panel.setMaximumWidth(300)
-        panel.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['panel']};
-                border-right: 1px solid {COLORS['border']};
-            }}
-        """)
-        
+        panel = QWidget()
+        panel.setMinimumWidth(175)
+        panel.setMaximumWidth(320)
+
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(10, 10, 6, 10)
         layout.setSpacing(8)
-        
-        # 标题
-        title = QLabel("图片列表")
-        title.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold;")
-        layout.addWidget(title)
-        
-        # 任务类型选择器
-        task_layout = QHBoxLayout()
-        task_label = QLabel("任务类型:")
-        task_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        task_layout.addWidget(task_label)
-        
-        self.task_combo = QComboBox()
-        self.task_combo.addItems(["detect", "segment", "pose", "classify"])
-        self.task_combo.currentTextChanged.connect(self.on_task_changed)
-        task_layout.addWidget(self.task_combo)
-        layout.addLayout(task_layout)
-        
+
+        # 标题行：「图片 · 张数」+ 收起按钮。收起后这一整栏的宽度让给画布。
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+
+        self.image_list_title = QLabel("图片")
+        self.image_list_title.setObjectName("h2")
+        title_row.addWidget(self.image_list_title)
+        title_row.addStretch(1)
+
+        self.btn_collapse_image_list = self._ghost_icon_button(
+            'chevron-left.svg', 24, "收起图片列表"
+        )
+        self.btn_collapse_image_list.clicked.connect(
+            lambda: self._set_image_list_collapsed(True)
+        )
+        title_row.addWidget(self.btn_collapse_image_list)
+
+        layout.addLayout(title_row)
+
+        # 这个项目里有多少图、标了多少
+        self.image_list_caption = QLabel("还没有图片")
+        self.image_list_caption.setObjectName("caption")
+        self.image_list_caption.setWordWrap(True)
+        layout.addWidget(self.image_list_caption)
+
         # 筛选
         self.image_filter = QComboBox()
         self.image_filter.addItems(["全部", "未标注", "已标注"])
+        self.image_filter.setToolTip("只看还没标的图片，可以避免漏标")
         self.image_filter.currentTextChanged.connect(self.filter_images)
         layout.addWidget(self.image_filter)
-        
-        # 图片列表
+
+        # 图片列表（✓ = 已标注，○ = 还没标）
         self.image_list = QListWidget()
-        self.image_list.setIconSize(QSize(80, 80))
-        self.image_list.setSpacing(4)
+        # 缩略图和文件名共用一行的宽度：80px 的图会把文件名挤成「sho…」，
+        # 64px 刚好让 shot0.jpg 这种长度完整显示
+        self.image_list.setIconSize(QSize(64, 64))
+        self.image_list.setSpacing(2)
+        self.image_list.setToolTip("✓ 已标注　○ 还没标注")
+        # 缩略图占掉大半行宽，文件名再长也只能就地省略：
+        # 让列表横向滚动的话，用户得拖着滚动条才能看全一个文件名，反而更糟
+        self.image_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.image_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.image_list.setWordWrap(False)
         self.image_list.itemClicked.connect(self.on_image_selected)
-        self.image_list.setStyleSheet(f"""
-            QListWidget {{
-                background-color: {COLORS['sidebar']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 4px;
+        layout.addWidget(self.image_list, 1)
+
+        return panel
+
+    def _ghost_icon_button(self, icon_name: str, size: int, tooltip: str) -> QToolButton:
+        """只有图标、没有底色的小按钮：收起 / 展开图片栏用。"""
+        button = QToolButton()
+        button.setIcon(_asset_icon(icon_name))
+        button.setIconSize(QSize(12, 12))
+        button.setFixedSize(size, size)
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # padding 显式清零：全局 QToolButton 有 5px 10px，会把这么小的按钮里的图标压没
+        button.setStyleSheet(f"""
+            QToolButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: {RADIUS_SM}px;
+                padding: 0px;
             }}
-            QListWidget::item {{
-                background-color: {COLORS['panel']};
-                border-radius: 4px;
-                padding: 4px;
-            }}
-            QListWidget::item:selected {{
-                background-color: {COLORS['primary']};
+            QToolButton:hover {{
+                background-color: {COLORS['hover']};
             }}
         """)
-        layout.addWidget(self.image_list)
-        
-        # 导航按钮
-        nav_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("◀ 上一张")
-        self.btn_prev.clicked.connect(self.prev_image)
-        self.btn_next = QPushButton("下一张 ▶")
-        self.btn_next.clicked.connect(self.next_image)
-        nav_layout.addWidget(self.btn_prev)
-        nav_layout.addWidget(self.btn_next)
-        layout.addLayout(nav_layout)
-        
-        return panel
-    
+        return button
+
+    def _set_image_list_collapsed(self, collapsed: bool, persist: bool = True):
+        """收起 / 展开左侧图片栏。
+
+        收起前先记下三栏当前宽度：QSplitter 把左栏让出来的空间分给中栏，
+        展开时再按记下的宽度还回去（受窗口约束可能有几个像素出入）。
+        """
+        if collapsed and self.left_panel.isVisible():
+            self._splitter_sizes = self.splitter.sizes()
+
+        self.left_panel.setVisible(not collapsed)
+        self.btn_expand_image_list.setVisible(collapsed)
+
+        if not collapsed and self._splitter_sizes:
+            self.splitter.setSizes(self._splitter_sizes)
+
+        if persist:
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("EzYOLO", "Settings")
+            settings.setValue("annotate_image_list_collapsed", collapsed)
+
+    def _restore_image_list_collapsed(self):
+        """按上次退出时的状态决定图片栏是收着还是开着。"""
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("EzYOLO", "Settings")
+        collapsed = str(settings.value("annotate_image_list_collapsed", False)).lower() in ('true', '1')
+        self._set_image_list_collapsed(collapsed, persist=False)
+
     def create_center_panel(self) -> QWidget:
-        """创建中间面板 - 标注画布"""
+        """创建中间面板 - 标注画布 + 翻页"""
         panel = QWidget()
-        panel.setMinimumWidth(620)
+        # 画布自己的最小宽度就是 400，加上左右各 6px 边距，这一栏少于 412 就会把画布
+        # 的右缘（以及贴在右上角的视图锁）裁掉。左 175 + 中 412 + 右 232 + 手柄，
+        # 1100px 窗口下仍然放得下。
+        panel.setMinimumWidth(412)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(6, 6, 6, 10)
         layout.setSpacing(8)
-        
-        # 工具栏
-        toolbar = self.create_toolbar()
-        layout.addWidget(toolbar)
-        
+
         # 标注画布
         self.canvas = AnnotationCanvas()
         self.canvas.annotation_created.connect(self.on_annotation_created)
@@ -2444,32 +2991,86 @@ class AnnotatePage(QWidget):
         self.canvas.annotation_modified.connect(self.on_annotation_modified)
         self.canvas.annotation_deleted.connect(self.on_annotation_deleted)
         layout.addWidget(self.canvas, stretch=1)
-        
+
+        # 翻页：这一页最主要的下一步动作就是「下一张」
+        layout.addWidget(self.create_navigation_bar())
+
         # 初始化时根据当前任务类型调整工具按钮的可见性
         current_task = self.task_combo.currentText()
         self.adjust_tool_visibility(current_task)
-        
+
         return panel
+
+    def create_navigation_bar(self) -> QWidget:
+        """画布下方的翻页条：上一张 / 下一张（主操作）。"""
+        bar = QWidget()
+        bar.setToolTip("标注自动保存，不需要手动保存")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.btn_prev = QPushButton("◀ 上一张")
+        self.btn_prev.setMinimumHeight(34)
+        self.btn_prev.clicked.connect(self.prev_image)
+        layout.addWidget(self.btn_prev)
+
+        layout.addStretch(1)
+
+        self.btn_next = QPushButton("下一张 ▶")
+        self.btn_next.setObjectName("primary")
+        self.btn_next.setMinimumHeight(34)
+        self.btn_next.clicked.connect(self.next_image)
+        layout.addWidget(self.btn_next)
+
+        self._sync_navigation_button_sizes()
+
+        return bar
+
+    def _sync_navigation_button_sizes(self):
+        """翻页按钮始终取两者所需的较大尺寸，避免左右一大一小。"""
+        buttons = (self.btn_prev, self.btn_next)
+        for button in buttons:
+            button.setMinimumSize(0, 0)
+            button.setMaximumSize(16777215, 16777215)
+
+        width = max(button.sizeHint().width() for button in buttons)
+        height = max(34, *(button.sizeHint().height() for button in buttons))
+        for button in buttons:
+            button.setFixedSize(width, height)
     
     def create_toolbar(self) -> QWidget:
-        """创建工具栏"""
-        toolbar = QFrame()
-        toolbar.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['panel']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 6px;
-            }}
-        """)
+        """创建工具栏：一行安静的控件条，只放画标注和改标注的动作。
+
+        以前这里是一张带边框的卡片，还给每组按钮顶了一行小标题（「标注工具」「修改」）。
+        三五个按钮不需要目录：标题多占一行高度，边框把它框成一个和画布平起平坐的区块，
+        画布因此矮了一截——而画布才是这一页真正要看的东西。
+        现在只留按钮本身，中间一根竖线把「画」和「改/删」分开。
+        """
+        toolbar = QWidget()
+        toolbar.setObjectName("annotate_toolbar")
+        # 卡片底色和边框都不要：它是浮在画布上方的一条控件，不是又一张卡片
+        toolbar.setStyleSheet(
+            "QWidget#annotate_toolbar { background-color: transparent; border: none; }"
+        )
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(6, 3, 6, 3)
-        toolbar_layout.setSpacing(14)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(6)
         base_tool_button_style = self._toolbar_chip_style('tool')
-        
+
+        # 图片栏收起时，这里是把它叫回来的唯一入口；平时不占位
+        self.btn_expand_image_list = self._ghost_icon_button(
+            'chevron-right.svg', 28, "展开图片列表"
+        )
+        self.btn_expand_image_list.clicked.connect(
+            lambda: self._set_image_list_collapsed(False)
+        )
+        self.btn_expand_image_list.hide()
+        toolbar_layout.addWidget(self.btn_expand_image_list)
+
         # 工具按钮组
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
-        
+
         # 绘制工具（矩形/多边形合并）
         self.btn_draw_tool = QToolButton()
         self.btn_draw_tool.setCheckable(True)
@@ -2485,16 +3086,16 @@ class AnnotatePage(QWidget):
         self.btn_draw_tool.setMenu(self.draw_tool_menu)
         self.btn_draw_tool.hide()  # 默认隐藏
         self.tool_group.addButton(self.btn_draw_tool)
-        
+
         # 关键点工具
-        self.btn_keypoint = QPushButton("📍 关键点")
-        self.btn_keypoint.setToolTip("关键点工具")
+        self.btn_keypoint = QPushButton("关键点")
+        self.btn_keypoint.setToolTip("在目标上依次点关键点（姿态任务）")
         self.btn_keypoint.setCheckable(True)
         self.btn_keypoint.clicked.connect(lambda: self.set_tool('keypoint'))
         self.btn_keypoint.setStyleSheet(base_tool_button_style)
         self.btn_keypoint.hide()  # 默认隐藏
         self.tool_group.addButton(self.btn_keypoint)
-        
+
         # # OBB工具
         # self.btn_obb = QPushButton("🔲 旋转矩形 (O)")
         # self.btn_obb.setCheckable(True)
@@ -2502,19 +3103,24 @@ class AnnotatePage(QWidget):
         # toolbar.addWidget(self.btn_obb)
         # self.btn_obb.hide()  # 默认隐藏
         # self.tool_group.addButton(self.btn_obb)
-        
+
         # 移动工具
-        self.btn_move = QPushButton("✋ 移动")
-        self.btn_move.setToolTip("移动视图")
+        self.btn_move = QPushButton("移动")
+        self.btn_move.setToolTip("拖动画布和已有标注")
         self.btn_move.setCheckable(True)
         self.btn_move.clicked.connect(lambda: self.set_tool('move'))
         self.btn_move.setStyleSheet(base_tool_button_style)
         self.tool_group.addButton(self.btn_move)
 
+        # 撤销按钮（和左边几个工具用同一套尺寸，一行排开时高度、内边距才对得齐）
+        self.btn_undo = QPushButton("撤销")
+        self.btn_undo.setToolTip("撤销上一步\n快捷键: Ctrl+Z")
+        self.btn_undo.setStyleSheet(base_tool_button_style)
+        self.btn_undo.clicked.connect(self.undo)
+
         # 删除按钮（主动作删标注，下拉菜单删图片）
         self.btn_delete = QToolButton()
-        self.btn_delete.setText("🗑️ 删除")
-        self.btn_delete.setToolTip("删除当前选中标注\n快捷键: D")
+        self.btn_delete.setText("删除")
         self.btn_delete.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.btn_delete.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.btn_delete.setStyleSheet(self._toolbar_chip_style('danger'))
@@ -2524,202 +3130,195 @@ class AnnotatePage(QWidget):
         self.action_delete_current_image.triggered.connect(self.delete_current_image)
         self.delete_menu.aboutToShow.connect(self.update_delete_menu_state)
         self.btn_delete.setMenu(self.delete_menu)
-        
-        # 撤销按钮
-        self.btn_undo = QPushButton("↶ 撤销")
-        self.btn_undo.setToolTip("撤销上一步\n快捷键: Ctrl+Z")
-        self.btn_undo.clicked.connect(self.undo)
-        self.btn_undo.setStyleSheet(base_tool_button_style)
-        
-        # 自动标注按钮
-        self.btn_auto_label = QPushButton("🤖 自动标注")
-        self.btn_auto_label.setMenu(self.create_auto_label_menu())
-        self.btn_auto_label.setStyleSheet(self._toolbar_menu_button_style('ai_blue'))
-        
-        # SAM自动标注按钮
-        self.btn_sam = QPushButton("🎯 SAM")
-        self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
-        self.btn_sam.setStyleSheet(self._toolbar_menu_button_style('ai_green'))
-        self.apply_sam_button_mode()
-        
-        # LLM自动标注按钮
-        self.btn_llm_label = QPushButton("🧠 LLM")
-        self.btn_llm_label.setToolTip("使用多模态大模型进行自动标注")
-        self.btn_llm_label.setMenu(self.create_llm_menu())
-        self.btn_llm_label.setStyleSheet(self._toolbar_menu_button_style('ai_gold'))
-        
-        # 批量处理按钮
-        self.btn_batch_process = QPushButton("📋 批处理")
-        self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
-        self.btn_batch_process.setToolTip("批量处理工具")
-        self.btn_batch_process.setStyleSheet(self._toolbar_chip_style('ai_olive'))
 
+        # 画的工具 | 改和删。一行排开，中间一根细线分开——
+        # 「删除」离「画方框」远一点，手滑的代价小一点。
         self.toolbar_draw_buttons = [self.btn_draw_tool, self.btn_keypoint, self.btn_move]
-        self.toolbar_edit_buttons = [self.btn_delete, self.btn_undo]
-        self.toolbar_ai_buttons = [self.btn_auto_label, self.btn_sam, self.btn_llm_label, self.btn_batch_process]
-        self.toolbar_draw_group = self._create_toolbar_button_group(self.toolbar_draw_buttons)
-        self.toolbar_edit_group = self._create_toolbar_button_group(self.toolbar_edit_buttons)
-        self.toolbar_ai_group = self._create_toolbar_button_group(self.toolbar_ai_buttons)
-        self.toolbar_groups = [
-            (self.toolbar_draw_group, self.toolbar_draw_buttons),
-            (self.toolbar_edit_group, self.toolbar_edit_buttons),
-            (self.toolbar_ai_group, self.toolbar_ai_buttons),
-        ]
+        self.toolbar_edit_buttons = [self.btn_undo, self.btn_delete]
+        self.toolbar_buttons = self.toolbar_draw_buttons + self.toolbar_edit_buttons
 
-        toolbar_layout.addWidget(self.toolbar_draw_group)
-        toolbar_layout.addWidget(self.toolbar_edit_group)
-        toolbar_layout.addWidget(self.toolbar_ai_group)
+        for button in self.toolbar_draw_buttons:
+            toolbar_layout.addWidget(button)
+        self.toolbar_separator = self._toolbar_separator()
+        toolbar_layout.addWidget(self.toolbar_separator)
+        for button in self.toolbar_edit_buttons:
+            toolbar_layout.addWidget(button)
         toolbar_layout.addStretch(1)
 
         self.refresh_draw_tool_button()
         self.refresh_toolbar_button_layout()
-        
+
         return toolbar
 
-    def _create_toolbar_button_group(self, buttons) -> QWidget:
-        """创建工具栏按钮组，显式控制组内间距。"""
-        group_widget = QWidget()
-        layout = QHBoxLayout(group_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        for button in buttons:
-            layout.addWidget(button)
-        return group_widget
+    def _toolbar_separator(self) -> QFrame:
+        """工具栏里的竖直分隔线。"""
+        line = QFrame()
+        line.setFixedWidth(1)
+        line.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT - 8)
+        line.setStyleSheet(
+            f"background-color: {COLORS['border']}; border: none; border-radius: 0px;"
+        )
+        return line
 
     def _toolbar_chip_style(self, role: str) -> str:
-        """生成顶部工具栏按钮样式。"""
+        """工具栏按钮样式。
+
+        选中的工具 = 实心蓝（就是它在生效），未选中 = 描边；
+        删除是破坏性动作，单独用红色描边，不和普通工具混在一起。
+        """
         palette_map = {
             'tool': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
+                'text': COLORS['text_primary'],
+                'border': COLORS['border_strong'],
+                'hover_border': COLORS['primary_hover'],
+                'checked': COLORS['primary'],
+                'checked_hover': COLORS['primary_hover'],
             },
             'danger': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
-            },
-            'ai_blue': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
-            },
-            'ai_green': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
-            },
-            'ai_gold': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
-            },
-            'ai_olive': {
-                'bg': '#154B78',
-                'hover': '#1D629B',
-                'active': COLORS['primary'],
-                'border': '#2871A8',
-                'text': '#F7FBFF',
+                'text': COLORS['error'],
+                'border': COLORS['border_strong'],
+                'hover_border': COLORS['error'],
+                'checked': COLORS['error'],
+                'checked_hover': COLORS['error'],
             },
         }
         palette = palette_map[role]
+        arrow_name = 'chevron_down.svg' if role == 'tool' else 'chevron_down_red.svg'
+        arrow_url = (_ASSETS_DIR / arrow_name).as_posix()
+        disabled_arrow_url = (_ASSETS_DIR / 'chevron_down_disabled.svg').as_posix()
+        checked_menu_background = COLORS['panel'] if role == 'tool' else palette['checked']
+        checked_menu_border = COLORS['border'] if role == 'tool' else COLORS['panel']
         return f"""
             QPushButton, QToolButton {{
-                background-color: {palette['bg']};
+                background-color: {COLORS['panel']};
                 color: {palette['text']};
                 border: 1px solid {palette['border']};
-                border-radius: 6px;
-                padding: 4px 10px;
+                border-radius: {RADIUS_SM}px;
                 font-weight: 600;
             }}
+            QPushButton {{
+                padding: 4px 10px;
+            }}
+            /* QToolButton 在这里永远带菜单：右边留 36px 给 24px 宽的 menu-button
+               子控件（+ 一点呼吸空间），文字才不会被压进箭头区。 */
+            QToolButton {{
+                padding: 4px 36px 4px 10px;
+            }}
             QPushButton:hover, QToolButton:hover {{
-                background-color: {palette['hover']};
-                border-color: {palette['active']};
+                background-color: {COLORS['hover']};
+                border-color: {palette['hover_border']};
             }}
             QPushButton:checked, QToolButton:checked {{
-                background-color: {palette['active']};
-                color: white;
-                border-color: {palette['active']};
+                background-color: {palette['checked']};
+                color: #FFFFFF;
+                border-color: {palette['checked']};
+            }}
+            QPushButton:disabled, QToolButton:disabled {{
+                background-color: {COLORS['panel']};
+                color: {COLORS['text_disabled']};
+                border-color: {COLORS['border']};
             }}
             QToolButton::menu-button {{
                 subcontrol-origin: padding;
                 subcontrol-position: right center;
-                width: 16px;
-                background-color: rgba(255, 255, 255, 0.08);
-                border-left: 1px solid rgba(255, 255, 255, 0.14);
-                border-top-right-radius: 6px;
-                border-bottom-right-radius: 6px;
+                width: 24px;
+                background-color: {COLORS['panel']};
+                border-left: 1px solid {COLORS['border']};
+                border-top-right-radius: {RADIUS_SM}px;
+                border-bottom-right-radius: {RADIUS_SM}px;
             }}
             QToolButton::menu-button:hover {{
-                background-color: rgba(255, 255, 255, 0.14);
+                background-color: {COLORS['hover']};
             }}
-            QToolButton::menu-arrow {{
-                width: 10px;
-                height: 10px;
+            /* 子控件要写在伪状态前面。写成 QToolButton:checked::menu-button，
+               Qt 认不出子控件，会把这条的底色刷满整个按钮——没选中的「删除」
+               也会变成一整块实心红。 */
+            QToolButton::menu-button:checked {{
+                background-color: {checked_menu_background};
+                border-left: 1px solid {checked_menu_border};
             }}
+            QToolButton::menu-button:checked:hover {{
+                background-color: {checked_menu_background if role == 'tool' else palette['checked_hover']};
+                border-left: 1px solid {checked_menu_border};
+            }}
+            QToolButton::menu-button:disabled {{
+                background-color: {COLORS['panel']};
+                border-left: 1px solid {COLORS['border']};
+            }}
+            QToolButton::menu-arrow,
             QToolButton::menu-indicator {{
-                width: 10px;
-                height: 10px;
+                image: url({arrow_url});
+                width: 12px;
+                height: 12px;
             }}
-        """
-
-    def _toolbar_menu_button_style(self, role: str) -> str:
-        """菜单按钮样式：保留下拉菜单能力，但隐藏倒三角指示器。"""
-        base_style = self._toolbar_chip_style(role)
-        return base_style + """
-            QPushButton::menu-indicator {
-                image: none;
-                width: 0px;
-                subcontrol-origin: padding;
-                subcontrol-position: right center;
-            }
+            QToolButton::menu-arrow:disabled,
+            QToolButton::menu-indicator:disabled {{
+                image: url({disabled_arrow_url});
+            }}
         """
 
     def _get_toolbar_button_width(self, button) -> int:
-        """计算按钮建议宽度，菜单按钮额外预留箭头空间。"""
+        """计算按钮建议宽度，菜单按钮额外预留箭头空间。
+
+        菜单按钮不能信 QToolButton 原生的 minimumSizeHint——它不知道我们把
+        menu-button 子控件挤宽到了多少，算出来的宽度会比实际需要的窄，文字
+        就被顶进箭头区。这里按实际的内边距（左 10 + 右 36）和双边框（2px）
+        自己算，再留 6px 安全边，最后跟 sizeHint 取较大值兜底。
+        """
         text_width = button.fontMetrics().horizontalAdvance(button.text())
-        extra_padding = 40
         if isinstance(button, QToolButton) and button.menu() is not None:
-            extra_padding += 18
-        return text_width + extra_padding
+            width = text_width + 10 + 36 + 2 + 6
+            return max(width, button.sizeHint().width())
+        return text_width + 24
 
     def refresh_toolbar_button_layout(self):
-        """按分组统一顶部按钮尺寸。"""
-        button_height = 32
-        for group_widget, group in getattr(self, 'toolbar_groups', []):
-            visible_buttons = [
-                button for button in group
-                if button is not None and not button.isHidden()
-            ]
-            group_widget.setVisible(bool(visible_buttons))
-            if not visible_buttons:
-                continue
-            group_width = max(self._get_toolbar_button_width(button) for button in visible_buttons)
-            for button in visible_buttons:
-                button.setFixedHeight(button_height)
-                button.setFixedWidth(group_width)
+        """统一工具栏按钮高度，宽度按各自文字走。
+
+        以前是按分组统一宽度（都撑到组里最宽的那个），工具栏因此要 577px，
+        窗口一小就把删除按钮挤出可视区。这里只保证高度一致和一个最小宽度。
+
+        高度对所有按钮一视同仁——带下拉箭头的 QToolButton（画方框、删除）和
+        普通 QPushButton（撤销）默认的 sizeHint 不一样，不钉住的话一行排开就是
+        参差不齐的。高度不再写死成 TOOLBAR_BUTTON_HEIGHT：换一套更高的系统字体时，
+        固定高度会把文字压扁，这里改成按实际按钮取需要的最大高度，再用
+        minimumHeight 兜底，长得下的字体可以自己撑高。
+        """
+        min_button_width = 78
+        visible_buttons = [
+            button for button in getattr(self, 'toolbar_buttons', [])
+            if button is not None and not button.isHidden()
+        ]
+        toolbar_height = max(
+            [TOOLBAR_BUTTON_HEIGHT]
+            + [button.sizeHint().height() for button in visible_buttons]
+            + [button.fontMetrics().height() + 12 for button in visible_buttons]
+        )
+        for button in visible_buttons:
+            button.setMinimumHeight(toolbar_height)
+            button.setMinimumWidth(
+                max(min_button_width, self._get_toolbar_button_width(button))
+            )
+        if hasattr(self, 'toolbar'):
+            self.toolbar.setMinimumHeight(toolbar_height)
+        if hasattr(self, 'toolbar_separator'):
+            self.toolbar_separator.setFixedHeight(max(1, toolbar_height - 8))
 
     def refresh_draw_tool_button(self):
         """刷新绘制工具按钮文本与选项状态。"""
         if not hasattr(self, 'btn_draw_tool'):
             return
 
+        keys = self._shortcut_keys()
         if self.default_draw_tool == 'polygon':
-            self.btn_draw_tool.setText("🛑 绘制")
-            self.btn_draw_tool.setToolTip("当前默认绘制模式: 多边形\n点击主按钮直接进入多边形绘制")
+            self.btn_draw_tool.setText("画多边形")
+            self.btn_draw_tool.setToolTip(
+                f"沿目标轮廓依次点，回到起点闭合\n快捷键: {keys['poly']}\n点右侧箭头可换成矩形"
+            )
         else:
-            self.btn_draw_tool.setText("🟦 绘制")
-            self.btn_draw_tool.setToolTip("当前默认绘制模式: 矩形\n点击主按钮直接进入矩形绘制")
+            self.btn_draw_tool.setText("画方框")
+            self.btn_draw_tool.setToolTip(
+                f"按住左键拖出一个框\n快捷键: {keys['rect']}\n点右侧箭头可换成多边形"
+            )
 
         if hasattr(self, 'action_draw_rectangle'):
             self.action_draw_rectangle.setCheckable(True)
@@ -2758,18 +3357,25 @@ class AnnotatePage(QWidget):
         except Exception:
             pass
         self.btn_sam.setMenu(None)
+        set_menu_indicator(self.btn_sam, False)
 
         sam_config = AutoLabelDialog.get_saved_sam_config()
         sam_type = sam_config.get("sam_type", "SAM")
         usage_mode = sam_config.get("usage_mode", "normal")
 
         if usage_mode == "memory" and sam_type in ("SAM2", "SAM3"):
-            self.btn_sam.setText("🎯 SAM记忆")
-            self.btn_sam.setToolTip("SAM记忆标注：更新记忆/清空记忆/单张推理/批量推理")
+            self.btn_sam.setText("SAM 记忆标注")
+            self.btn_sam.setToolTip(
+                "先教它认一次目标（更新记忆），之后就能自动标同类目标\n"
+                "菜单：更新记忆 / 清空记忆 / 单张推理 / 批量推理"
+            )
             self.btn_sam.setMenu(self.create_sam_memory_menu())
+            set_menu_indicator(self.btn_sam, True)
         else:
-            self.btn_sam.setText("🎯 SAM")
-            self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
+            self.btn_sam.setText("SAM 交互分割")
+            self.btn_sam.setToolTip(
+                "在目标上点一下，SAM 自动分割出它的轮廓\n需要先在「用已有模型标注 → 设置」里配好 SAM 模型"
+            )
             self.btn_sam.clicked.connect(self.start_sam_annotation)
         self.refresh_toolbar_button_layout()
 
@@ -2791,204 +3397,253 @@ class AnnotatePage(QWidget):
         return menu
     
     def create_right_panel(self) -> QWidget:
-        """创建右侧面板 - 属性面板"""
-        panel = QFrame()
-        panel.setFrameStyle(QFrame.Shape.StyledPanel)
-        panel.setMaximumWidth(300)
-        panel.setStyleSheet(f"""
-            QFrame {{
-                background-color: {COLORS['panel']};
-                border-left: 1px solid {COLORS['border']};
-            }}
-        """)
-        
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-        
-        # 类别列表
-        class_group = QGroupBox("类别列表")
-        class_group.setStyleSheet(f"""
-            QGroupBox {{
-                color: {COLORS['text_primary']};
-                font-weight: bold;
-                border: 1px solid {COLORS['border']};
-                border-radius: 4px;
-                margin-top: 8px;
-                padding-top: 8px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }}
-        """)
+        """创建右侧面板 - 类别、AI 自动标注、样本管理、导出
+
+        整块可以滚动：窗口再矮也不会把下面的按钮压没。
+        """
+        panel = QWidget()
+        panel.setMinimumWidth(232)
+        panel.setMaximumWidth(280)
+
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        # 横向滚动条平时不会出现；万一字体更宽把内容撑出去，也是能滚到而不是被切掉
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(10)
+
+        layout.addWidget(self._create_class_group())
+        layout.addWidget(self._create_ai_group())
+        layout.addWidget(self._create_sample_group())
+        layout.addWidget(self._create_export_group())
+        layout.addStretch()
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        return panel
+
+    def _create_class_group(self) -> QGroupBox:
+        """类别：标注的第一步——先说清楚要画的是什么。"""
+        class_group = QGroupBox("类别")
+        class_group.setObjectName("annotate_class_group")
+        class_group.setStyleSheet(self._compact_group_style("annotate_class_group"))
         class_layout = QVBoxLayout(class_group)
-        
+        class_layout.setSpacing(8)
+
         self.class_list = QListWidget()
-        self.class_list.setStyleSheet(f"""
-            QListWidget {{
-                background-color: {COLORS['sidebar']};
-                border: 1px solid {COLORS['border']};
-            }}
-            QListWidget::item {{
-                padding: 6px 8px;
-                min-height: 24px;
-            }}
-            QListWidget::item:selected {{
-                background-color: {COLORS['primary']};
-            }}
-        """)
+        self.class_list.setMinimumHeight(96)
         self.class_list.setSpacing(2)
+        self.class_list.setToolTip("数字键 1-9 切换类别；右键类别可改名或删除")
         self.class_list.itemClicked.connect(self.on_class_selected)
         self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         class_layout.addWidget(self.class_list)
-        
-        compact_action_button_height = 24
-        compact_action_button_style = f"""
-            QPushButton {{
-                min-height: {compact_action_button_height}px;
-                max-height: {compact_action_button_height}px;
-                padding: 0 10px;
-            }}
-        """
 
-        # 添加类别按钮
-        self.btn_add_class = QPushButton("+ 添加类别")
-        self.btn_add_class.clicked.connect(self.add_class)
-        self.btn_add_class.setFixedHeight(compact_action_button_height)
-        self.btn_add_class.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_add_class.setStyleSheet(compact_action_button_style)
-        self.btn_apply_attr = QPushButton("应用修改")
-        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
-        self.btn_apply_attr.setFixedHeight(compact_action_button_height)
-        self.btn_apply_attr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_apply_attr.setStyleSheet(compact_action_button_style)
-        self.btn_apply_attr.setEnabled(False)
-        class_button_row = QHBoxLayout()
-        class_button_row.setContentsMargins(0, 0, 0, 0)
-        class_button_row.setSpacing(8)
-        class_button_row.addWidget(self.btn_add_class, 1)
-        class_button_row.addWidget(self.btn_apply_attr, 1)
-        class_layout.addLayout(class_button_row)
-        
-        layout.addWidget(class_group)
-        
-        # 标注属性 / 样本调节
-        attr_group = QGroupBox("标注属性")
-        attr_group.setStyleSheet(class_group.styleSheet())
-        attr_layout = QFormLayout(attr_group)
-        attr_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        attr_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        attr_layout.setVerticalSpacing(8)
-        attr_layout.setHorizontalSpacing(10)
-
-        field_style = f"""
-            QComboBox, QSpinBox {{
-                min-height: 32px;
-                padding: 3px 8px;
-                color: {COLORS['text_primary']};
-            }}
-        """
-        # 当前标注类别
-        self.attr_class = QComboBox()
+        # 隐藏的类别下拉：仍然承担「选中标注 → 改类别」的数据流，不再占版面
+        self.attr_class = QComboBox(class_group)
         self.attr_class.currentIndexChanged.connect(self.on_attr_class_changed)
         self.attr_class.hide()
-        
-        # 当前目标标签的样本数
+
+        self.btn_add_class = QPushButton("+ 添加类别")
+        self.btn_add_class.clicked.connect(self.add_class)
+
+        # 只有「选中了一个标注、且选的类别和它现在的不一样」时才可点
+        self.btn_apply_attr = QPushButton("改为选中类别")
+        self.btn_apply_attr.setToolTip("把画布上选中的那个标注，改成当前选中的类别")
+        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
+        self.btn_apply_attr.setEnabled(False)
+
+        # 两个按钮真 1:1 等宽：QHBoxLayout 的 stretch 只分「多出来的」空间，
+        # 文字长的那个起点就更宽，最后还是不等。栅格按列分宽度，才真的一样宽。
+        class_button_row = QGridLayout()
+        class_button_row.setContentsMargins(0, 0, 0, 0)
+        class_button_row.setHorizontalSpacing(8)
+        class_button_row.setColumnStretch(0, 1)
+        class_button_row.setColumnStretch(1, 1)
+        for column, button in enumerate((self.btn_add_class, self.btn_apply_attr)):
+            # 最小宽度放到 10：窄栏里由栅格来分宽度，按钮自己不许把列撑开
+            button.setMinimumWidth(10)
+            button.setMinimumHeight(28)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            class_button_row.addWidget(button, 0, column)
+        class_layout.addLayout(class_button_row)
+
+        return class_group
+
+    def _compact_group_style(self, object_name: str) -> str:
+        """只给这一页的某个分组用的紧凑内边距（全局 QGroupBox / QPushButton 不动）。
+
+        组里的按钮也一并收紧左右内边距：右栏窄，全局那份 padding 会让「改为选中类别」
+        这种六个字的按钮在 1100px 窗口下切字。
+        """
+        return f"""
+            QGroupBox#{object_name} {{
+                margin-top: 20px;
+                padding: 10px 12px 12px 12px;
+            }}
+            QGroupBox#{object_name} QPushButton {{
+                padding: 5px 6px;
+            }}
+            QGroupBox#{object_name} QPushButton[menuIndicator="true"] {{
+                padding-right: 30px;
+            }}
+        """
+
+    def _create_ai_group(self) -> QGroupBox:
+        """AI 自动标注：让模型先画一遍，人只做检查和微调。"""
+        ai_group = QGroupBox("AI 自动标注")
+        ai_group.setObjectName("annotate_ai_group")
+        ai_group.setStyleSheet(self._compact_group_style("annotate_ai_group"))
+        ai_group.setToolTip("模型先标一遍，你只做检查和微调")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_layout.setSpacing(8)
+
+        # 已有 YOLO 权重 → 自动画框
+        self.btn_auto_label = QPushButton("用已有模型标注")
+        self.btn_auto_label.setToolTip("用一个已经训练好的 .pt 模型自动标注\n菜单：设置 / 单张推理 / 批量推理")
+        self.btn_auto_label.setMenu(self.create_auto_label_menu())
+        set_menu_indicator(self.btn_auto_label)
+
+        # SAM：点一下就分割（文本和菜单由 apply_sam_button_mode 按设置决定）
+        self.btn_sam = QPushButton("SAM")
+
+        # 多模态大模型
+        self.btn_llm_label = QPushButton("大模型标注")
+        self.btn_llm_label.setToolTip("用多模态大模型识别图片里的目标\n菜单：单张推理 / 批量推理")
+        self.btn_llm_label.setMenu(self.create_llm_menu())
+        set_menu_indicator(self.btn_llm_label)
+
+        # 批处理不在这里：它不是「让模型帮你标」，是按像素点批量改图，
+        # 归到下面的样本管理（进阶）里，见 _create_sample_group
+        self.ai_action_buttons = [self.btn_auto_label, self.btn_sam, self.btn_llm_label]
+        for button in self.ai_action_buttons:
+            button.setMinimumHeight(32)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            ai_layout.addWidget(button)
+
+        self.apply_sam_button_mode()
+
+        return ai_group
+
+    def _create_sample_group(self) -> CollapsibleSection:
+        """样本管理：批处理 + 负样本标记 + 按类别随机删图，用来平衡数据。
+
+        默认收起：这几件事不是每天都干，但里面有一个会真删图片文件的按钮——
+        既不该常驻占掉类别和 AI 入口的位置，也不该藏进菜单里让人找不到。
+        """
+        sample_group = CollapsibleSection("样本管理（进阶）")
+        sample_group.setToolTip("按整张图片随机删除，用来平衡类别；负样本 = 已标注但没有任何框的图片")
+        sample_layout = sample_group.content_layout()
+
+        self.btn_batch_process = QPushButton("批处理")
+        self.btn_batch_process.setToolTip("按选中的像素点批量处理图片")
+        self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
+        self.btn_batch_process.setMinimumHeight(30)
+        self.btn_batch_process.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sample_layout.addWidget(self.btn_batch_process)
+
+        self.btn_mark_negative_sample = QPushButton("把当前图片标为负样本")
+        self.btn_mark_negative_sample.setToolTip("这张图里没有任何目标，也是有用的学习材料")
+        self.btn_mark_negative_sample.clicked.connect(self.mark_current_image_as_negative_sample)
+        self.btn_mark_negative_sample.setMinimumHeight(30)
+        self.btn_mark_negative_sample.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sample_layout.addWidget(self.btn_mark_negative_sample)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setVerticalSpacing(8)
+        form.setHorizontalSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        # 面板窄的时候标签自动换到字段上一行，而不是把面板顶宽
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
         self.sample_target_class = QComboBox()
+        self.sample_target_class.setMinimumWidth(90)
         self.sample_target_class.currentIndexChanged.connect(self.on_sample_target_changed)
-        self.sample_target_class.setStyleSheet(field_style)
-        attr_layout.addRow("删样标签:", self.sample_target_class)
+        form.addRow("删哪个类别:", self.sample_target_class)
 
         self.sample_count_label = QLabel("0")
-        self.sample_count_label.setMinimumHeight(32)
+        self.sample_count_label.setMinimumHeight(30)
         self.sample_count_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.sample_count_label.setStyleSheet(f"""
             QLabel {{
                 color: {COLORS['text_primary']};
-                padding: 6px 8px;
+                padding: 6px 10px;
                 border: 1px solid {COLORS['border']};
-                background-color: {COLORS['sidebar']};
-                border-radius: 4px;
+                background-color: {COLORS['inset']};
+                border-radius: {RADIUS_SM}px;
             }}
         """)
-        attr_layout.addRow("标签个数:", self.sample_count_label)
+        form.addRow("现有图片数:", self.sample_count_label)
 
         self.sample_delete_count = QSpinBox()
         self.sample_delete_count.setRange(0, 0)
-        self.sample_delete_count.setStyleSheet(field_style)
-        attr_layout.addRow("随机删去:", self.sample_delete_count)
+        self.sample_delete_count.setMinimumWidth(90)
+        form.addRow("随机删去:", self.sample_delete_count)
 
-        self.sample_hint = QLabel("按整张图片随机删除；负样本指已标注但无任何框的图片。")
-        self.sample_hint.setWordWrap(True)
-        self.sample_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 2px 0;")
-        attr_layout.addRow(self.sample_hint)
-
-        self.btn_mark_negative_sample = QPushButton("标注为负样本")
-        self.btn_mark_negative_sample.clicked.connect(self.mark_current_image_as_negative_sample)
-        self.btn_mark_negative_sample.setFixedHeight(compact_action_button_height)
-        self.btn_mark_negative_sample.setStyleSheet(compact_action_button_style)
-        self.btn_mark_negative_sample.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sample_layout.addLayout(form)
 
         self.btn_delete_random_samples = QPushButton("随机删除样本")
+        self.btn_delete_random_samples.setObjectName("danger")
+        self.btn_delete_random_samples.setToolTip("按整张图片随机删除，会连图片文件一起删掉，不可恢复")
         self.btn_delete_random_samples.clicked.connect(self.delete_random_samples_for_target)
-        self.btn_delete_random_samples.setFixedHeight(compact_action_button_height)
-        self.btn_delete_random_samples.setStyleSheet(compact_action_button_style)
+        self.btn_delete_random_samples.setMinimumHeight(30)
         self.btn_delete_random_samples.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sample_layout.addWidget(self.btn_delete_random_samples)
 
-        action_button_widget = QWidget()
-        action_button_layout = QHBoxLayout(action_button_widget)
-        action_button_layout.setContentsMargins(0, 0, 0, 0)
-        action_button_layout.setSpacing(8)
-        action_button_layout.addWidget(self.btn_mark_negative_sample, 1)
-        action_button_layout.addWidget(self.btn_delete_random_samples, 1)
-        attr_layout.addRow(action_button_widget)
-        
-        layout.addWidget(attr_group)
-        
-        # 导出功能
-        export_group = QGroupBox("数据导出")
-        export_group.setStyleSheet(class_group.styleSheet())
-        export_layout = QVBoxLayout(export_group)
-        
-        # 导出格式选择
+        return sample_group
+
+    def _create_export_group(self) -> CollapsibleSection:
+        """导出：训练不需要手动导出，这里是给外部工具用的。默认收起。"""
+        export_group = CollapsibleSection("数据导出（可选）")
+        export_group.setToolTip("训练会直接读标注，不用先导出；只有要把数据给别的工具用时才需要")
+        export_layout = export_group.content_layout()
+
         format_layout = QFormLayout()
+        format_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        format_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.export_format = QComboBox()
         self.export_format.addItems(["YOLO格式", "COCO格式"])
+        self.export_format.setMinimumWidth(90)
         format_layout.addRow("导出格式:", self.export_format)
         export_layout.addLayout(format_layout)
-        
-        # 导出按钮
-        self.btn_export_annotations = QPushButton("📤 导出标注文件")
+
+        self.btn_export_annotations = QPushButton("导出标注文件")
         self.btn_export_annotations.clicked.connect(self.export_annotations)
+        self.btn_export_annotations.setMinimumHeight(30)
         export_layout.addWidget(self.btn_export_annotations)
-        
-        self.btn_export_dataset = QPushButton("📦 导出完整数据集")
+
+        self.btn_export_dataset = QPushButton("导出完整数据集")
+        self.btn_export_dataset.setToolTip("图片 + 标注 + 训练用的 data.yaml")
         self.btn_export_dataset.clicked.connect(self.export_dataset)
+        self.btn_export_dataset.setMinimumHeight(30)
         export_layout.addWidget(self.btn_export_dataset)
-        
-        layout.addWidget(export_group)
-        
-        layout.addStretch()
-        
-        return panel
+
+        return export_group
     
     def create_auto_label_menu(self) -> QMenu:
         """创建自动标注下拉菜单"""
         menu = QMenu()
         
         # 设置选项
-        action_settings = menu.addAction("⚙️ 设置")
+        action_settings = menu.addAction("设置")
         action_settings.triggered.connect(self.show_auto_label_settings)
-        
+
         # 单张推理选项
-        action_single = menu.addAction("🔍 单张推理")
+        action_single = menu.addAction("单张推理")
         action_single.triggered.connect(self.run_single_inference)
-        
+
         # 批量推理选项
-        action_batch = menu.addAction("📋 批量推理")
+        action_batch = menu.addAction("批量推理")
         action_batch.triggered.connect(self.run_batch_inference)
         
         return menu
@@ -2998,54 +3653,218 @@ class AnnotatePage(QWidget):
         menu = QMenu()
         
         # 单张推理选项
-        action_single = menu.addAction("🔍 单张推理")
+        action_single = menu.addAction("单张推理")
         action_single.triggered.connect(self.run_llm_single_inference)
-        
+
         # 批量推理选项
-        action_batch = menu.addAction("📋 批量推理")
+        action_batch = menu.addAction("批量推理")
         action_batch.triggered.connect(self.run_llm_batch_inference)
         
         return menu
     
     def create_status_bar(self) -> QFrame:
-        """创建状态栏"""
+        """创建状态栏：图片、进度、类别、工具和临时批处理状态。"""
         status_bar = QFrame()
-        status_bar.setFrameStyle(QFrame.Shape.StyledPanel)
-        status_bar.setMaximumHeight(40)
+        # 固定高度会在字体放大时把文字切掉，这里只给下限
+        status_bar.setMinimumHeight(34)
         status_bar.setStyleSheet(f"""
             QFrame {{
                 background-color: {COLORS['panel']};
+                border: none;
                 border-top: 1px solid {COLORS['border']};
+                border-radius: 0px;
             }}
             QLabel {{
                 color: {COLORS['text_secondary']};
                 font-size: 12px;
-                padding: 4px 12px;
             }}
         """)
-        
+
         layout = QHBoxLayout(status_bar)
-        layout.setContentsMargins(8, 4, 8, 4)
-        
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(8)
+
         self.status_image = QLabel("当前: 0/0")
         layout.addWidget(self.status_image)
-        
+
         layout.addWidget(QLabel("|"))
-        
-        self.status_annotation = QLabel("标注: 0")
+
+        self.status_progress = QLabel("标注: 0/0")
+        layout.addWidget(self.status_progress)
+
+        layout.addWidget(QLabel("|"))
+
+        # 不能用 Ignored：布局会把它按近零宽度排，随后控件又被 minimumWidth 撑开，
+        # 造成与右侧分隔符重叠。Preferred 让布局按实际可见宽度为它留出位置。
+        # 当前类别仍保留颜色方块；长名称省略，完整名称放在 tooltip。
+        self.current_class_chip = QLabel()
+        self.current_class_chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.current_class_chip.setMinimumWidth(120)
+        self.current_class_chip.setMaximumWidth(150)
+        self._register_elided_label(self.current_class_chip)
+        self._set_elided_text(self.current_class_chip, "类别: 未选择")
+        layout.addWidget(self.current_class_chip)
+
+        layout.addWidget(QLabel("|"))
+
+        self.status_annotation = QLabel("本图标注: 0")
         layout.addWidget(self.status_annotation)
-        
+
         layout.addWidget(QLabel("|"))
-        
-        self.status_position = QLabel("位置: --")
-        layout.addWidget(self.status_position)
-        
-        layout.addStretch()
-        
+
         self.status_tool = QLabel("工具: 矩形")
         layout.addWidget(self.status_tool)
-        
+
+        # 临时进度用（批量自动标注时显示正在处理哪张图），平时为空。
+        self.status_batch = QLabel("")
+        self.status_batch.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._register_elided_label(self.status_batch)
+        layout.addWidget(self.status_batch, 1)
+
+        # 快捷键表以前是一整条常驻文字，窗口一窄就被切断；现在收进这个按钮的提示里
+        self.btn_shortcut_help = QPushButton("快捷键")
+        self.btn_shortcut_help.setObjectName("ghost")
+        self.btn_shortcut_help.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_shortcut_help.setStyleSheet(
+            "QPushButton#ghost { padding: 1px 8px; min-height: 0px; font-size: 12px; }"
+        )
+        self.btn_shortcut_help.setFixedHeight(24)
+        self.btn_shortcut_help.clicked.connect(self._show_shortcut_help)
+        layout.addWidget(self.btn_shortcut_help)
+
         return status_bar
+
+    def _show_shortcut_help(self):
+        """点「快捷键」直接把提示弹出来，不用非得悬停等。"""
+        from PyQt6.QtWidgets import QToolTip
+
+        QToolTip.showText(
+            self.btn_shortcut_help.mapToGlobal(QPoint(0, 0)),
+            self.btn_shortcut_help.toolTip(),
+            self.btn_shortcut_help
+        )
+
+    def _current_image_index(self) -> int:
+        """当前图片在列表中的位置，没有则 -1。"""
+        if not self.current_image_id:
+            return -1
+        return next(
+            (i for i, img in enumerate(self.images) if img['id'] == self.current_image_id),
+            -1
+        )
+
+    def _update_context_bar(self):
+        """刷新顶部信息条和左侧图片计数。"""
+        if not hasattr(self, 'image_name_label'):
+            return
+
+        total = len(self.images)
+        annotated = sum(1 for img in self.images if img.get('status') == 'annotated')
+        index = self._current_image_index()
+
+        if not self.current_project_id:
+            self._set_elided_text(self.image_name_label, "未选择项目")
+        elif not self.images:
+            self._set_elided_text(self.image_name_label, "这个项目还没有图片")
+        elif index < 0:
+            self._set_elided_text(self.image_name_label, "未选择图片")
+        else:
+            image = self.images[index]
+            status = "已标注" if image.get('status') == 'annotated' else "还没标注"
+            # 位置和状态在前：它们每张图都有、长度稳定，窗口再窄也看得见。
+            # 名字放最后，压不下时省略掉的是它——不是「第几张」和「标没标」。
+            self._set_elided_text(
+                self.image_name_label,
+                f"第 {index + 1}/{total} 张 · {self._image_display_name(image)} · {status}",
+                tooltip=self._image_tooltip(image)
+            )
+
+        if hasattr(self, 'image_list_title'):
+            self.image_list_title.setText(f"图片 · {total}" if total else "图片")
+
+        if hasattr(self, 'image_list_caption'):
+            if total:
+                self.image_list_caption.setText(
+                    f"共 {total} 张 · 已标注 {annotated} · 还剩 {total - annotated}"
+                )
+            else:
+                self.image_list_caption.setText("还没有图片，请回到「数据导入」")
+
+        self._update_current_class_chip()
+        self._update_canvas_placeholder()
+
+    def _update_current_class_chip(self):
+        """状态栏上的「当前类别」：画上去的就是它。"""
+        if not hasattr(self, 'current_class_chip'):
+            return
+
+        current = next((cls for cls in self.classes if cls['id'] == self.current_class_id), None)
+        if current is None:
+            self.current_class_chip.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self._set_elided_text(
+                self.current_class_chip, "类别: 未选择",
+                tooltip="画上去的标注算哪个类别，在右侧「类别」里换"
+            )
+            return
+
+        self.current_class_chip.setStyleSheet(
+            f"color: {_readable_on_light(current.get('color'))}; font-weight: 600;"
+        )
+        self._set_elided_text(
+            self.current_class_chip, f"类别: ■ {current['name']}",
+            tooltip=f"当前类别：{current['name']}\n在右侧「类别」里切换"
+        )
+
+    def _update_canvas_placeholder(self):
+        """画布空着的时候，告诉用户下一步该做什么。"""
+        if not hasattr(self, 'canvas'):
+            return
+
+        if not self.current_project_id:
+            hint = "还没有选择项目"
+        elif not self.images:
+            hint = "这个项目里还没有图片"
+        else:
+            hint = "从左边选一张图片开始"
+
+        if self.canvas.empty_hint != hint:
+            self.canvas.empty_hint = hint
+            if self.canvas.current_image is None:
+                self.canvas.update()
+
+    def _update_action_availability(self):
+        """没有项目/图片时就把对应的按钮关掉，别让人点了没反应。"""
+        has_project = bool(self.current_project_id)
+        has_image = bool(self.current_image_id)
+        index = self._current_image_index()
+
+        if hasattr(self, 'btn_prev'):
+            self.btn_prev.setEnabled(index > 0)
+            self.btn_next.setEnabled(0 <= index < len(self.images) - 1)
+
+        for name in ('btn_draw_tool', 'btn_keypoint', 'btn_move', 'btn_delete'):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(has_image)
+
+        if hasattr(self, 'btn_undo'):
+            self.btn_undo.setEnabled(has_image and self.history_index >= 0)
+
+        # AI 入口只要求有项目：它们的菜单里还有「设置」和「批量推理」，
+        # 没选图片也该点得开；只对当前图片生效的那些，处理函数自己会提示先选图片。
+        for button in getattr(self, 'ai_action_buttons', []):
+            button.setEnabled(has_project)
+
+        if hasattr(self, 'btn_add_class'):
+            self.btn_add_class.setEnabled(has_project)
+        if hasattr(self, 'btn_mark_negative_sample'):
+            self.btn_mark_negative_sample.setEnabled(has_image)
+        # 批处理跟着项目走（和它还在 AI 组里时一样）：它的对话框自己会提示先选图片
+        for name in ('btn_batch_process', 'btn_delete_random_samples',
+                     'btn_export_annotations', 'btn_export_dataset'):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(has_project)
     
     def set_project(self, project_id: int):
         """设置当前项目"""
@@ -3115,16 +3934,16 @@ class AnnotatePage(QWidget):
         # 保存图片数据
         self.images = data.get('images', [])
         
-        # 设置任务类型选择器
+        # 同步任务类型选择器（项目名归左侧流程栏显示，这一页不再重复）
         if self.current_project_id:
             project = db.get_project(self.current_project_id)
-            if project and project.get('type'):
-                task_type = project['type']
+            if project:
+                task_type = project.get('type')
                 if task_type in ['detect', 'segment', 'pose', 'classify', 'obb']:
                     index = self.task_combo.findText(task_type)
                     if index >= 0:
                         self.task_combo.setCurrentIndex(index)
-        
+
         # 开始加载图片列表（使用多线程加载缩略图）
         self.load_image_list()
     
@@ -3157,18 +3976,20 @@ class AnnotatePage(QWidget):
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
         self._invalidate_sample_stats_cache()
-        
+        self._refresh_image_display_names()
+
         # 先创建所有列表项（显示占位符）
         for image in self.images:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, image['id'])
-            
+
             # 设置显示文本
             status_text = "✓" if image.get('status') == 'annotated' else "○"
-            item.setText(f"{status_text} {image['filename']}")
-            
+            item.setText(f"{status_text} {self._image_display_name(image)}")
+            item.setToolTip(self._image_tooltip(image))
+
             self.image_list.addItem(item)
-        
+
         self.update_status_bar()
         self.update_sample_control_panel()
         
@@ -3190,24 +4011,51 @@ class AnnotatePage(QWidget):
         """加载完成回调"""
         pass
     
+    def _refresh_image_display_names(self):
+        """整个列表一起算显示名：重名的（两段视频抽到同一个帧号）才需要补区分信息，
+        所以必须整批算，不能一张一张各算各的。"""
+        aliases = display_names([img.get('filename', '') for img in self.images])
+        self._image_display_names = {
+            img['id']: alias for img, alias in zip(self.images, aliases)
+        }
+
+    def _image_display_name(self, image: Dict) -> str:
+        """列表里显示的名字：抽帧名念成「帧 223」，普通文件名原样。"""
+        cached = getattr(self, '_image_display_names', {}).get(image['id'])
+        return cached or display_name(image.get('filename', ''))
+
+    def _image_tooltip(self, image: Dict) -> str:
+        """完整文件名和分辨率不丢，只是从列表挪进了提示里。"""
+        filename = image.get('filename', '')
+        width = image.get('width', 0)
+        height = image.get('height', 0)
+        if width and height:
+            return f"{filename}\n{width}x{height}"
+        return filename
+
     def update_image_list_display(self):
         """更新图片列表显示"""
         # 重新加载图片数据
         if self.current_project_id:
             self.images = db.get_project_images(self.current_project_id)
-            
+            self._refresh_image_display_names()
+
             # 更新图片列表项
             for i in range(self.image_list.count()):
                 item = self.image_list.item(i)
                 image_id = item.data(Qt.ItemDataRole.UserRole)
-                
+
                 # 找到对应的图片数据
                 image_data = next((img for img in self.images if img['id'] == image_id), None)
                 if image_data:
                     # 更新显示文本
                     status_text = "✓" if image_data.get('status') == 'annotated' else "○"
-                    item.setText(f"{status_text} {image_data['filename']}")
-    
+                    item.setText(f"{status_text} {self._image_display_name(image_data)}")
+                    item.setToolTip(self._image_tooltip(image_data))
+
+            # 图片的已标注状态变了，进度也要跟着变
+            self.update_status_bar()
+
     def update_class_list(self):
         """更新类别列表"""
         current_attr_class = self.attr_class.currentData()
@@ -3234,7 +4082,7 @@ class AnnotatePage(QWidget):
             # 设置颜色
             color = QColor(cls.get('color', '#808080'))
             item.setForeground(color)
-            item.setSizeHint(QSize(item.sizeHint().width(), 30))
+            item.setSizeHint(QSize(item.sizeHint().width(), 28))
             
             self.class_list.addItem(item)
             
@@ -3258,7 +4106,8 @@ class AnnotatePage(QWidget):
             self.sample_target_class.setCurrentIndex(0)
         self.sample_target_class.blockSignals(False)
         self.update_sample_control_panel(class_sample_counts, negative_sample_count)
-        
+        self._update_current_class_chip()
+
         # 默认选中第一个类别
         if self.class_list.count() > 0:
             selected_row = next(
@@ -3344,6 +4193,7 @@ class AnnotatePage(QWidget):
 
         self._sync_attr_class_combo_from_list()
         self._refresh_annotation_class_controls()
+        self._update_current_class_chip()
 
     def _sync_attr_class_combo_from_list(self):
         """将类别列表当前选择同步到属性下拉框。"""
@@ -3487,42 +4337,105 @@ class AnnotatePage(QWidget):
         if hasattr(self, 'loading_label'):
             self.loading_label.hide()
     
-    def show_auto_label_settings(self):
-        """显示自动标注设置对话框"""
+    # 配置窗口里的三页：设置页和「去配置」入口按名字点进去，不让用户自己找
+    AUTO_LABEL_TABS = {'yolo': 0, 'sam': 1, 'llm': 2}
+
+    def open_auto_label_config(self, section: str = "") -> bool:
+        """打开自动标注配置窗口，可指定直接落在哪一页。
+
+        设置页和各处「去配置」入口都走这里——配置文件（SAM / LLM）是全局的，
+        没有项目也能配，只是类别映射没东西可写，这时不碰数据库。
+
+        返回用户有没有点保存。
+        """
         self.init_auto_label_components()
         self.auto_label_dialog.set_classes(self.classes)
-        
-        # 显示对话框
-        if self.auto_label_dialog.exec() == QDialog.DialogCode.Accepted:
-            # 获取任务类型
-            model_task = self.auto_label_dialog.get_model_task()
-            
-            # 保存设置
-            self.auto_label_settings = {
-                'model_path': self.auto_label_dialog.get_model_path(),
-                'model_task': model_task,  # 保存任务类型
-                'conf_threshold': self.auto_label_dialog.sb_conf_threshold.value(),
-                'iou_threshold': self.auto_label_dialog.sb_iou_threshold.value(),
-                'class_mapping': self.auto_label_dialog.get_class_mappings(),
-                'only_unlabeled': self.auto_label_dialog.chk_only_unlabeled.isChecked(),
-                'overwrite_labels': self.auto_label_dialog.chk_overwrite.isChecked()
-            }
-            
-            # 输出调试信息
 
-            
-            # 更新标注页面的类别列表
-            if hasattr(self.auto_label_dialog, 'project_classes'):
-                new_classes = self.auto_label_dialog.project_classes
-                if new_classes != self.classes:
-                    self.classes = new_classes
-                    # 更新数据库
-                    db.update_project(self.current_project_id, classes=self.classes)
-                    # 更新界面
-                    self.update_class_list()
-                    QMessageBox.information(self, "成功", "类别列表已更新")
-            self.apply_sam_button_mode()
-    
+        tab_index = self.AUTO_LABEL_TABS.get(section)
+        if tab_index is not None:
+            self.auto_label_dialog.tab_widget.setCurrentIndex(tab_index)
+
+        if self.auto_label_dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+
+        # 保存 YOLO 预标注的参数（SAM / LLM 的配置由对话框自己写进 config/*.json）
+        self.auto_label_settings = {
+            'model_path': self.auto_label_dialog.get_model_path(),
+            'model_task': self.auto_label_dialog.get_model_task(),
+            'conf_threshold': self.auto_label_dialog.sb_conf_threshold.value(),
+            'iou_threshold': self.auto_label_dialog.sb_iou_threshold.value(),
+            'class_mapping': self.auto_label_dialog.get_class_mappings(),
+            'only_unlabeled': self.auto_label_dialog.chk_only_unlabeled.isChecked(),
+            'overwrite_labels': self.auto_label_dialog.chk_overwrite.isChecked(),
+        }
+
+        # 类别是项目的东西：没有项目就没有类别可写，这时一个字都不往数据库里落
+        new_classes = getattr(self.auto_label_dialog, 'project_classes', None)
+        if self.current_project_id and new_classes is not None and new_classes != self.classes:
+            self.classes = new_classes
+            db.update_project(self.current_project_id, classes=self.classes)
+            self.update_class_list()
+            QMessageBox.information(self, "成功", "类别列表已更新")
+
+        self.apply_sam_button_mode()
+        return True
+
+    def _offer_auto_label_config(self, title: str, message: str, section: str) -> bool:
+        """缺配置时不只是「告诉用户去哪配」，而是给一个真能点开配置的按钮。
+
+        用户点「去配置」→ 直接开配置窗口的对应页；点了保存就返回 True，
+        调用方可以就地重读配置继续干活，不用再走一遍菜单。
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(message)
+        config_btn = box.addButton("去配置", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if box.clickedButton() is not config_btn:
+            return False
+        return self.open_auto_label_config(section)
+
+    @staticmethod
+    def _load_llm_config() -> dict:
+        """读 LLM 配置：默认值 + 用户存过的那份。"""
+        from gui.pages.auto_label_dialog import LLM_CONFIG_FILE, DEFAULT_LLM_CONFIG
+
+        llm_config = DEFAULT_LLM_CONFIG.copy()
+        if os.path.exists(LLM_CONFIG_FILE):
+            try:
+                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    llm_config.update(json.load(f))
+            except Exception as e:
+                print(f"加载LLM配置失败: {e}")
+        return llm_config
+
+    def _require_llm_config(self) -> Optional[dict]:
+        """拿到能用的 LLM 配置；没填 API Key 就当场给一个能点开的配置入口。"""
+        llm_config = self._load_llm_config()
+        if llm_config.get('api_key'):
+            return llm_config
+
+        if not self._offer_auto_label_config(
+            "还没填 API Key",
+            "用大模型标注要先在 LLM 视觉里填好 API Key 和模型名。",
+            'llm',
+        ):
+            return None
+
+        llm_config = self._load_llm_config()
+        if not llm_config.get('api_key'):
+            QMessageBox.warning(self, "提示", "还是没有 API Key，填好之后再试。")
+            return None
+        return llm_config
+
+    def show_auto_label_settings(self):
+        """显示自动标注设置对话框（工具栏「自动标注 → 设置」）"""
+        self.open_auto_label_config()
+
+
     def start_sam_annotation(self):
         """开始SAM交互式标注"""
         if not self.current_project_id:
@@ -3551,11 +4464,21 @@ class AnnotatePage(QWidget):
         
         # 获取已保存的SAM配置（避免临时弹窗回落到默认值）
         sam_config = AutoLabelDialog.get_saved_sam_config()
-        
+
         if not sam_config or not sam_config.get('model_file'):
-            QMessageBox.warning(self, "提示", "请先配置SAM模型\n点击: 自动标注 → 设置 → SAM自动标注")
-            return
-        
+            # 配完就地继续，不用再点一遍「自动标注 → 设置」
+            if not self._offer_auto_label_config(
+                "还没配置 SAM 模型",
+                "SAM 交互分割要先选好分割模型和权重文件。",
+                'sam',
+            ):
+                return
+            sam_config = AutoLabelDialog.get_saved_sam_config()
+            if not sam_config or not sam_config.get('model_file'):
+                QMessageBox.warning(self, "提示", "还是没有可用的 SAM 权重，先配好再来。")
+                return
+
+
         # 获取项目类型
         project = db.get_project(self.current_project_id)
         project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
@@ -3598,8 +4521,16 @@ class AnnotatePage(QWidget):
             return None, None
         sam_config = AutoLabelDialog.get_saved_sam_config()
         if sam_config.get("usage_mode") != "memory" or sam_config.get("sam_type") not in ("SAM2", "SAM3"):
-            QMessageBox.warning(self, "提示", "当前SAM设置不是记忆标注模式（仅SAM2/SAM3支持）")
-            return None, None
+            if not self._offer_auto_label_config(
+                "当前不是记忆标注模式",
+                "记忆标注需要把 SAM 设成 SAM2 或 SAM3，并把用法选成「记忆」。",
+                'sam',
+            ):
+                return None, None
+            sam_config = AutoLabelDialog.get_saved_sam_config()
+            if sam_config.get("usage_mode") != "memory" or sam_config.get("sam_type") not in ("SAM2", "SAM3"):
+                QMessageBox.warning(self, "提示", "SAM 设置仍然不是记忆标注模式（仅 SAM2/SAM3 支持）。")
+                return None, None
         return sam_config, image_path
 
     def start_sam_memory_update(self):
@@ -4020,36 +4951,59 @@ class AnnotatePage(QWidget):
                     })
         return annotations
     
+    def _exit_batch_process_mode(self):
+        """退出批处理点选模式。
+
+        幂等：确认执行、点取消、直接关窗三条路径都走这里，重复调用没有副作用。
+        以前只有「确认执行」会清理，用户一取消就卡在点选模式里——画布上每点一下
+        还在继续加点，而且是加给一个已经关掉的对话框。
+        """
+        canvas = getattr(self, 'canvas', None)
+        if canvas is not None:
+            canvas.batch_process_mode = False
+            canvas.batch_process_points = []
+            canvas.batch_process_dialog = None
+            canvas.update()
+        self.batch_process_dialog = None
+
     def show_batch_process_dialog(self):
         """显示批量处理标注对话框"""
         if not self.current_project_id:
             QMessageBox.warning(self, "提示", "请先选择一个项目")
             return
-        
+
         if not self.images:
             QMessageBox.warning(self, "提示", "项目中没有图片")
             return
-        
+
+        # 上一次的对话框可能还开着，先收干净再开新的
+        previous = self.batch_process_dialog
+        self._exit_batch_process_mode()
+        if previous is not None:
+            previous.close()
+            previous.deleteLater()
+
         # 创建对话框
         dialog = BatchProcessDialog(self, self.classes, len(self.images))
         dialog.process_requested.connect(self.on_batch_process_requested)
-        
+        # 接受 / 取消 / 直接关窗都会触发 finished，统一在这里退出点选模式
+        dialog.finished.connect(lambda _result: self._exit_batch_process_mode())
+
         # 进入像素点选择模式
         self.batch_process_dialog = dialog
         self.canvas.batch_process_mode = True
         self.canvas.batch_process_points = []
         self.canvas.batch_process_dialog = dialog
-        
+        self.canvas.update()
+
         # 显示对话框（非模态，允许在图片上点击）
         dialog.show()
-    
+
     def on_batch_process_requested(self, config):
         """处理批量处理请求"""
         # 退出像素点选择模式
-        self.canvas.batch_process_mode = False
-        self.canvas.batch_process_points = []
-        self.canvas.batch_process_dialog = None
-        
+        self._exit_batch_process_mode()
+
         # 执行批量处理
         self.execute_batch_process(config)
     
@@ -4474,9 +5428,7 @@ class AnnotatePage(QWidget):
     
     def on_batch_inference_progress(self, progress, current, total, image_name):
         """批量推理进度回调"""
-        # 更新状态栏
-        self.status_annotation.setText(f"自动标注: {current}/{total}")
-        self.status_position.setText(f"当前: {image_name}")
+        self._set_elided_text(self.status_batch, f"批处理: {current}/{total} · {image_name}")
         self.repaint()
     
     def on_batch_inference_completed(self, success, message, processed_count):
@@ -4528,6 +5480,7 @@ class AnnotatePage(QWidget):
             self.canvas.current_class_id = self.current_class_id
             self._sync_attr_class_combo_from_list()
         self._refresh_annotation_class_controls()
+        self._update_current_class_chip()
     
     def filter_images(self, filter_text: str):
         """筛选图片"""
@@ -5311,14 +6264,15 @@ class AnnotatePage(QWidget):
         self.update_sample_control_panel()
     
     def update_status_bar(self):
-        """更新状态栏"""
+        """更新状态栏，并顺带刷新顶部信息条和按钮可用性。"""
         total = len(self.images)
-        current = 0
-        if self.current_image_id:
-            current = next((i for i, img in enumerate(self.images) if img['id'] == self.current_image_id), 0) + 1
-        
+        annotated = sum(1 for img in self.images if img.get('status') == 'annotated')
+        index = self._current_image_index()
+        current = index + 1 if index >= 0 else 0
+
         self.status_image.setText(f"当前: {current}/{total}")
-        self.status_annotation.setText(f"标注: {len(self.annotations)}")
+        self.status_progress.setText(f"标注: {annotated}/{total}")
+        self.status_annotation.setText(f"本图标注: {len(self.annotations)}")
         tool_names = {
             'rectangle': '矩形',
             'polygon': '多边形',
@@ -5327,31 +6281,36 @@ class AnnotatePage(QWidget):
             'obb': '旋转矩形'
         }
         self.status_tool.setText(f"工具: {tool_names.get(self.canvas.current_tool, self.canvas.current_tool)}")
-    
+        # 批量任务留下的临时进度文字到这里就该清掉
+        self._set_elided_text(self.status_batch, "")
+
+        self._update_context_bar()
+        self._update_action_availability()
+
     def keyPressEvent(self, event: QKeyEvent):
         """键盘事件"""
         from PyQt6.QtCore import QSettings
         
         # 获取快捷键设置
         settings = QSettings("EzYOLO", "Settings")
-        rect_tool_key = settings.value("rect_tool_shortcut", "W").upper()
-        poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
-        move_tool_key = settings.value("move_tool_shortcut", "V").upper()
-        delete_key = settings.value("delete_shortcut", "DELETE").upper()
+        rect_tool_key = str(settings.value("rect_tool_shortcut", "W"))
+        poly_tool_key = str(settings.value("poly_tool_shortcut", "P"))
+        move_tool_key = str(settings.value("move_tool_shortcut", "V"))
+        delete_key = str(settings.value("delete_shortcut", "DELETE"))
         
-        # 处理工具快捷键
+        # 处理工具快捷键（按键码比对，DELETE/SPACE/方向键这些没有字符的键才认得出来）
         key_text = event.text().upper()
-        if key_text == rect_tool_key:
+        if event_matches_shortcut(event, rect_tool_key):
             self.select_draw_tool('rectangle')
             return
-        elif key_text == poly_tool_key:
+        elif event_matches_shortcut(event, poly_tool_key):
             self.select_draw_tool('polygon')
             return
-        elif key_text == move_tool_key:
+        elif event_matches_shortcut(event, move_tool_key):
             self.btn_move.setChecked(True)
             self.set_tool('move')
             return
-        elif key_text == delete_key:
+        elif event_matches_shortcut(event, delete_key):
             self.delete_selected_annotation()
         elif event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
             self.undo()
@@ -5607,111 +6566,40 @@ class AnnotatePage(QWidget):
             return
         
         target_class = self.classes[self.current_class_id]['name']
-        
-        # 获取LLM配置
-        from gui.pages.auto_label_dialog import AutoLabelDialog, LLM_CONFIG_FILE, DEFAULT_LLM_CONFIG
-        import json
-        
-        # 加载LLM配置
-        llm_config = DEFAULT_LLM_CONFIG.copy()
-        if os.path.exists(LLM_CONFIG_FILE):
-            try:
-                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved_config = json.load(f)
-                    llm_config.update(saved_config)
-            except Exception as e:
-                print(f"加载LLM配置失败: {e}")
-        
-        # 检查API Key
-        if not llm_config.get('api_key'):
-            QMessageBox.warning(self, "提示", "请先配置LLM API Key\n点击: 自动标注 → 设置 → LLM自动标注")
+
+        # 缺 API Key 时这里会给出「去配置」入口，配完直接往下走
+        llm_config = self._require_llm_config()
+        if not llm_config:
             return
-        
+
         # 显示进度对话框
         from PyQt6.QtWidgets import QProgressDialog
         progress = QProgressDialog("正在使用LLM进行目标检测...", "取消", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setCancelButton(None)
         progress.show()
-        
-        # 在后台线程中运行LLM推理
-        from PyQt6.QtCore import QThread, pyqtSignal
-        
-        class LLMInferenceWorker(QThread):
-            """LLM推理工作线程"""
-            inference_finished = pyqtSignal(bool, str, list)  # 成功, 消息, 检测结果
-            
-            def __init__(self, config, image_path, target):
-                super().__init__()
-                self.config = config
-                self.image_path = image_path
-                self.target = target
-            
-            def run(self):
-                try:
-                    import base64
-                    import re
-                    from openai import OpenAI
-                    
-                    # 读取图片
-                    with open(self.image_path, "rb") as f:
-                        img_base64 = base64.b64encode(f.read()).decode("utf-8")
-                    
-                    # 创建客户端
-                    client = OpenAI(
-                        api_key=self.config['api_key'],
-                        base_url=self.config['base_url']
-                    )
-                    
-                    # 格式化提示词
-                    system_prompt = self.config['system_prompt']
-                    user_prompt = self.config['user_prompt'].format(target=self.target)
-                    
-                    # 调用API
-                    completion = client.chat.completions.create(
-                        model=self.config['model_name'],
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": user_prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
-                                    }
-                                ]
-                            }
-                        ]
-                    )
-                    
-                    response_text = completion.choices[0].message.content
-                    print(f"LLM返回:\n{response_text}")
-                    
-                    # 解析返回的文本格式: target,[xmin,ymin,xmax,ymax]
-                    detections = []
-                    pattern = r'([^,\n]+),\[(\d+),(\d+),(\d+),(\d+)\]'
-                    matches = re.findall(pattern, response_text)
-                    
-                    for match in matches:
-                        label, xmin, ymin, xmax, ymax = match
-                        detections.append({
-                            "label": label.strip(),
-                            "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]
-                        })
-                    
-                    self.inference_finished.emit(True, f"检测到 {len(detections)} 个目标", detections)
-                    
-                except Exception as e:
-                    self.inference_finished.emit(False, f"推理出错: {str(e)}", [])
-        
-        # 创建并启动工作线程
-        self.llm_worker = LLMInferenceWorker(llm_config, image_path, target_class)
-        self.llm_worker.inference_finished.connect(
-            lambda success, msg, detections: self.on_llm_inference_finished(success, msg, detections, progress)
+
+        # 单张也走后台线程：请求要等几秒，界面不能在这几秒里僵着。
+        # 上一张还在跑就不再起新的：直接改写 self.llm_worker 会把最后一个引用丢掉，
+        # 那个还在 run() 里的 QThread 当场被回收——直接崩。
+        if self.llm_worker is not None and self.llm_worker.isRunning():
+            progress.close()
+            QMessageBox.information(self, "提示", "上一张还在跑，等它出结果再试。")
+            return
+
+        self.llm_worker = LLMBatchWorker(llm_config, [current_image], target_class)
+        self._track_llm_worker(self.llm_worker)
+        self.llm_worker.image_done.connect(
+            lambda _image_id, detections, error:
+                self.on_llm_inference_finished(
+                    not error,
+                    f"推理出错: {error}" if error else f"检测到 {len(detections)} 个目标",
+                    detections, progress,
+                )
         )
         self.llm_worker.start()
-    
+
+
     def on_llm_inference_finished(self, success, message, detections, progress_dialog):
         """LLM推理完成回调"""
         progress_dialog.close()
@@ -5796,27 +6684,18 @@ class AnnotatePage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一个类别")
             return
         
-        target_class = self.classes[self.current_class_id]['name']
-        
-        # 获取LLM配置
-        from gui.pages.auto_label_dialog import LLM_CONFIG_FILE, DEFAULT_LLM_CONFIG
-        import json
-        
-        # 加载LLM配置
-        llm_config = DEFAULT_LLM_CONFIG.copy()
-        if os.path.exists(LLM_CONFIG_FILE):
-            try:
-                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved_config = json.load(f)
-                    llm_config.update(saved_config)
-            except Exception as e:
-                print(f"加载LLM配置失败: {e}")
-        
-        # 检查API Key
-        if not llm_config.get('api_key'):
-            QMessageBox.warning(self, "提示", "请先配置LLM API Key\n点击: 自动标注 → 设置 → LLM自动标注")
+        # 已经在跑就别再起一批：两批同时写标注，谁都说不清结果
+        if self.llm_batch_worker is not None and self.llm_batch_worker.isRunning():
+            QMessageBox.information(self, "提示", "上一批还在跑，等它结束或者先取消。")
             return
-        
+
+        target_class = self.classes[self.current_class_id]['name']
+
+        # 缺 API Key 时给「去配置」入口，配完继续
+        llm_config = self._require_llm_config()
+        if not llm_config:
+            return
+
         # 选择图片范围
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QHBoxLayout, QPushButton
         
@@ -5869,132 +6748,106 @@ class AnnotatePage(QWidget):
             QMessageBox.warning(self, "提示", "没有选择要处理的图片")
             return
         
-        # 显示进度对话框
+        # 进度条：取消是「请求取消」，当前这张跑完就停，界面不等
         from PyQt6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("正在使用LLM进行批量检测...", "取消", 0, len(images_to_process), self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.show()
-        
-        # 批量处理
-        total_added = 0
-        processed_count = 0
-        
-        import base64
-        import re
-        from openai import OpenAI
-        
-        for i, image_data in enumerate(images_to_process):
-            if progress.wasCanceled():
-                break
-            
-            progress.setValue(i)
-            progress.setLabelText(f"正在处理: {image_data.get('filename', '')} ({i+1}/{len(images_to_process)})")
-            
-            image_path = image_data.get('storage_path', '')
-            if not image_path or not os.path.exists(image_path):
-                continue
-            
-            try:
-                # 读取图片
-                with open(image_path, "rb") as f:
-                    img_base64 = base64.b64encode(f.read()).decode("utf-8")
-                
-                # 创建客户端
-                client = OpenAI(
-                    api_key=llm_config['api_key'],
-                    base_url=llm_config['base_url']
-                )
-                
-                # 格式化提示词
-                system_prompt = llm_config['system_prompt']
-                user_prompt = llm_config['user_prompt'].format(target=target_class)
-                
-                # 调用API
-                completion = client.chat.completions.create(
-                    model=llm_config['model_name'],
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": user_prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
-                                }
-                            ]
-                        }
-                    ]
-                )
-                
-                response_text = completion.choices[0].message.content
-                
-                # 解析返回的文本格式
-                detections = []
-                pattern = r'([^,\n]+),\[(\d+),(\d+),(\d+),(\d+)\]'
-                matches = re.findall(pattern, response_text)
-                
-                for match in matches:
-                    label, xmin, ymin, xmax, ymax = match
-                    detections.append({
-                        "label": label.strip(),
-                        "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]
-                    })
-                
-                # 添加检测结果为标注
-                image_id = image_data['id']
-                class_id = self.current_class_id
-                added_count = 0
-                
-                for det in detections:
-                    bbox = det.get("bbox", [0, 0, 0, 0])
-                    xmin, ymin, xmax, ymax = bbox
-                    
-                    # 创建标注数据
-                    annotation_data = {
-                        'x': float(xmin),
-                        'y': float(ymin),
-                        'width': float(xmax - xmin),
-                        'height': float(ymax - ymin)
-                    }
-                    
-                    # 保存到数据库
-                    class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
-                    ann_id = db.add_annotation(
-                        image_id=image_id,
-                        project_id=self.current_project_id,
-                        class_id=class_id,
-                        class_name=class_name,
-                        annotation_type='bbox',
-                        data=annotation_data
-                    )
-                    
-                    if ann_id:
-                        added_count += 1
-                
-                if added_count > 0:
-                    db.update_image_status(image_id, 'annotated')
-                    total_added += added_count
-                
-                processed_count += 1
-                
-            except Exception as e:
-                print(f"处理图片 {image_data.get('filename', '')} 时出错: {e}")
-                continue
-        
-        progress.setValue(len(images_to_process))
-        
-        # 重新加载标注
+        self.llm_batch_progress = QProgressDialog(
+            "正在使用LLM进行批量检测...", "取消", 0, len(images_to_process), self
+        )
+        self.llm_batch_progress.setWindowTitle("LLM 批量推理")
+        self.llm_batch_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.llm_batch_progress.setAutoClose(False)
+        self.llm_batch_progress.setAutoReset(False)
+        self.llm_batch_progress.setValue(0)
+
+        self.llm_batch_total = len(images_to_process)
+        self.llm_batch_added = 0
+        self.llm_batch_class_id = self.current_class_id
+
+        self.llm_batch_worker = LLMBatchWorker(llm_config, images_to_process, target_class)
+        self.llm_batch_progress.canceled.connect(self.llm_batch_worker.cancel)
+        self.llm_batch_worker.image_started.connect(self.on_llm_batch_image_started)
+        self.llm_batch_worker.image_done.connect(self.on_llm_batch_image_done)
+        self.llm_batch_worker.batch_finished.connect(self.on_llm_batch_finished)
+        self._track_llm_worker(self.llm_batch_worker)
+
+        self.btn_llm_label.setEnabled(False)
+        self.llm_batch_progress.show()
+        self.llm_batch_worker.start()
+
+    def on_llm_batch_image_started(self, position: int, filename: str):
+        """第几张、哪一张，写在进度条上。"""
+        if not self.llm_batch_progress:
+            return
+        self.llm_batch_progress.setLabelText(
+            f"正在处理第 {position}/{self.llm_batch_total} 张：{filename}"
+        )
+
+    def on_llm_batch_image_done(self, image_id: int, detections: list, error: str):
+        """一张图片跑完：标注写库在界面线程做，进度往前走一格。"""
+        if self.llm_batch_progress:
+            self.llm_batch_progress.setValue(self.llm_batch_progress.value() + 1)
+
+        if error:
+            # 失败的图片只记账，不打断整批；错误里的密钥已经在线程里抹掉了
+            print(f"[LLM批量] 图片 {image_id} 处理失败: {error}")
+            return
+
+        class_id = self.llm_batch_class_id
+        class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+        added = 0
+
+        for det in detections:
+            xmin, ymin, xmax, ymax = det.get("bbox", [0, 0, 0, 0])
+            ann_id = db.add_annotation(
+                image_id=image_id,
+                project_id=self.current_project_id,
+                class_id=class_id,
+                class_name=class_name,
+                annotation_type='bbox',
+                data={
+                    'x': float(xmin),
+                    'y': float(ymin),
+                    'width': float(xmax - xmin),
+                    'height': float(ymax - ymin),
+                },
+            )
+            if ann_id:
+                added += 1
+
+        if added:
+            db.update_image_status(image_id, 'annotated')
+            self.llm_batch_added += added
+
+    def on_llm_batch_finished(self, succeeded: int, failed: int, cancelled: bool):
+        """整批结束：收尾、刷新界面、把成绩单一次说清楚。"""
+        if self.llm_batch_progress:
+            self.llm_batch_progress.close()
+            self.llm_batch_progress = None
+
+        # 这里不销毁线程：batch_finished 是 run() 的最后一句，run() 还没返回，
+        # 一销毁就是「QThread: Destroyed while thread is still running」。
+        # 先挪到「等它退出」的列表里继续持有，_on_llm_worker_finished 再放手。
+        worker = self.llm_batch_worker
+        self.llm_batch_worker = None
+        if worker is not None and worker not in self._retired_llm_workers:
+            self._retired_llm_workers.append(worker)
+
+        self.btn_llm_label.setEnabled(True)
+
         self.load_annotations()
         self.update_image_list_display()
         self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
-        
-        QMessageBox.information(self, "完成", 
-            f"批量推理完成!\n"
-            f"处理了 {processed_count} 张图片\n"
-            f"共添加 {total_added} 个标注")
-    
+
+        headline = "批量推理已取消。" if cancelled else "批量推理完成！"
+        QMessageBox.information(
+            self, "完成",
+            f"{headline}\n"
+            f"成功 {succeeded} 张，失败 {failed} 张，共 {self.llm_batch_total} 张\n"
+            f"新增 {self.llm_batch_added} 个标注"
+        )
+
+
     def export_dataset(self):
         """导出完整数据集"""
         import shutil

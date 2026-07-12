@@ -4,6 +4,7 @@
 使用SQLite作为本地数据库
 """
 
+import os
 import sqlite3
 import json
 from datetime import datetime
@@ -764,119 +765,131 @@ class Database:
                 jobs.append(job)
             return jobs
 
-    def sync_files_with_database(self) -> Dict:
-        """同步数据库与真实文件
-        
-        清理数据库中不存在的真实文件，确保数据库记录与实际文件一致
-        
+    def sync_files_with_database(self, projects_dir: str = None) -> Dict:
+        """扫描数据库与 projects/ 目录之间的差异
+
+        只读扫描，绝不删除任何数据库记录或磁盘文件。第一阶段的数据保护要求
+        任何不一致都必须交给用户查看后再决定，而不是自动清理。
+
+        Args:
+            projects_dir: 仅供测试使用，指定要扫描的 projects 目录；
+                默认为软件所在目录下的 projects/。
+
         Returns:
-            Dict: 同步结果，包含删除的文件数量等信息
+            Dict: 扫描结果。deleted_db_count/deleted_file_count/total_deleted
+                为兼容旧字段，永远为 0；orphan_db_count/orphan_disk_count/issues
+                描述发现的不一致，供 UI 提示用户。
         """
-        import os
-        import shutil
-        
-        deleted_db_count = 0
-        deleted_file_count = 0
-        deleted_db_files = []
-        deleted_actual_files = []
-        
-        # 获取所有图像记录
-        images = self.get_all_images()
-        
-        # 构建数据库中存在的文件路径集合
+        def _normalize(raw_path: str) -> str:
+            return str(Path(raw_path).expanduser().resolve(strict=False))
+
+        issues = []
+
+        orphan_db_count = 0
         db_files = set()
+        try:
+            images = self.get_all_images()
+        except Exception as exc:
+            images = []
+            issues.append({'type': 'scan_error', 'detail': str(exc)})
+
         for image in images:
             storage_path = image.get('storage_path')
-            if storage_path:
-                db_files.add(storage_path)
-        
-        # 第一部分：清理数据库中不存在的文件记录
-        for image in images:
-            storage_path = image.get('storage_path')
-            if storage_path:
-                # 检查文件是否存在
-                if not os.path.exists(storage_path):
-                    # 文件不存在，删除数据库记录
-                    image_id = image.get('id')
-                    if image_id:
-                        try:
-                            # 删除相关标注
-                            self.delete_image_annotations(image_id)
-                            # 删除图像记录
-                            with self.get_connection() as conn:
-                                cursor = conn.cursor()
-                                cursor.execute("DELETE FROM images WHERE id = ?", (image_id,))
-                            deleted_db_count += 1
-                            deleted_db_files.append(storage_path)
-                        except Exception:
-                            pass  # 忽略删除失败的情况
-        
-        # 第二部分：清理文件夹中不存在于数据库的文件
-        # 获取所有项目目录
-        import glob
-        from pathlib import Path
-        
-        # 查找所有projects目录下的文件夹
-        projects_dir = Path(__file__).parent.parent / "projects"
-        if projects_dir.exists():
-            # 获取数据库中存在的项目列表
+            if not storage_path:
+                continue
+            try:
+                normalized_image_path = _normalize(storage_path)
+            except Exception as exc:
+                issues.append({'type': 'scan_error', 'detail': str(exc), 'path': storage_path})
+                continue
+            db_files.add(normalized_image_path)
+            try:
+                exists = os.path.exists(storage_path)
+            except Exception as exc:
+                issues.append({'type': 'scan_error', 'detail': str(exc), 'path': storage_path})
+                continue
+            if not exists:
+                orphan_db_count += 1
+                issues.append({
+                    'type': 'missing_file',
+                    'image_id': image.get('id'),
+                    'project_id': image.get('project_id'),
+                    'path': storage_path,
+                })
+
+        if projects_dir is None:
+            projects_dir_path = Path(__file__).parent.parent / "projects"
+        else:
+            projects_dir_path = Path(projects_dir)
+
+        orphan_disk_count = 0
+        try:
             db_projects = self.get_all_projects()
-            db_project_ids = set()
+
+            known_project_dirs = {}
             for project in db_projects:
-                db_project_ids.add(project.get('id'))
-            
-            # 遍历所有项目文件夹
-            for project_folder in projects_dir.iterdir():
-                if project_folder.is_dir():
-                    # 检查项目文件夹是否在数据库中存在
-                    # 从文件夹名中提取项目ID（格式：project_123 或 test_20260203_142707）
-                    folder_name = project_folder.name
-                    
-                    # 检查是否为项目文件夹（包含下划线）
-                    if '_' in folder_name:
-                        # 尝试从文件夹名中提取项目ID
-                        project_exists = False
-                        
-                        # 检查是否有对应的项目ID
-                        for project in db_projects:
-                            project_name = project.get('name', '')
-                            # 如果文件夹名包含项目名，认为是对应的项目文件夹
-                            if project_name in folder_name:
-                                project_exists = True
-                                break
-                        
-                        # 如果项目不在数据库中，删除整个项目文件夹
-                        if not project_exists:
-                            try:
-                                # 记录要删除的文件数量
-                                for root, dirs, files in os.walk(project_folder):
-                                    deleted_file_count += len(files)
-                                    deleted_actual_files.extend([os.path.join(root, f) for f in files])
-                                # 删除整个文件夹
-                                shutil.rmtree(project_folder)
-                            except Exception:
-                                pass  # 忽略删除失败的情况
-                        else:
-                            # 项目存在，清理项目文件夹中不存在于数据库的文件
-                            for root, dirs, files in os.walk(project_folder):
-                                for file in files:
-                                    file_path = os.path.join(root, file)
-                                    # 检查文件是否在数据库中存在
-                                    if file_path not in db_files:
-                                        # 文件不在数据库中，删除实际文件
-                                        try:
-                                            os.remove(file_path)
-                                            deleted_file_count += 1
-                                            deleted_actual_files.append(file_path)
-                                        except Exception:
-                                            pass  # 忽略删除失败的情况
-        
+                project_storage_path = project.get('storage_path')
+                if not project_storage_path:
+                    continue
+                try:
+                    normalized_project_path = _normalize(project_storage_path)
+                except Exception as exc:
+                    issues.append({
+                        'type': 'scan_error',
+                        'detail': str(exc),
+                        'path': project_storage_path,
+                    })
+                    continue
+                known_project_dirs[normalized_project_path] = project
+
+                if not Path(normalized_project_path).exists():
+                    orphan_db_count += 1
+                    issues.append({
+                        'type': 'missing_project_dir',
+                        'project_id': project.get('id'),
+                        'path': project_storage_path,
+                    })
+
+            if projects_dir_path.exists():
+                for project_folder in projects_dir_path.iterdir():
+                    if not project_folder.is_dir():
+                        continue
+
+                    normalized_folder_path = _normalize(str(project_folder))
+                    project = known_project_dirs.get(normalized_folder_path)
+
+                    if project is None:
+                        orphan_disk_count += 1
+                        issues.append({'type': 'orphan_project_dir', 'path': str(project_folder)})
+                    else:
+                        for root, dirs, files in os.walk(project_folder):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                try:
+                                    normalized_file_path = _normalize(file_path)
+                                except Exception as exc:
+                                    issues.append({
+                                        'type': 'scan_error',
+                                        'detail': str(exc),
+                                        'path': file_path,
+                                    })
+                                    continue
+                                if normalized_file_path not in db_files:
+                                    orphan_disk_count += 1
+                                    issues.append({'type': 'orphan_file', 'path': file_path})
+        except Exception as exc:
+            issues.append({'type': 'scan_error', 'detail': str(exc)})
+
         return {
-            'deleted_db_count': deleted_db_count,
-            'deleted_file_count': deleted_file_count,
-            'deleted_db_files': deleted_db_files,
-            'deleted_actual_files': deleted_actual_files,
-            'total_deleted': deleted_db_count + deleted_file_count
+            'deleted_db_count': 0,
+            'deleted_file_count': 0,
+            'deleted_db_files': [],
+            'deleted_actual_files': [],
+            'total_deleted': 0,
+            'orphan_db_count': orphan_db_count,
+            'orphan_disk_count': orphan_disk_count,
+            'issues': issues,
+            'has_issues': bool(issues),
         }
 
 
