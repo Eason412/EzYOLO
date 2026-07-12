@@ -342,7 +342,7 @@ class Database:
                 query += " AND group_id = ?"
                 params.append(group_id)
 
-            query += " ORDER BY created_at"
+            query += " ORDER BY created_at, id"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -369,7 +369,7 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(
                 f"SELECT * FROM images WHERE project_id = ? AND ({where_clause}) "
-                "ORDER BY created_at",
+                "ORDER BY created_at, id",
                 params
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -383,7 +383,7 @@ class Database:
                 FROM images
                 INNER JOIN annotations ON images.id = annotations.image_id
                 WHERE images.project_id = ? AND annotations.class_id = ?
-                ORDER BY images.created_at
+                ORDER BY images.created_at, images.id
             """, (project_id, class_id))
             return [dict(row) for row in cursor.fetchall()]
 
@@ -413,7 +413,7 @@ class Database:
             if annotated_only:
                 query += " AND images.status = ?"
                 params.append('annotated')
-            query += " ORDER BY images.created_at"
+            query += " ORDER BY images.created_at, images.id"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
