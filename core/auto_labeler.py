@@ -488,11 +488,13 @@ class BatchLabelingThread(QThread):
     """批量标注线程"""
     
     # 信号定义
-    progress_updated = pyqtSignal(int, int, int)  # 已处理数量, 总数量, 已标注数量
+    progress_updated = pyqtSignal(int, int, int)  # 已处理数量（含失败）, 总数量, 已标注数量
     image_processed = pyqtSignal(str, int)  # 图像路径, 生成的标注数量
-    # 是否成功, 消息, 是否被取消。取消单独一个位——它不是失败，
+    # 是否成功, 消息, 是否被取消, 成功处理数, 失败数。取消单独一个位——它不是失败，
     # 以前混在 success=False 里，界面就只能弹一个红色的「批量标注失败」。
-    batch_completed = pyqtSignal(bool, str, bool)
+    # 两个计数也要跟着走：manager 以前拿 len(images) 当「处理了多少张」上报，
+    # 那是「打算处理多少张」，中途失败的、被取消没跑到的，全被算成了成功。
+    batch_completed = pyqtSignal(bool, str, bool, int, int)
     
     def __init__(self, plan, model_manager, config: Dict):
         super().__init__()
@@ -505,12 +507,17 @@ class BatchLabelingThread(QThread):
         self.auto_labeler = None
         self._is_running = True
         self._is_paused = False
+        # 收工时的真实战果，manager 收线程时按这两个数上报
+        self.processed_count = 0
+        self.failed_count = 0
 
     def _resolve_local_model_path(self) -> Optional[str]:
-        """找出这次要用的本地 .pt；找不到就返回 None——绝不去网上取。
+        """找出这次要用的本地权重；找不到就返回 None——绝不去网上取。
 
-        批量这条路只认磁盘上已经存在的权重。设置里选的如果是「yolov8n」这种官方
-        名字，只在本地预训练目录里按名字找同名文件；找不到就当作没有，直接报错。
+        批量这条路只认磁盘上已经存在的权重（.pt / .pth 都收——训练导出的检查点
+        常常是 .pth，把它挡在门外只会逼用户去改扩展名）。设置里选的如果是
+        「yolov8n」这种官方名字，只在本地预训练目录里按名字找同名文件；找不到就
+        当作没有，直接报错。
 
         这里刻意不碰 model_manager.load_model()：那个方法在本地文件不存在时会
         转头执行 `YOTO(model_name)` 去联网下载一个 COCO 通用模型——用户按下的是
@@ -521,7 +528,7 @@ class BatchLabelingThread(QThread):
             return None
 
         # 已经是一个存在的本地权重：直接用
-        if candidate.lower().endswith('.pt') and os.path.isfile(candidate):
+        if candidate.lower().endswith(('.pt', '.pth')) and os.path.isfile(candidate):
             return candidate
 
         # 官方名字（yolov8n / yolo11s …）：只做一次纯路径推算，看本地有没有下过
@@ -568,6 +575,7 @@ class BatchLabelingThread(QThread):
         """运行批量标注：建标注器、加载模型、逐图处理，全都在这个后台线程里。"""
         total = len(self.images)
         processed = 0
+        failed = 0
         labeled = 0
 
         try:
@@ -575,67 +583,100 @@ class BatchLabelingThread(QThread):
 
             # 模型加载期间用户就点了取消：别硬着头皮再跑一整批
             if not self._is_running:
-                self.batch_completed.emit(True, "已取消，模型还没加载完就停下了", True)
+                self._finish(True, "已取消，模型还没加载完就停下了", True, 0, 0)
                 return
 
             if self.auto_labeler is None:
-                self.batch_completed.emit(False, load_error, False)
+                self._finish(False, load_error, False, 0, 0)
                 return
 
-            for i, image in enumerate(self.images):
+            for image in self.images:
                 if not self._is_running:
                     break
-                
+
                 # 检查是否暂停
                 while self._is_paused:
                     time.sleep(0.1)
                     if not self._is_running:
                         break
-                
+
                 if not self._is_running:
                     break
-                
+
                 # 处理图像
                 image_path = image.get('storage_path', '')
                 image_id = image.get('id', 0)
-                
-                if image_path and os.path.exists(image_path):
-                    annotations = self.auto_labeler.process_single_image(
-                        image_path, image_id, self.config
+
+                # 文件没了（被移走、被删、盘没挂上）：记一笔失败接着跑下一张。
+                # 以前这里是「什么都不做」——既不算成功也不算失败，进度条就永远
+                # 停在差几张的地方，收尾还照样报「全部完成」。
+                if not image_path or not os.path.exists(image_path):
+                    failed += 1
+                    self.progress_updated.emit(processed + failed, total, labeled)
+                    self.image_processed.emit(image_path, 0)
+                    time.sleep(0.01)
+                    continue
+
+                annotations = self.auto_labeler.process_single_image(
+                    image_path, image_id, self.config
+                )
+
+                overwrite = self.config.get('overwrite_labels', False)
+                # 一个目标都没检出、又是覆盖模式：这就是「这张图上没东西」的结论，
+                # 旧标注得跟着清掉。以前空结果直接跳过保存，用户勾了「覆盖」，
+                # 上一轮的框却原封不动留在库里。不覆盖时当然一个字都不许动。
+                if annotations or overwrite:
+                    self.auto_labeler.save_annotations(
+                        annotations, image_id, overwrite
                     )
-                    
-                    if annotations:
-                        # 保存标注
-                        overwrite = self.config.get('overwrite_labels', False)
-                        self.auto_labeler.save_annotations(
-                            annotations, image_id, overwrite
-                        )
-                        labeled += len(annotations)
-                        
-                    # 发送信号
-                    processed += 1
-                    self.progress_updated.emit(processed, total, labeled)
-                    self.image_processed.emit(image_path, len(annotations))
-                
+                    labeled += len(annotations)
+
+                # 发送信号
+                processed += 1
+                self.progress_updated.emit(processed + failed, total, labeled)
+                self.image_processed.emit(image_path, len(annotations))
+
                 # 避免CPU占用过高
                 time.sleep(0.01)
-            
+
             # 完成
-            if self._is_running:
-                self.batch_completed.emit(
+            if not self._is_running:
+                # 用户主动喊停不是出错：照实说已经做了多少，不报错
+                self._finish(
+                    True,
+                    f"已取消，已处理 {processed}/{total} 张图像，生成了 {labeled} 个标注"
+                    + (f"，{failed} 张失败" if failed else ""),
+                    True,
+                    processed,
+                    failed,
+                )
+            elif failed:
+                # 有图片没跑成，就别说「完成」——照实报出成功几张、失败几张
+                self._finish(
+                    False,
+                    f"批量标注结束：成功 {processed}/{total} 张，"
+                    f"{failed} 张失败（图片文件不存在），生成了 {labeled} 个标注",
+                    False,
+                    processed,
+                    failed,
+                )
+            else:
+                self._finish(
                     True,
                     f"批量标注完成，处理了 {processed}/{total} 张图像，生成了 {labeled} 个标注",
                     False,
-                )
-            else:
-                # 用户主动喊停不是出错：照实说已经做了多少，不报错
-                self.batch_completed.emit(
-                    True,
-                    f"已取消，已处理 {processed}/{total} 张图像，生成了 {labeled} 个标注",
-                    True,
+                    processed,
+                    failed,
                 )
         except Exception as e:
-            self.batch_completed.emit(False, f"批量标注出错: {str(e)}", False)
+            self._finish(False, f"批量标注出错: {str(e)}", False, processed, failed)
+
+    def _finish(self, success: bool, message: str, cancelled: bool,
+                processed: int, failed: int):
+        """收尾：把真实计数留在线程上，再连同结果一起发出去。"""
+        self.processed_count = processed
+        self.failed_count = failed
+        self.batch_completed.emit(success, message, cancelled, processed, failed)
     
     def pause(self):
         """暂停"""
@@ -665,6 +706,9 @@ class BatchLabelingManager(QObject):
         self.model_manager = None
         self.images = []
         self.plan = None
+        # 上一批的真实战果（线程数出来的，不是「打算处理多少张」）
+        self.processed_count = 0
+        self.failed_count = 0
 
     def start_batch_processing(self, plan, model_manager) -> bool:
         """按快照开跑；已经有一批在跑就直接拒绝。返回「这次是不是真的启动了」。
@@ -717,14 +761,21 @@ class BatchLabelingManager(QObject):
 
     def on_progress_updated(self, processed: int, total: int, labeled: int):
         """进度更新回调"""
-        current_image = self.images[processed-1] if processed <= len(self.images) else {}
+        current_image = self.images[processed-1] if 0 < processed <= len(self.images) else {}
         image_name = os.path.basename(current_image.get('storage_path', ''))
         progress = int((processed / total) * 100) if total else 0
         self.progress_updated.emit(progress, processed, total, image_name)
 
-    def on_batch_completed(self, success: bool, message: str, cancelled: bool):
-        """批量完成回调"""
-        processed_count = len(self.images)
+    def on_batch_completed(self, success: bool, message: str, cancelled: bool,
+                           processed_count: int = 0, failed_count: int = 0):
+        """批量完成回调。
+
+        上报的是线程真正数出来的成功张数。以前这里写的是 `len(self.images)` ——
+        那是「这一批打算处理多少张」：取消了、文件不在了、跑挂了，都照样按满勤
+        上报，界面于是弹出「处理了 30 张图片」，而实际只跑了 3 张。
+        """
+        self.processed_count = processed_count
+        self.failed_count = failed_count
         self.batch_completed.emit(success, message, processed_count, cancelled)
 
     def _on_thread_finished(self):
