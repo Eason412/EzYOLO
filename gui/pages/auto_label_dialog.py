@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 from gui.styles import COLORS, CONTROL_HEIGHT_LG, RADIUS_SM
 from gui.widgets.app_dialog import confirm, show_warning
+from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.context_help import ContextHelp
 
 # LLM配置文件路径
@@ -158,41 +159,6 @@ SIZE_NAMES = {
     "b": "balanced (平衡)",
     "u": "ultra (超大)",
 }
-
-
-class CollapsibleSection(QWidget):
-    """可折叠的高级设置区：默认收起，只有需要的人才展开。"""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self._title = title
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        self.toggle_button = QPushButton()
-        self.toggle_button.setObjectName("link")
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.toggled.connect(self._on_toggled)
-        layout.addWidget(self.toggle_button, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        self.body = QWidget()
-        self.body.setVisible(False)
-        layout.addWidget(self.body)
-
-        self._sync_text()
-
-    def _on_toggled(self, checked: bool):
-        self.body.setVisible(checked)
-        self._sync_text()
-
-    def _sync_text(self):
-        arrow = "▾" if self.toggle_button.isChecked() else "▸"
-        self.toggle_button.setText(f"{arrow} {self._title}")
-
-    def set_expanded(self, expanded: bool):
-        self.toggle_button.setChecked(expanded)
 
 
 def _sam_model_exists(model_file: str) -> bool:
@@ -532,9 +498,10 @@ class AutoLabelDialog(QDialog):
         """类别映射：进阶用法，默认折叠"""
         section = CollapsibleSection("类别映射（可选：模型类别与项目类别不一致时使用）")
 
-        layout = QVBoxLayout(section.body)
+        layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        section.add_layout(layout)
 
         # 启用映射选项
         self.chk_enable_mapping = QCheckBox("启用类别映射")
@@ -1087,8 +1054,9 @@ class AutoLabelDialog(QDialog):
         layout.addLayout(form)
 
         advanced = CollapsibleSection("高级参数（仅 FastSAM 生效）")
-        advanced_layout = QFormLayout(advanced.body)
+        advanced_layout = QFormLayout()
         advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced.add_layout(advanced_layout)
 
         # 置信度阈值（FastSAM用）
         self.sb_sam_conf = QDoubleSpinBox()
@@ -1317,9 +1285,10 @@ class AutoLabelDialog(QDialog):
         """提示词模板：默认折叠，不挡住上面的基础配置"""
         section = CollapsibleSection("提示词模板（高级）")
 
-        layout = QVBoxLayout(section.body)
+        layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        section.add_layout(layout)
 
         # 系统提示词
         layout.addWidget(QLabel("系统提示词:"))

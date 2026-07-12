@@ -25,6 +25,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 from gui.styles import COLORS, mono_font_family_css
+from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 from gui.workflow import find_project_weights
@@ -733,36 +734,6 @@ class VideoPlayer(QWidget):
         self.video_label.setFixedSize(max(1, target_w), max(1, target_h))
 
 
-class CollapsibleSection(QWidget):
-    """次要设置的折叠区：默认收起，点标题行才展开，避免一上来就是一堵参数墙。"""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self._title = title
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        self.toggle = QPushButton(f"▸ {title}")
-        self.toggle.setObjectName("link")
-        self.toggle.setCheckable(True)
-        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle.toggled.connect(self._on_toggled)
-        layout.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignLeft)
-
-        self.body = QWidget()
-        self.body.setVisible(False)
-        self.content = QVBoxLayout(self.body)
-        self.content.setContentsMargins(0, 0, 0, 0)
-        self.content.setSpacing(10)
-        layout.addWidget(self.body)
-
-    def _on_toggled(self, checked: bool):
-        self.body.setVisible(checked)
-        self.toggle.setText(f"{'▾' if checked else '▸'} {self._title}")
-
-
 def make_card(title: str, hint: str = "") -> Tuple[QFrame, QVBoxLayout]:
     """一张卡片：标题 + 可选的一句说明。返回卡片本身和它的内容区布局。"""
     card = QFrame()
@@ -1142,7 +1113,7 @@ class TestPage(QWidget):
         self.inference_size.setSingleStep(32)
         adv_form.addRow("推理尺寸:", self.inference_size)
 
-        advanced.content.addLayout(adv_form)
+        advanced.content_layout().addLayout(adv_form)
 
         pretrained_form = QFormLayout()
         pretrained_form.setContentsMargins(0, 0, 0, 0)
@@ -1161,7 +1132,7 @@ class TestPage(QWidget):
         self.task_type.setToolTip("决定 ONNX / TensorRT 模型怎么加载")
         pretrained_form.addRow("任务:", self.task_type)
 
-        advanced.content.addLayout(pretrained_form)
+        advanced.content_layout().addLayout(pretrained_form)
 
         # 先填好型号/任务，再接「选择变了就刷新模型说明」的信号，避免初始化时反复触发
         self._init_model_lists()
@@ -1169,7 +1140,7 @@ class TestPage(QWidget):
         self.model_size.currentIndexChanged.connect(self._on_pretrained_changed)
         self.task_type.currentIndexChanged.connect(self._on_pretrained_changed)
 
-        advanced.content.addWidget(self.create_class_mapping_block())
+        advanced.content_layout().addWidget(self.create_class_mapping_block())
 
         body.addWidget(advanced)
 
@@ -1226,7 +1197,7 @@ class TestPage(QWidget):
         self.log_text.setStyleSheet(
             (f"font-family: {mono}; " if mono else "") + "font-size: 12px;"
         )
-        section.content.addWidget(self.log_text)
+        section.content_layout().addWidget(self.log_text)
 
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
@@ -1245,7 +1216,7 @@ class TestPage(QWidget):
         btn_row.addWidget(self.btn_save_log)
 
         btn_row.addStretch()
-        section.content.addLayout(btn_row)
+        section.content_layout().addLayout(btn_row)
 
         return section
 
