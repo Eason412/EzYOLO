@@ -25,6 +25,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 from gui.styles import COLORS, mono_font_family_css
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 from gui.workflow import find_project_weights
 from models.database import db
@@ -968,6 +969,14 @@ class TestPage(QWidget):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 4, 0)
         content_layout.setSpacing(12)
+
+        self.context_help = ContextHelp([
+            "点「用本项目训练的模型」或「选择模型文件…」，先定用哪个模型。",
+            "选图片、文件夹或视频作为输入，也可以直接加载项目里的一个分组。",
+            "调「识别门槛」后点「开始测试」，右边显示画好框的结果和耗时。",
+            "这里只是看模型效果，检测结果不会写回项目的标注。",
+        ])
+        content_layout.addWidget(self.context_help)
 
         content_layout.addWidget(self.create_model_card())
         content_layout.addWidget(self.create_source_card())

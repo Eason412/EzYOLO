@@ -17,6 +17,7 @@ from html import escape
 from typing import Dict, List, Optional
 
 from gui.styles import COLORS, mono_font_family_css, set_menu_indicator
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.elided_combo import ElidedComboBox
 from gui.workflow import (
     STEP_IMPORT, STEP_ANNOTATE, STEP_RESULT,
@@ -887,6 +888,18 @@ class TrainPage(QWidget):
         scroll_layout = QVBoxLayout(self.scroll_content)
         scroll_layout.setContentsMargins(0, 0, 6, 0)
         scroll_layout.setSpacing(12)
+
+        self.context_help = ContextHelp(
+            [
+                "先看「数据准备」那几行是否都齐了，缺图片、标注或类别就先回上一步补。",
+                "在「基础配置」里选模型和训练轮数，先用小模型跑通一轮，再换大的。",
+                "要改 batch、学习率、数据增强时才展开「高级参数」，其余保持默认。",
+                "点「开始训练」，右边看进度、损失曲线和日志。",
+                "点「停止」会在当前这一轮跑完后结束；已跑完的轮次留在 runs 目录里，但这次训练不会再继续。",
+            ],
+            risk_steps=[5],
+        )
+        scroll_layout.addWidget(self.context_help)
 
         scroll_layout.addWidget(self.create_prep_card())
         scroll_layout.addWidget(self.create_basic_card())

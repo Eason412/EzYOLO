@@ -28,6 +28,7 @@ from gui.thumbnail_overlay import bbox_preview_boxes, draw_boxes_on_thumbnail
 from models.database import db
 from core.import_manager import ImportManager, VIDEO_MODE_INTERVAL, VIDEO_MODE_RANDOM
 from core.annotation_importer import AnnotationImporter
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.loading_dialog import LoadingOverlay
 from gui.widgets.group_select_dialog import GroupSelectDialog, ask_import_group
 from gui.widgets.task_type_dialog import ask_task_type, task_type_label
@@ -322,6 +323,18 @@ class ImportPage(QWidget):
         # 工具栏：左边加数据，右边管数据
         self.toolbar = self.create_toolbar()
         main_layout.addWidget(self.toolbar)
+
+        # 使用说明：默认收起，紧跟在工具栏下面
+        self.context_help = ContextHelp(
+            [
+                "用工具栏的「导入图片 / 导入文件夹 / 导入视频 / 导入标注」选一种方式，数据就进到当前项目里。",
+                "在「筛选」里选已标注或未标注，缩略图只留下你这次要处理的那一批。",
+                "勾上「显示标注框」，缩略图会直接画出已有标注；取消勾选就只看原图。",
+                "「管理」里的「清空全部图片」和「删除项目」会连标注一起删掉，删了不能撤销。",
+            ],
+            risk_steps=[4],
+        )
+        main_layout.addWidget(self.context_help)
 
         # 导入任务状态条（默认隐藏）：只反映“导入任务”本身，
         # 跟下面缩略图加载用的 progress_bar 是两套独立状态

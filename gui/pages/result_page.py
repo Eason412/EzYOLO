@@ -31,6 +31,7 @@ from PyQt6.QtGui import QPixmap
 
 from gui.styles import COLORS, RADIUS_SM, set_menu_indicator
 from gui.workflow import APP_ROOT, find_project_runs
+from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 
 
@@ -584,6 +585,14 @@ class ResultPage(QWidget):
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
+
+        self.context_help = ContextHelp([
+            "先看最上面的结论卡，一句话判断这次训练出来的模型能不能用。",
+            "看「关键指标」里的 mAP50：越接近 1 越准；mAP50-95 比它低很多是常态。",
+            "翻「训练过程与预测示例」里的曲线和预测图：损失应该一路下降并趋平，框的位置和类别要对得上。",
+            "点「导出模型」拿到 ONNX / TensorRT 文件，导出的是这次训练的最佳权重。",
+        ])
+        layout.addWidget(self.context_help)
 
         layout.addWidget(self.create_verdict_card())
         layout.addWidget(self.create_run_card())

@@ -42,6 +42,7 @@ import sys
 from gui.styles import COLORS, RADIUS_SM, get_primary_font_family, set_menu_indicator
 from gui.display_names import display_name, display_names
 from gui.widgets.collapsible_section import CollapsibleSection
+from gui.widgets.context_help import ContextHelp
 from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
 from gui.view_zoom import (
@@ -2701,6 +2702,9 @@ class AnnotatePage(QWidget):
         self.context_bar = self.create_context_bar()
         self.main_layout.addWidget(self.context_bar)
 
+        # 使用说明：默认收起，跟顶栏左右对齐
+        self.main_layout.addWidget(self.create_context_help_bar())
+
         # 创建分割器
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -2741,6 +2745,27 @@ class AnnotatePage(QWidget):
         """显示页面时刷新快捷键配置。"""
         self._refresh_navigation_shortcuts()
         super().showEvent(event)
+
+    def create_context_help_bar(self) -> QWidget:
+        """使用说明那一条：主布局是零边距的，靠这层容器跟顶栏对齐。"""
+        bar = QWidget()
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(16, 8, 16, 0)
+        layout.setSpacing(0)
+
+        self.context_help = ContextHelp(
+            [
+                "在右侧「类别」里选中一个类别，接下来画的标注都算这个类别。",
+                "用工具栏的绘制工具在图片上按住拖出一个框，松手就生成一条标注。",
+                "点右侧「用已有模型标注」，先让模型标一遍，再手动改错的地方。",
+                "点画布右上角的锁，切换图片时保持当前的缩放和位置，方便逐张比对。",
+                "「批量标注…」按自动标注设置处理整批图片；那里勾了「覆盖原标签」的话，已有标注会被替换且无法撤销。",
+            ],
+            risk_steps=[5],
+        )
+        layout.addWidget(self.context_help)
+
+        return bar
 
     def create_context_bar(self) -> QWidget:
         """顶部信息条：当前图片 / 工具 / 标注方式。
