@@ -12,7 +12,7 @@
 
 import _bootstrap  # noqa: F401  必须第一个导入
 
-from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtCore import QSize, QSizeF, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
@@ -219,16 +219,21 @@ def test_no_clipping_across_common_widths():
 
 
 def test_icon_renders_crisp_across_dpi_scales():
-    """图标来自 svg，按任意目标尺寸取 pixmap 都应该精确匹配（矢量，不是位图硬缩放）。
+    """图标来自 svg，按任意 devicePixelRatio 取 pixmap 都应该精确匹配（矢量，不是位图硬缩放）。
 
-    100/125/150/200% 对应的物理尺寸分别是 16/20/24/32px。
+    100/125/150/200% 对应的物理尺寸分别是 16/20/24/32px；用 pixmap(size, dpr) 这个
+    重载显式传目标 dpr，不能让外层进程的 QT_SCALE_FACTOR 再乘一遍——那是两回事：
+    QT_SCALE_FACTOR 影响的是这次调用之外、Qt 自己默认取的 dpr，跟这里显式传入的
+    dpr 参数互不相关，混在一起断言就会在外层缩放不是 1.0 时重复相乘算错物理尺寸。
     """
     section = _make_section()
-    for scale in (1.0, 1.25, 1.5, 2.0):
-        size = QSize(round(16 * scale), round(16 * scale))
-        pixmap = section.toggle.icon().pixmap(size)
+    for dpr in (1.0, 1.25, 1.5, 2.0):
+        pixmap = section.toggle.icon().pixmap(QSize(16, 16), dpr)
         assert not pixmap.isNull()
-        assert pixmap.size() == size
+        expected_physical = round(16 * dpr)
+        assert pixmap.size() == QSize(expected_physical, expected_physical)
+        assert pixmap.devicePixelRatio() == dpr
+        assert pixmap.deviceIndependentSize() == QSizeF(16.0, 16.0)
 
 
 def test_train_auto_label_test_pages_share_the_same_class():
