@@ -4,7 +4,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
-    QCheckBox, QSlider, QProgressBar, QTextEdit, QSplitter,
+    QCheckBox, QSlider, QProgressBar, QTextEdit,
     QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame,
     QInputDialog, QRadioButton, QListWidget, QListWidgetItem, QButtonGroup,
     QMenu,
@@ -13,9 +13,11 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
 import os
 import json
 import shutil
+from html import escape
 from typing import Dict, List, Optional
 
-from gui.styles import COLORS, mono_font_family_css
+from gui.styles import COLORS, mono_font_family_css, set_menu_indicator
+from gui.widgets.elided_combo import ElidedComboBox
 from gui.workflow import (
     STEP_IMPORT, STEP_ANNOTATE, STEP_RESULT,
     get_project_snapshot,
@@ -142,6 +144,16 @@ class NoWheelComboBox(QComboBox):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class ElidedNoWheelComboBox(ElidedComboBox):
+    """训练模板下拉：装不下就省略号收尾，未聚焦时也不吃滚轮。"""
 
     def wheelEvent(self, event):
         if self.hasFocus():
@@ -782,28 +794,22 @@ class TrainPage(QWidget):
         self.refresh_readiness()
 
     def init_ui(self):
-        """初始化界面：左边按顺序配置并开始，右边看进度、曲线和日志。"""
+        """初始化界面：左边按顺序配置并开始，右边看进度、曲线和日志。
+
+        左栏宽度固定，不用 QSplitter——窗口变宽时增量都该给右边的监控面板，
+        左边的配置卡片不应该跟着横向漂移。
+        """
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(16)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        # 两侧都不许被拖没：主操作和日志任何时候都要看得见
-        splitter.setChildrenCollapsible(False)
+        self.config_panel = self.create_config_panel()
+        self.config_panel.setFixedWidth(360)
+        main_layout.addWidget(self.config_panel)
 
-        left_panel = self.create_config_panel()
-        left_panel.setMinimumWidth(380)
-        splitter.addWidget(left_panel)
-
-        right_panel = self.create_monitor_panel()
-        right_panel.setMinimumWidth(340)
-        splitter.addWidget(right_panel)
-
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([430, 450])
-
-        main_layout.addWidget(splitter)
+        self.monitor_panel = self.create_monitor_panel()
+        self.monitor_panel.setMinimumWidth(340)
+        main_layout.addWidget(self.monitor_panel, 1)
 
         self.connect_config_signals()
         self.refresh_readiness()
@@ -823,8 +829,8 @@ class TrainPage(QWidget):
         card.setObjectName("card")
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
 
         heading = QLabel(title)
         heading.setObjectName("h2")
@@ -873,6 +879,9 @@ class TrainPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 左栏宽度固定，装不下的内容纵向滚动就好，不许再横向滚出一条杠
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.config_scroll = scroll
 
         self.scroll_content = QWidget()
         scroll_layout = QVBoxLayout(self.scroll_content)
@@ -932,7 +941,7 @@ class TrainPage(QWidget):
         card, layout = self.make_card("基础配置")
 
         form = QFormLayout()
-        form.setSpacing(10)
+        form.setSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # 模板行也走表单：以前它是卡片里单独一条 QHBoxLayout，标签列和字段列
@@ -978,19 +987,33 @@ class TrainPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        self.template_combo = NoWheelComboBox()
+        self.template_combo = ElidedNoWheelComboBox()
         self.template_combo.setToolTip("把一套调好的参数存下来，下次直接套用。")
         self.template_combo.currentTextChanged.connect(self.on_template_selection_changed)
+        # 名字可以任意长，但这一行还要给两个按钮留位置：内容再长也不能把行撑宽，
+        # 装不下就交给 ElidedNoWheelComboBox 画省略号，而不是把 scroll_content 撑出横向滚动条
+        self.template_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.template_combo.setMinimumContentsLength(1)
+        self.template_combo.setMinimumWidth(40)
         row.addWidget(self.template_combo, 1)
+
+        compact_button_style = """
+            QPushButton { padding: 5px 8px; }
+            QPushButton[menuIndicator="true"] { padding-right: 30px; }
+        """
 
         self.btn_apply_template = QPushButton("套用")
         self.btn_apply_template.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_template.setStyleSheet(compact_button_style)
         self.btn_apply_template.clicked.connect(self.apply_selected_template)
         row.addWidget(self.btn_apply_template)
 
         # 文案里不再自己写 ▾：挂了菜单的按钮，Qt 会再画一个箭头，写死一个就成了双箭头
         self.btn_template_menu = QPushButton("管理")
         self.btn_template_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_template_menu.setStyleSheet(compact_button_style)
         menu = QMenu(self.btn_template_menu)
         self.action_save_template = menu.addAction("把当前参数保存为模板…")
         self.action_save_template.triggered.connect(self.save_current_as_template)
@@ -999,6 +1022,7 @@ class TrainPage(QWidget):
         self.action_delete_template = menu.addAction("删除所选模板")
         self.action_delete_template.triggered.connect(self.delete_selected_template)
         self.btn_template_menu.setMenu(menu)
+        set_menu_indicator(self.btn_template_menu)
         row.addWidget(self.btn_template_menu)
 
         return holder
@@ -1042,7 +1066,7 @@ class TrainPage(QWidget):
         group = QGroupBox("训练细节")
 
         layout = QFormLayout(group)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # Batch Size
@@ -1090,7 +1114,7 @@ class TrainPage(QWidget):
         group = QGroupBox("数据增强")
 
         layout = QFormLayout(group)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
         # Mosaic
         self.mosaic = QCheckBox("启用 Mosaic 增强")
@@ -1144,7 +1168,7 @@ class TrainPage(QWidget):
 
         self.ratio_split_widget = QWidget()
         ratio_layout = QFormLayout(self.ratio_split_widget)
-        ratio_layout.setSpacing(10)
+        ratio_layout.setSpacing(8)
         
         # 训练集比例
         self.train_split = NoWheelSlider(Qt.Orientation.Horizontal)
@@ -1361,11 +1385,32 @@ class TrainPage(QWidget):
         """④ 训练摘要：开始前把这次要跑的东西用人话摆出来。"""
         card, layout = self.make_card("训练摘要")
 
+        # 富文本：一行「训练轮数：100 轮」里，真正要人看清的是 100，
+        # 纯文本做不出这个层次——项目名、类别名之类的动态内容全部转义后才拼进去。
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
+        self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(self.summary_label)
 
         return card
+
+    def _summary_value(self, text: str, accent: bool = False) -> str:
+        """摘要里的一个值：加粗，可选蓝色。text 必须已经转义。"""
+        color = COLORS['accent_text'] if accent else COLORS['text_primary']
+        return f'<span style="color:{color}; font-weight:600;">{text}</span>'
+
+    def _summary_unit(self, text: str) -> str:
+        """跟在值后面的单位（轮、%、px）：灰、不加粗，把数字衬出来。"""
+        return f'<span style="color:{COLORS["text_secondary"]};">{escape(text)}</span>'
+
+    def _summary_row(self, label: str, value_html: str) -> str:
+        """一行：左边灰色说明，右边值。"""
+        return (
+            f'<tr>'
+            f'<td style="color:{COLORS["text_secondary"]};">{escape(label)}</td>'
+            f'<td>{value_html}</td>'
+            f'</tr>'
+        )
 
     def update_summary(self):
         """把当前表单翻译成几行人话。"""
@@ -1396,17 +1441,41 @@ class TrainPage(QWidget):
         if self.hsv.isChecked():
             augments.append(f"HSV {self.hsv_strength.value()}%")
 
-        lines = [
-            f"模型：{self.model_version.currentText()} · "
-            f"{self.model_size.currentText() or '-'} · {self.task_type.currentText() or '-'}",
-            f"训练轮数：{self.epochs.value()} 轮　　计算设备：{self.device.currentText()}",
-            f"数据划分：{split_text}",
-            f"数据增强：{'、'.join(augments) if augments else '全部关闭'}",
-            f"其他：批大小 {self.batch_size.value()} · 图片尺寸 {self.img_size.value()} · "
-            f"学习率 {self.lr.value():.4f} · 优化器 {self.optimizer.currentText()} · "
-            f"加载线程 {self.workers.value()}",
+        # 模型这一行：版本和型号是这次训练最要紧的两个选择，用蓝色点出来；
+        # 任务类型跟着它们走，用普通的深色。
+        sep = self._summary_unit(" · ")
+        model_html = sep.join([
+            self._summary_value(escape(self.model_version.currentText()), accent=True),
+            self._summary_value(escape(self.model_size.currentText() or '-'), accent=True),
+            self._summary_value(escape(self.task_type.currentText() or '-')),
+        ])
+
+        other_html = sep.join([
+            self._summary_unit("批大小 ") + self._summary_value(escape(str(self.batch_size.value()))),
+            self._summary_unit("图片尺寸 ") + self._summary_value(escape(str(self.img_size.value()))),
+            self._summary_unit("学习率 ") + self._summary_value(escape(f"{self.lr.value():.4f}")),
+            self._summary_unit("优化器 ") + self._summary_value(escape(self.optimizer.currentText())),
+            self._summary_unit("加载线程 ") + self._summary_value(escape(str(self.workers.value()))),
+        ])
+
+        rows = [
+            self._summary_row("模型", model_html),
+            self._summary_row(
+                "训练轮数",
+                self._summary_value(escape(str(self.epochs.value()))) + self._summary_unit(" 轮"),
+            ),
+            self._summary_row("计算设备", self._summary_value(escape(self.device.currentText()))),
+            self._summary_row("数据划分", self._summary_value(escape(split_text))),
+            self._summary_row(
+                "数据增强",
+                self._summary_value(escape('、'.join(augments) if augments else '全部关闭')),
+            ),
+            self._summary_row("其他", other_html),
         ]
-        self.summary_label.setText("\n".join(lines))
+
+        self.summary_label.setText(
+            f'<table cellspacing="0" cellpadding="3">{"".join(rows)}</table>'
+        )
 
     def connect_config_signals(self):
         """任何配置改动都要反映到摘要里，否则摘要就是骗人的。"""

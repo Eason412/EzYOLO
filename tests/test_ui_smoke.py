@@ -34,8 +34,9 @@ def test_window_opens_on_first_step():
     window = make_window()
     assert window.current_index == STEP_IMPORT
     assert window.content_stack.currentIndex() == STEP_IMPORT
-    # 没有项目时，页头不该催下一步
-    assert window.header.next_btn.isHidden()
+    # 没有项目时，工作流的下一步数据也不该催下一步
+    # （导入页是业务页，PageHeader 本身也不显示，见 test_ui_layout.py）
+    assert window.header._next_index is None
 
 
 def test_all_steps_reachable_and_gated_without_project():
@@ -82,9 +83,10 @@ def test_project_with_images_opens_annotate_but_blocks_train():
     assert window.content_stack.currentIndex() == GATE_INDEX
     assert window.gate._goto_index == STEP_ANNOTATE
 
-    # 页头的下一步应该指向标注
+    # 工作流的下一步数据应该指向标注（导入页是业务页，页头本身不显示，
+    # 见 test_ui_layout.py 的 header 隐藏测试；这里只验证数据仍然对）
     window.switch_page(STEP_IMPORT)
-    assert window.header.next_btn.isVisible() or window.header._next_index == STEP_ANNOTATE
+    assert window.header._next_index == STEP_ANNOTATE
 
     db.delete_project(project_id)
 

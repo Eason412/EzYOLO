@@ -15,14 +15,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+from PyQt6.QtCore import Qt  # noqa: E402
 from PyQt6.QtWidgets import QLabel, QPushButton  # noqa: E402
-from PyQt6.QtGui import QImage, QColor  # noqa: E402
+from PyQt6.QtGui import QImage, QColor, QFontMetrics  # noqa: E402
 
 from gui.workflow import (  # noqa: E402
     STEP_IMPORT, STEP_ANNOTATE, STEP_TRAIN, STEP_RESULT, STEP_TEST,
     PAGE_SETTINGS, PAGE_ABOUT,
 )
-from gui.main_window import MainWindow  # noqa: E402
+from gui.main_window import MainWindow, GATE_INDEX  # noqa: E402
 
 _app = _bootstrap.app()
 db = _bootstrap.db
@@ -403,6 +404,355 @@ def test_startup_notice_stays_quiet_when_nothing_is_wrong():
     window = make_window()
     assert not window.notice.isVisible()
     window.close()
+
+
+def test_long_project_name_is_elided_not_cut_in_half():
+    """侧栏项目名装不下时要以省略号收尾，不能把最后一个中文字切掉一半。
+
+    上面那套切字检查只看 QLabel 和 QPushButton，下拉框漏在外面——
+    而 QComboBox 恰恰是不会自己省略的：文字比框宽就直接裁掉。给下拉箭头
+    留出内边距之后，长项目名正好会露出半个字。
+    """
+    long_name = "安全帽检测很长的项目名字测试用例"
+    project_id = _bootstrap.create_temp_project(name=long_name, project_type="detect")
+
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    for _ in range(3):
+        _app.processEvents()
+
+    combo = window.project_combo
+    metrics = QFontMetrics(combo.font())
+
+    # 前提：这个名字确实装不下，否则这个测试什么都没测到
+    assert metrics.horizontalAdvance(long_name) > combo.width(), "名字应该长到装不下"
+
+    painted = combo.elided_text()
+    assert painted != long_name, "装不下却原样画出来，最后一个字会被切掉"
+    assert painted.endswith("…"), f"应该用省略号收尾，实际是 {painted!r}"
+    assert metrics.horizontalAdvance(painted) <= combo.width(), "省略之后仍然超出框宽"
+
+    # 完整名字要还能看得到
+    assert combo.itemData(combo.currentIndex(), Qt.ItemDataRole.ToolTipRole) == long_name
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_project_identity_is_not_repeated_on_the_pages():
+    """项目名只由左侧流程栏负责。标注页和导入页不再各放一份。
+
+    同一屏把项目名写三遍不会让人更清楚自己在哪，只会把宽度从真正要看的东西
+    （标注页的画布、导入页的图片区）里抠走。
+    """
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    for _ in range(3):
+        _app.processEvents()
+
+    assert not hasattr(window.annotate_page, 'project_name_label'), \
+        "标注页信息条不该再有「当前项目」这一格"
+    assert not hasattr(window.import_page, 'project_bar'), \
+        "导入页不该再有项目信息卡片"
+
+    # 侧栏那一份还在——不能把项目身份整个弄丢
+    assert window.project_combo is not None
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_annotate_toolbar_is_one_quiet_row_without_group_captions():
+    """标注工具栏是一行控件，不是一张带小标题的卡片。
+
+    「标注工具」「修改」这两行常驻小标题各占一行高度，三五个按钮不需要目录；
+    卡片边框还把它框成一个和画布平起平坐的区块——画布因此矮了一截。
+    """
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    window.switch_page(STEP_ANNOTATE)
+    for _ in range(3):
+        _app.processEvents()
+
+    page = window.annotate_page
+
+    captions = [label.text() for label in page.toolbar.findChildren(QLabel)]
+    assert "标注工具" not in captions and "修改" not in captions, \
+        f"工具栏里不该再有常驻的分组标题：{captions}"
+
+    # 一行：所有可见按钮的垂直区间必须互相重叠
+    visible = [b for b in page.toolbar_buttons if b.isVisible()]
+    assert len(visible) >= 3
+    tops = {b.y() for b in visible}
+    assert len(tops) == 1, f"工具栏按钮不在同一行上：{[(b.text(), b.y()) for b in visible]}"
+
+    # 高度一致：QToolButton（带下拉箭头）和普通 QPushButton 默认对不齐
+    heights = {b.height() for b in visible}
+    assert len(heights) == 1, \
+        f"按钮高度不一致，中间那根分隔线两边会高低不平：{[(b.text(), b.height()) for b in visible]}"
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_advanced_and_destructive_panels_start_collapsed():
+    """样本管理（会真删图片文件）和数据导出默认收起，不常驻占地方。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    window.switch_page(STEP_ANNOTATE)
+    for _ in range(3):
+        _app.processEvents()
+
+    page = window.annotate_page
+
+    # 收起时里面的按钮是看不见的，但控件还在——展开就能用，没有被删掉
+    assert not page.btn_delete_random_samples.isVisible()
+    assert not page.btn_export_dataset.isVisible()
+    assert not page.btn_batch_process.isVisible(), "批处理已经挪进样本管理（进阶）里"
+
+    # 类别和 AI 入口是主路径，必须一进来就看得见
+    assert page.class_list.isVisible()
+    assert page.btn_auto_label.isVisible()
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_expanded_sections_do_not_clip_their_contents():
+    """收起只是默认值，不是把问题藏起来——展开之后一样不许切字。"""
+    from gui.widgets.collapsible_section import CollapsibleSection
+
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    window.switch_page(STEP_ANNOTATE)
+    for _ in range(3):
+        _app.processEvents()
+
+    sections = window.annotate_page.right_panel.findChildren(CollapsibleSection)
+    assert len(sections) == 2, f"应该有样本管理和数据导出两个折叠区，实际 {len(sections)}"
+
+    for section in sections:
+        assert not section.is_expanded(), f"{section.toggle.text()} 默认应该是收起的"
+        section.set_expanded(True)
+    for _ in range(3):
+        _app.processEvents()
+
+    problems = []
+    for section in sections:
+        problems += _clipped_widgets(section)
+    assert not problems, "折叠区展开后文字被切:\n" + "\n".join(problems)
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_import_page_keeps_task_type_and_hides_rare_actions_in_a_menu():
+    """导入页：任务类型是工具栏上的一个胶囊，罕用和破坏性的动作进「管理」菜单。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    window.switch_page(STEP_IMPORT)
+    for _ in range(3):
+        _app.processEvents()
+
+    page = window.import_page
+
+    assert page.btn_task_type.isVisible()
+    assert "目标检测" in page.btn_task_type.text(), page.btn_task_type.text()
+
+    labels = [a.text() for a in page.manage_menu.actions() if a.text()]
+    for wanted in ("移动分组", "删除选中的图片", "清空全部图片", "删除项目"):
+        assert wanted in labels, f"「{wanted}」应该在管理菜单里：{labels}"
+
+    # 破坏性的两个要看得出来是破坏性的
+    for action in page.destructive_actions:
+        assert action.property('destructive') is True
+        assert not action.icon().isNull(), f"{action.text()} 应该带一个红点"
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_header_hidden_on_import_and_annotate_business_pages():
+    """导入 / 标注是业务页：左侧 StepNav 已经承担了流程和下一步导航，
+    PageHeader 整块（标题、序号、说明、下一步按钮）不该再显示第二遍。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    for _ in range(3):
+        _app.processEvents()
+
+    window.switch_page(STEP_IMPORT)
+    for _ in range(3):
+        _app.processEvents()
+    assert not window.header.isVisible(), "导入页不该显示 PageHeader"
+
+    window.switch_page(STEP_ANNOTATE)
+    for _ in range(3):
+        _app.processEvents()
+    assert not window.header.isVisible(), "标注页不该显示 PageHeader"
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_header_visible_on_non_business_pages():
+    """训练、结果、测试、设置、关于继续显示 PageHeader。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    for _ in range(3):
+        _app.processEvents()
+
+    for index in (STEP_TRAIN, STEP_RESULT, STEP_TEST, PAGE_SETTINGS, PAGE_ABOUT):
+        window.switch_page(index)
+        for _ in range(3):
+            _app.processEvents()
+        assert window.header.isVisible(), f"第 {index} 页应该显示 PageHeader"
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_header_visible_when_gate_blocks_annotate_without_project():
+    """没有项目时进标注页会被 StepGate 挡住——挡住的是业务页，不是页头。
+    Gate 本身的上下文（第几步、说明）仍然要靠 PageHeader 显示。"""
+    window = make_window()
+    window.resize(1100, 720)
+    window.show()
+    _app.processEvents()
+
+    window.switch_page(STEP_ANNOTATE)
+    for _ in range(3):
+        _app.processEvents()
+
+    assert window.content_stack.currentIndex() == GATE_INDEX
+    assert window.header.isVisible(), "Gate 挡住业务页时，PageHeader 应该继续显示"
+
+    window.close()
+
+
+def test_import_toolbar_moves_up_without_header():
+    """页头隐藏后，工具栏是导入页第一个主要区块，离窗口顶部应该只剩页面自己的
+    上边距（约 16~18px），而不是页头（标题+说明）撑出来的六七十像素。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.resize(1100, 720)
+    window.show()
+    window.switch_page(STEP_IMPORT)
+    for _ in range(3):
+        _app.processEvents()
+
+    toolbar = window.import_page.toolbar
+    top_y = toolbar.mapTo(window, toolbar.rect().topLeft()).y()
+    assert top_y < 40, (
+        f"工具栏离窗口顶部还有 {top_y}px，页头似乎没有真正隐藏（应该只剩页面自身的上边距）"
+    )
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_train_page_config_panel_width_is_fixed_across_sizes():
+    """训练页左边配置栏宽度固定 360px，窗口变宽时增量都该给右边监控面板，
+    不再靠 QSplitter 拖来拖去导致卡片横向漂移。"""
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.switch_page(STEP_TRAIN)
+
+    page = window.train_page
+    assert hasattr(page, 'config_panel') and hasattr(page, 'monitor_panel')
+
+    widths = {}
+    for width, height in SIZES:
+        window.resize(width, height)
+        window.show()
+        for _ in range(3):
+            _app.processEvents()
+        widths[width] = page.config_panel.width()
+
+        assert page.monitor_panel.isVisible()
+        assert page.monitor_panel.width() >= 340
+
+        problems = _clipped_widgets(page)
+        assert not problems, f"[{width}x{height}] 训练页文字被切:\n" + "\n".join(problems)
+
+    assert widths[1100] == 360, f"1100 宽时左栏应该是 360px，实际 {widths[1100]}"
+    assert widths[1470] == 360, f"1470 宽时左栏应该仍是 360px，实际 {widths[1470]}"
+
+    window.close()
+    db.delete_project(project_id)
+
+
+def test_train_page_template_row_does_not_scroll_horizontally():
+    """训练模板这一行（下拉 + 套用 + 管理）挤在固定 360px 左栏里，只许纵向滚动。
+
+    以前这一行把 scroll_content 撑得比视口宽，QScrollArea 底部会冒出一条横向
+    滚动条，基础配置右边的控件（边框、下拉箭头）跟着被裁掉一截。真正的判据
+    不是「有没有滚动条控件」，而是内容本身有没有比视口宽——横向滚动条被关掉
+    之后，撑宽的内容会变成永久裁切，比留着滚动条更糟。
+    """
+    project_id = seed_project()
+    window = make_window()
+    window.load_projects(select_id=project_id)
+    window.switch_page(STEP_TRAIN)
+
+    page = window.train_page
+    scroll = page.config_scroll
+
+    for width, height in SIZES:
+        window.resize(width, height)
+        window.show()
+        for _ in range(3):
+            _app.processEvents()
+
+        assert scroll.horizontalScrollBar().maximum() == 0, (
+            f"[{width}x{height}] 配置栏出现横向滚动，maximum="
+            f"{scroll.horizontalScrollBar().maximum()}（应为 0）"
+        )
+
+        viewport_width = scroll.viewport().width()
+        for widget, label in (
+            (page.template_combo, "训练模板下拉"),
+            (page.btn_apply_template, "「套用」按钮"),
+            (page.btn_template_menu, "「管理」按钮"),
+        ):
+            top_left = widget.mapTo(scroll.viewport(), widget.rect().topLeft())
+            bottom_right = widget.mapTo(scroll.viewport(), widget.rect().bottomRight())
+            assert top_left.x() >= 0 and bottom_right.x() <= viewport_width + SLACK, (
+                f"[{width}x{height}] {label}超出了 scroll viewport 可见范围: "
+                f"x={top_left.x()}..{bottom_right.x()}，viewport 宽度 {viewport_width}"
+            )
+
+        for btn in (page.btn_apply_template, page.btn_template_menu):
+            assert not _text_is_clipped(btn), (
+                f"[{width}x{height}] {btn.text()!r} 按钮的文字被切掉了"
+            )
+
+    window.close()
+    db.delete_project(project_id)
 
 
 if __name__ == "__main__":

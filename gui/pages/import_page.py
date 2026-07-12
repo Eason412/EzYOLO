@@ -9,11 +9,11 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
-    QMenu, QMessageBox, QComboBox, QLineEdit, QListWidget, QListWidgetItem,
-    QDialog, QStackedWidget, QSizePolicy,
+    QMenu, QComboBox, QLineEdit, QListWidget, QListWidgetItem,
+    QDialog, QStackedWidget, QSizePolicy, QToolButton,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QIcon, QFontMetrics
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QTimer
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QIcon
 import cv2
 import numpy as np
 import threading
@@ -22,13 +22,27 @@ from typing import List, Dict, Optional, Tuple, Callable
 import os
 
 from gui.styles import COLORS
+from gui.display_names import display_name, display_names
 from models.database import db
-from core.import_manager import ImportManager
+from core.import_manager import ImportManager, VIDEO_MODE_INTERVAL, VIDEO_MODE_RANDOM
 from core.annotation_importer import AnnotationImporter
 from gui.widgets.loading_dialog import LoadingOverlay
 from gui.widgets.group_select_dialog import GroupSelectDialog, ask_import_group
 from gui.widgets.task_type_dialog import ask_task_type, task_type_label
 from gui.widgets.workflow_widgets import EmptyState
+from gui.widgets.app_dialog import (
+    ask_text, confirm, confirm_destructive, show_info, show_warning,
+)
+from gui.widgets.video_extract_dialog import ask_video_extract_plan
+
+
+def short_task_label(task_type: str) -> str:
+    """工具栏胶囊上只放中文那半截：「目标检测 detect」→「目标检测」。
+
+    共用的任务类型对话框仍然显示带英文的完整标签——在那里，detect / segment
+    这些词要和 YOLO 的术语对得上，是有用的信息；而工具栏上它只是把胶囊撑长。
+    """
+    return task_type_label(task_type).split(' ')[0]
 
 
 # 数据导入线程：文件夹 / 多图 / 视频，实际工作全部委托给 core.import_manager，
@@ -44,13 +58,16 @@ class ImportWorkerThread(QThread):
     # "QThread: Destroyed while thread is still running"。
     result_ready = pyqtSignal(bool, str, bool, int, int)
 
-    def __init__(self, project_id, group_id, kind, source, frame_interval=1):
+    def __init__(self, project_id, group_id, kind, source, frame_interval=1,
+                 video_mode=VIDEO_MODE_INTERVAL, sample_count=None):
         super().__init__()
         self.project_id = project_id
         self.group_id = group_id
         self.kind = kind  # 'folder' | 'images' | 'video'
         self.source = source
         self.frame_interval = frame_interval
+        self.video_mode = video_mode        # 'interval' | 'random'
+        self.sample_count = sample_count    # 随机模式要抽的张数
         self._cancel_event = threading.Event()
 
     def cancel(self):
@@ -80,6 +97,8 @@ class ImportWorkerThread(QThread):
                     self.source, frame_interval=self.frame_interval,
                     progress_callback=progress_callback,
                     cancel_event=self._cancel_event,
+                    mode=self.video_mode,
+                    sample_count=self.sample_count,
                 )
             else:
                 raise ValueError(f"未知导入类型: {self.kind}")
@@ -148,6 +167,82 @@ class ImageLoadWorker(QThread):
         self._is_running = False
 
 
+class _ResponsiveThumbnailGrid(QListWidget):
+    """图片缩略图网格：列数跟着视口宽度走，不留一整列的空白。
+
+    固定 gridSize 在窗口宽度和「整数个格子」对不上时，要么挤出横向滚动条，
+    要么在最右边留一条不够放下一格的空白（比如 890px 宽只塞得下 4 个 184px
+    格子，剩下 154px 就那么空着）。这里在视口变化时重算列数，让 usable
+    宽度正好被列数整除，余数摊薄到每一格里，而不是攒成一条空白。
+    """
+
+    _PREFERRED_CELL_WIDTH = 184
+    _MIN_CELL_WIDTH = 156
+    _MAX_CELL_WIDTH = 220
+    _VIEWPORT_INSET = 4
+    _MIN_ICON_EXTENT = 120
+    _MAX_ICON_EXTENT = 160
+    _ICON_HORIZONTAL_ALLOWANCE = 24
+    _CELL_VERTICAL_ALLOWANCE = 30
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 用定时器把重算推迟到下一轮事件循环：resizeEvent 里直接 setGridSize
+        # 可能马上再触发一次 resizeEvent，级联下去；排队执行、且只在视口真的
+        # 变化时才动，就不会递归。
+        self._grid_update_timer = QTimer(self)
+        self._grid_update_timer.setSingleShot(True)
+        self._grid_update_timer.timeout.connect(self._recalculate_grid)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._grid_update_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._grid_update_timer.start(0)
+
+    def _recalculate_grid(self):
+        viewport = self.viewport()
+        if viewport is None:
+            return
+        usable = max(1, viewport.width() - self._VIEWPORT_INSET)
+
+        columns = max(1, round(usable / self._PREFERRED_CELL_WIDTH))
+        cell_width = usable // columns
+
+        # 太宽：多分几列；分到会低于下限就停，不做无意义的震荡
+        while cell_width > self._MAX_CELL_WIDTH:
+            next_columns = columns + 1
+            next_cell_width = usable // next_columns
+            if next_cell_width < self._MIN_CELL_WIDTH:
+                break
+            columns = next_columns
+            cell_width = next_cell_width
+
+        # 太窄：少分几列；退回 1 列前，先看看会不会又超过上限
+        while cell_width < self._MIN_CELL_WIDTH and columns > 1:
+            next_columns = columns - 1
+            next_cell_width = usable // next_columns
+            if next_cell_width > self._MAX_CELL_WIDTH:
+                break
+            columns = next_columns
+            cell_width = next_cell_width
+
+        icon_extent = max(
+            self._MIN_ICON_EXTENT,
+            min(self._MAX_ICON_EXTENT, cell_width - self._ICON_HORIZONTAL_ALLOWANCE),
+        )
+        font_height = self.fontMetrics().height()
+        grid_size = QSize(cell_width, icon_extent + font_height + self._CELL_VERTICAL_ALLOWANCE)
+        icon_size = QSize(icon_extent, icon_extent)
+
+        if grid_size != self.gridSize():
+            self.setGridSize(grid_size)
+        if icon_size != self.iconSize():
+            self.setIconSize(icon_size)
+
+
 class ImportPage(QWidget):
     """数据导入页面"""
 
@@ -181,7 +276,7 @@ class ImportPage(QWidget):
 
         self.init_ui()
         self.refresh_view_filter_options()
-        self.update_project_bar()
+        self.update_project_controls()
         self.update_view_mode()
 
     def _remove_cached_thumbnails(self, storage_paths):
@@ -207,9 +302,9 @@ class ImportPage(QWidget):
         main_layout.setContentsMargins(24, 18, 24, 18)
         main_layout.setSpacing(14)
 
-        # 项目信息条：当前项目叫什么、要做哪种任务
-        self.project_bar = self.create_project_bar()
-        main_layout.addWidget(self.project_bar)
+        # 项目信息条没了：当前项目在左侧流程栏里选、也一直显示在那儿，
+        # 这里再放一张写着项目名和「01」的卡片，只是把同一件事说第二遍，
+        # 顺带把整整一行高度从图片区里拿走。任务类型改挂到工具栏右侧。
 
         # 工具栏：左边加数据，右边管数据
         self.toolbar = self.create_toolbar()
@@ -238,40 +333,13 @@ class ImportPage(QWidget):
         self.status_bar = self.create_status_bar()
         main_layout.addWidget(self.status_bar)
 
-    def create_project_bar(self) -> QFrame:
-        """项目信息条：项目名 + 任务类型 + 删除项目"""
-        bar = QFrame()
-        bar.setObjectName("card")
-
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
-
-        self.project_name_label = QLabel("未选择项目")
-        self.project_name_label.setObjectName("h2")
-        # 名字可能很长，不能让它把任务类型 / 删除按钮挤出去，超出部分省略并放进 tooltip
-        self.project_name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.project_name_label.setMaximumWidth(280)
-        layout.addWidget(self.project_name_label)
-
-        self.btn_task_type = QPushButton("任务类型：未设置")
-        self.btn_task_type.setToolTip("决定标注工具和训练方式，一般选「目标检测」")
-        self.btn_task_type.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_task_type.clicked.connect(self.change_task_type)
-        layout.addWidget(self.btn_task_type)
-
-        layout.addStretch()
-
-        self.btn_delete_project = QPushButton("删除项目")
-        self.btn_delete_project.setObjectName("danger")
-        self.btn_delete_project.setToolTip("连同项目里的图片和标注一起删除，不可恢复")
-        self.btn_delete_project.clicked.connect(self.delete_current_project)
-        layout.addWidget(self.btn_delete_project)
-
-        return bar
-
     def create_toolbar(self) -> QFrame:
-        """创建工具栏"""
+        """工具栏：左边「把数据弄进来」，右边「这批数据怎么看、怎么管」。
+
+        右边一排以前是筛选 + 移动分组 + 删除选中 + 清空，四个按钮平铺，
+        「清空」和「导入文件夹」一样大——用一次的和每次都用的抢同样的注意力。
+        现在只留任务类型和筛选，其余收进「管理」菜单，破坏性的那两个单独成一段。
+        """
         toolbar = QFrame()
         toolbar.setObjectName("toolbar")
 
@@ -303,6 +371,13 @@ class ImportPage(QWidget):
 
         layout.addStretch()
 
+        # 任务类型：一个能点的胶囊，点开就是原来那个选择框
+        self.btn_task_type = QPushButton("任务：未设置")
+        self.btn_task_type.setToolTip("决定标注工具和训练方式，一般选「目标检测」")
+        self.btn_task_type.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_task_type.clicked.connect(self.change_task_type)
+        layout.addWidget(self.btn_task_type)
+
         filter_label = QLabel("筛选")
         filter_label.setObjectName("caption")
         layout.addWidget(filter_label)
@@ -312,22 +387,93 @@ class ImportPage(QWidget):
         self.view_combo.currentTextChanged.connect(self.filter_images)
         layout.addWidget(self.view_combo)
 
-        self.btn_move_group = QPushButton("移动分组")
-        self.btn_move_group.setToolTip("把选中图片移到指定分组")
-        self.btn_move_group.clicked.connect(self.move_selected_to_group)
-        layout.addWidget(self.btn_move_group)
-
-        self.btn_delete_selected = QPushButton("删除选中")
-        self.btn_delete_selected.clicked.connect(self.delete_selected_images)
-        layout.addWidget(self.btn_delete_selected)
-
-        self.btn_clear = QPushButton("清空")
-        self.btn_clear.setObjectName("danger")
-        self.btn_clear.setToolTip("删除当前项目里的全部图片")
-        self.btn_clear.clicked.connect(self.clear_all_images)
-        layout.addWidget(self.btn_clear)
+        layout.addWidget(self.create_manage_button())
 
         return toolbar
+
+    def create_manage_button(self) -> QToolButton:
+        """「管理 ▾」：不常用的和会删东西的都收在这里。
+
+        破坏性的两个（清空图片、删除项目）单独放在一段里，前面一个红点——
+        Qt 的菜单项没法单独染色（QAction 不是控件，样式表选不中它），
+        图标是唯一能把「这一条会删东西」标出来的位置。
+        """
+        self.btn_manage = QToolButton()
+        self.btn_manage.setText("管理 ▾")
+        self.btn_manage.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_manage.setToolTip("移动分组、删除图片、删除项目")
+        # 文字里已经有 ▾ 了，别让 Qt 再画一个自带的箭头
+        self.btn_manage.setStyleSheet("""
+            QToolButton::menu-indicator { image: none; width: 0px; }
+        """)
+
+        self.manage_menu = QMenu(self)
+
+        self.action_move_group = self.manage_menu.addAction("移动分组")
+        self.action_move_group.setToolTip("把选中图片移到指定分组")
+        self.action_move_group.triggered.connect(self.move_selected_to_group)
+
+        self.action_delete_selected = self.manage_menu.addAction("删除选中的图片")
+        self.action_delete_selected.triggered.connect(self.delete_selected_images)
+
+        self.manage_menu.addSeparator()
+
+        # 一个点不动的标题，把下面两条框成「危险」的那一段
+        danger_caption = self.manage_menu.addAction("危险操作")
+        danger_caption.setEnabled(False)
+
+        self.action_clear = self.manage_menu.addAction(self._danger_icon(), "清空全部图片")
+        self.action_clear.setToolTip("删除当前项目里的全部图片")
+        self.action_clear.triggered.connect(self.clear_all_images)
+
+        self.action_delete_project = self.manage_menu.addAction(self._danger_icon(), "删除项目")
+        self.action_delete_project.setToolTip("连同项目里的图片和标注一起删除，不可恢复")
+        self.action_delete_project.triggered.connect(self.delete_current_project)
+
+        self.destructive_actions = [self.action_clear, self.action_delete_project]
+        for action in self.destructive_actions:
+            action.setProperty('destructive', True)
+
+        # 菜单弹出前再算一次：选中状态可能是在菜单关着的时候变的
+        self.manage_menu.aboutToShow.connect(self.update_manage_action_state)
+
+        self.btn_manage.setMenu(self.manage_menu)
+        return self.btn_manage
+
+    def update_manage_action_state(self):
+        """管理菜单里每一条现在能不能点。
+
+        「移动分组」和「删除选中的图片」没有选中图片时就是不能用的——
+        以前它们一直亮着，点下去只弹一句「还没选图片」，等于用一个弹窗
+        代替了本来一眼就该看出来的状态。「清空全部图片」同理：没有图片可清。
+        """
+        has_project = bool(self.current_project_id)
+        has_selection = bool(self.image_list.selectedItems())
+        has_images = bool(self.images)
+
+        self.action_move_group.setEnabled(has_project and has_selection)
+        self.action_delete_selected.setEnabled(has_project and has_selection)
+
+        # 破坏性的两个在导入进行中一律关掉：正在往里写图片的时候不能把项目端了。
+        # 移动/删除选中不受影响——那是对已有图片的操作，导入中照样可以做。
+        busy = self._import_busy
+        self.action_clear.setEnabled(has_project and has_images and not busy)
+        self.action_delete_project.setEnabled(has_project and not busy)
+
+    def _danger_icon(self) -> QIcon:
+        """破坏性菜单项前面那个红点。自己画的，不引第三方图标。"""
+        pixmap = QPixmap(10, 10)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLORS['error_fill']))
+        painter.drawEllipse(1, 1, 8, 8)
+        painter.end()
+
+        return QIcon(pixmap)
 
     def create_import_status_bar(self) -> QFrame:
         """导入任务状态条：状态文字 + 进度条 + 取消按钮。
@@ -385,16 +531,17 @@ class ImportPage(QWidget):
 
     def create_image_grid(self) -> QListWidget:
         """图片缩略图网格。"""
-        self.image_list = QListWidget()
+        self.image_list = _ResponsiveThumbnailGrid()
         self.image_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.image_list.setIconSize(QSize(160, 160))
         self.image_list.setSpacing(10)
         self.image_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.image_list.setMovement(QListWidget.Movement.Static)
         self.image_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.image_list.setUniformItemSizes(True)
-        self.image_list.setGridSize(QSize(184, 208))
+        self.image_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.image_list.itemClicked.connect(self.on_image_clicked)
+        # 选中哪些图片，决定了「移动分组 / 删除选中」能不能点
+        self.image_list.itemSelectionChanged.connect(self.update_manage_action_state)
         # 注意：这里不写 item 的 background-color，
         # 让代码里 setBackground 设的「已标注」底色能显示出来
         self.image_list.setStyleSheet(f"""
@@ -405,6 +552,7 @@ class ImportPage(QWidget):
                 padding: 8px;
             }}
             QListWidget::item {{
+                margin: 4px;
                 border: 1px solid {COLORS['border']};
                 border-radius: 8px;
                 padding: 6px;
@@ -415,17 +563,36 @@ class ImportPage(QWidget):
         """)
         return self.image_list
 
+    def _refresh_image_display_names(self):
+        """整批算显示名：抽帧出来的图叫「帧 223」，重名的才补区分信息。
+
+        必须整批算——「这个帧号在这批图里是不是独一份」只有看全列表才知道。
+        """
+        aliases = display_names([img.get('filename', '') for img in self.images])
+        self._image_display_names = {
+            img['id']: alias for img, alias in zip(self.images, aliases)
+        }
+
+    def _image_display_name(self, image_data: Dict) -> str:
+        cached = getattr(self, '_image_display_names', {}).get(image_data.get('id'))
+        return cached or display_name(image_data.get('filename', ''))
+
     def _apply_item_status(self, item: QListWidgetItem, image_data: Dict):
-        """让「哪些图已经标过」在网格里一眼看得出来：勾号 + 绿字，不只靠颜色。"""
-        filename = image_data['filename']
+        """让「哪些图已经标过」在网格里一眼看得出来：勾号 + 绿字，不只靠颜色。
+
+        格子底下写的是显示名（完整文件名在 tooltip 里）：一网格全是
+        20260712_000602_575947_frame_000223.jpg 的话，每个格子只放得下前面那段
+        一模一样的时间戳，等于每张图都没有名字。
+        """
         annotated = image_data.get('status') == 'annotated'
+        alias = self._image_display_name(image_data)
 
         if annotated:
-            item.setText(f"✓ {filename}")
+            item.setText(f"✓ {alias}")
             item.setForeground(QColor(COLORS['success']))
             item.setBackground(QColor(COLORS['success_soft']))
         else:
-            item.setText(filename)
+            item.setText(alias)
             item.setForeground(QColor(COLORS['text_secondary']))
             item.setBackground(QColor(COLORS['panel']))
 
@@ -484,7 +651,7 @@ class ImportPage(QWidget):
         self.thumbnail_widgets.clear()
 
         self.refresh_view_filter_options()
-        self.update_project_bar()
+        self.update_project_controls()
 
         if project_id:
             self.load_project_images()
@@ -492,31 +659,25 @@ class ImportPage(QWidget):
             self.update_status_bar()
             self.update_view_mode()
 
-    def update_project_bar(self):
-        """刷新项目信息条与按钮可用性。"""
+    def update_project_controls(self):
+        """刷新任务类型胶囊与各处可用性（没有项目就全灰掉）。"""
         has_project = bool(self.current_project_id)
 
         project = db.get_project(self.current_project_id) if has_project else None
         if project:
-            name = project.get('name', '未命名项目')
-            self.btn_task_type.setText(f"任务类型：{task_type_label(project.get('type'))}")
+            self.btn_task_type.setText(f"任务：{short_task_label(project.get('type'))}")
         else:
-            name = "未选择项目"
-            self.btn_task_type.setText("任务类型：未设置")
+            self.btn_task_type.setText("任务：未设置")
 
-        metrics = QFontMetrics(self.project_name_label.font())
-        elided = metrics.elidedText(name, Qt.TextElideMode.ElideRight, self.project_name_label.maximumWidth())
-        self.project_name_label.setText(elided)
-        self.project_name_label.setToolTip(name)
-
-        for button in (
-            self.btn_task_type, self.btn_delete_project,
+        for control in (
+            self.btn_task_type,
             self.btn_import_folder, self.btn_import_images,
             self.btn_import_video, self.btn_import_annotations,
-            self.btn_move_group, self.btn_delete_selected, self.btn_clear,
-            self.btn_refresh_status, self.view_combo,
+            self.btn_manage, self.btn_refresh_status, self.view_combo,
         ):
-            button.setEnabled(has_project)
+            control.setEnabled(has_project)
+
+        self.update_manage_action_state()
 
         # 导入任务进行中：即使有项目，也不能再启动新导入或破坏当前项目
         if self._import_busy:
@@ -527,7 +688,6 @@ class ImportPage(QWidget):
         has_project = bool(self.current_project_id)
 
         # 没有项目时，工具栏和状态栏全是灰的、没意义，直接收起来，只留一句引导
-        self.project_bar.setVisible(has_project)
         self.toolbar.setVisible(has_project)
         self.status_bar.setVisible(has_project)
 
@@ -569,14 +729,18 @@ class ImportPage(QWidget):
             return
 
         db.update_project(self.current_project_id, type=task_type)
-        self.update_project_bar()
+        self.update_project_controls()
 
     def create_new_project(self):
         """创建新项目：先起名字，再选任务类型。"""
-        from PyQt6.QtWidgets import QInputDialog
-
-        name, ok = QInputDialog.getText(self, "新建项目", "给项目起个名字（比如「安全帽检测」）：")
-        if not ok or not name.strip():
+        name = ask_text(
+            self, "新建项目",
+            "给项目起个名字，之后图片、标注和训练结果都存在这个项目里。",
+            placeholder="比如：安全帽检测",
+            confirm_text="创建项目",
+        )
+        # 取消，或者名字是空的 / 只有空格：ask_text 都返回 None
+        if not name:
             return
 
         task_type = ask_task_type(self, current='detect', title="这个项目要做什么")
@@ -584,7 +748,7 @@ class ImportPage(QWidget):
             return
 
         project_id = db.create_project(
-            name=name.strip(),
+            name=name,
             description="",
             project_type=task_type,
             classes=[]
@@ -600,15 +764,13 @@ class ImportPage(QWidget):
         project = db.get_project(self.current_project_id)
         project_name = (project or {}).get('name', '')
 
-        reply = QMessageBox.question(
+        if not confirm_destructive(
             self,
-            "确认删除",
-            f"确定要删除项目「{project_name}」吗？\n\n"
-            "项目里的所有图片和标注都会一起删除，无法恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+            "删除项目",
+            f"项目「{project_name}」里的所有图片和标注都会一起删除，无法恢复。",
+            detail=f"当前项目有 {len(self.images)} 张图片。",
+            confirm_text="删除项目",
+        ):
             return
 
         try:
@@ -633,12 +795,12 @@ class ImportPage(QWidget):
             self._remove_cached_thumbnails(removed_storage_paths)
 
             self.update_status_bar()
-            self.update_project_bar()
+            self.update_project_controls()
             self.update_view_mode()
             self.projects_changed.emit(None)
 
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"删除项目失败: {str(e)}")
+            show_warning(self, "删除项目失败", str(e))
 
     def load_project_images(self):
         """加载项目图像 - 使用多线程"""
@@ -660,6 +822,7 @@ class ImportPage(QWidget):
 
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
+        self._refresh_image_display_names()
         self.update_status_bar()
         self.update_view_mode()
 
@@ -816,6 +979,7 @@ class ImportPage(QWidget):
             return 0
 
         self.images.extend(new_images)
+        self._refresh_image_display_names()
 
         uncached_tasks = []
         for image_data in new_images:
@@ -830,6 +994,10 @@ class ImportPage(QWidget):
             else:
                 uncached_tasks.append((row_index, image_data))
 
+        # 新导入的图可能和已有的重名（另一段视频的同一个帧号），
+        # 那样老格子也得补上区分信息——所以整列表重刷一遍文字
+        self._refresh_item_labels()
+
         self.update_status_bar()
         self.update_view_mode()
         self.filter_images(self.view_combo.currentText())
@@ -840,6 +1008,15 @@ class ImportPage(QWidget):
             on_thumbnails_ready()
 
         return len(new_images)
+
+    def _refresh_item_labels(self):
+        """按当前的显示名，把所有格子的文字重刷一遍。"""
+        by_id = {img['id']: img for img in self.images}
+        for i in range(self.image_list.count()):
+            item = self.image_list.item(i)
+            image_data = by_id.get(item.data(Qt.ItemDataRole.UserRole))
+            if image_data:
+                self._apply_item_status(item, image_data)
 
     def refresh_view_filter_options(self):
         """刷新筛选下拉框（含分组列表）。"""
@@ -929,6 +1106,9 @@ class ImportPage(QWidget):
         self.status_annotated.setText(f"已标注 {annotated}")
         self.status_pending.setText(f"未标注 {pending}")
 
+        # 图片数变了：「清空全部图片」在没有图片时就该是灰的
+        self.update_manage_action_state()
+
         self.project_data_changed.emit()
 
     # ==================== 导入任务状态 ====================
@@ -940,9 +1120,13 @@ class ImportPage(QWidget):
         for button in (
             self.btn_import_folder, self.btn_import_images,
             self.btn_import_video, self.btn_import_annotations,
-            self.btn_delete_project, self.btn_clear,
         ):
             button.setEnabled(enabled)
+
+        # 破坏性的两个现在在「管理」菜单里：禁的是菜单项，不是整个菜单——
+        # 导入中仍然允许移动分组、删除选中的图片。具体谁能点由这里统一算，
+        # 它读的是 self._import_busy，所以调用顺序上必须先把 busy 标志改好。
+        self.update_manage_action_state()
 
     def _start_import_ui(self, message: str, indeterminate: bool = True):
         """进入「导入中」状态：用户点确认导入后，一个事件循环内就要看到这个。"""
@@ -996,7 +1180,7 @@ class ImportPage(QWidget):
         else:
             self.import_status_frame.setVisible(False)
 
-        self.update_project_bar()
+        self.update_project_controls()
 
     def _cancel_active_import(self):
         """取消按钮：请求后台线程停止，最迟在下一个文件/帧边界生效。"""
@@ -1024,12 +1208,14 @@ class ImportPage(QWidget):
 
     def _start_data_import(self, kind: str, source, group_id,
                             frame_interval: int = 1, initial_message: str = "",
-                            indeterminate: bool = True):
+                            indeterminate: bool = True,
+                            video_mode: str = VIDEO_MODE_INTERVAL,
+                            sample_count: int = None):
         """统一入口：文件夹 / 多图 / 视频导入都从这里起后台线程。"""
         if not self.current_project_id:
             return
         if self._import_busy:
-            QMessageBox.information(self, "提示", "已有导入任务在进行，请稍候")
+            show_info(self, "已有导入任务在进行", "等这一个跑完再开始下一个。")
             return
 
         self._import_generation += 1
@@ -1039,7 +1225,9 @@ class ImportPage(QWidget):
         self._start_import_ui(initial_message, indeterminate=indeterminate)
 
         thread = ImportWorkerThread(
-            self.current_project_id, group_id, kind, source, frame_interval=frame_interval
+            self.current_project_id, group_id, kind, source,
+            frame_interval=frame_interval,
+            video_mode=video_mode, sample_count=sample_count,
         )
         thread.progress_updated.connect(
             lambda progress, message, g=generation: self._on_import_progress(g, progress, message)
@@ -1075,7 +1263,7 @@ class ImportPage(QWidget):
 
         if not success:
             self._end_import_ui()
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{error}")
+            show_warning(self, "导入失败", "导入过程中出错，没有改动项目里的图片。", detail=error)
             return
 
         prefix = "已取消" if cancelled else "导入完成"
@@ -1108,7 +1296,7 @@ class ImportPage(QWidget):
     def import_folder(self):
         """导入文件夹"""
         if not self.current_project_id:
-            QMessageBox.warning(self, "提示", "请先选择或创建一个项目")
+            show_warning(self, "还没有项目", "先在左边选一个项目，或者新建一个。")
             return
         
         folder_path = QFileDialog.getExistingDirectory(
@@ -1125,7 +1313,7 @@ class ImportPage(QWidget):
     def import_images(self):
         """导入单张或多张图片"""
         if not self.current_project_id:
-            QMessageBox.warning(self, "提示", "请先选择或创建一个项目")
+            show_warning(self, "还没有项目", "先在左边选一个项目，或者新建一个。")
             return
         
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -1142,7 +1330,7 @@ class ImportPage(QWidget):
     def import_video(self):
         """导入视频"""
         if not self.current_project_id:
-            QMessageBox.warning(self, "提示", "请先选择或创建一个项目")
+            show_warning(self, "还没有项目", "先在左边选一个项目，或者新建一个。")
             return
         
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1157,35 +1345,47 @@ class ImportPage(QWidget):
             self.process_video_import(file_path, group_id=group_id)
     
     def process_video_import(self, file_path: str, group_id: int = None):
-        """处理视频导入：抽帧间隔问完，后台线程负责剩下的一切。"""
+        """处理视频导入：抽帧方案问完，后台线程负责剩下的一切。
+
+        元信息（总帧数 / fps / 时长）在弹窗里就读好了——只读属性，不解码，
+        所以「打开一个大视频看看能抽几张」不会卡住界面，也不会先导入一堆帧。
+        """
         if not self.current_project_id:
             return
 
-        from PyQt6.QtWidgets import QInputDialog
-        interval, ok = QInputDialog.getInt(
-            self, "抽帧设置",
-            "请输入抽帧间隔（每隔多少帧抽取一帧）:",
-            value=30, min=1, max=1000
-        )
-
-        if not ok:
+        try:
+            plan = ask_video_extract_plan(self, file_path)
+        except ValueError as exc:
+            show_warning(self, "打不开这个视频", str(exc))
             return
 
+        if not plan:
+            return
+
+        name = Path(file_path).name
+        if plan['mode'] == VIDEO_MODE_RANDOM:
+            initial_message = f"正在打开视频: {name}（随机抽取 {plan['sample_count']} 张）"
+        else:
+            initial_message = f"正在打开视频: {name}（每 {plan['frame_interval']} 帧取 1 张）"
+
         self._start_data_import(
-            'video', file_path, group_id, frame_interval=interval,
-            initial_message=f"正在打开视频: {Path(file_path).name}",
+            'video', file_path, group_id,
+            frame_interval=plan['frame_interval'],
+            video_mode=plan['mode'],
+            sample_count=plan['sample_count'],
+            initial_message=initial_message,
         )
 
     def import_annotations(self):
         """导入已有标注"""
         if not self.current_project_id:
-            QMessageBox.warning(self, "提示", "请先选择或创建一个项目")
+            show_warning(self, "还没有项目", "先在左边选一个项目，或者新建一个。")
             return
         
         # 检查项目是否有任务标签
         project = db.get_project(self.current_project_id)
         if not project:
-            QMessageBox.warning(self, "提示", "项目信息获取失败")
+            show_warning(self, "读不到项目信息", "项目可能已经被删除，换一个试试。")
             return
         
         task_type = project.get('type')
@@ -1194,7 +1394,7 @@ class ImportPage(QWidget):
             if not task_type:
                 return
             db.update_project(self.current_project_id, type=task_type)
-            self.update_project_bar()
+            self.update_project_controls()
 
         # 选择标注格式
         from PyQt6.QtWidgets import QRadioButton
@@ -1261,14 +1461,16 @@ class ImportPage(QWidget):
         if not labels_dir:
             return
         
-        reply = QMessageBox.question(
-            self, "选择图像文件夹",
-            "是否需要选择对应的图像文件夹？\n（如果标签文件和图像文件在同一目录，可选择否）",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        need_images_dir = confirm(
+            self, "图像文件夹",
+            "标签文件和图片不在同一个目录时，要另外指定图片所在的文件夹。",
+            detail="如果 .txt 和图片就放在一起，选「不用」。",
+            confirm_text="去选择",
+            cancel_text="不用",
         )
-        
+
         images_dir = None
-        if reply == QMessageBox.StandardButton.Yes:
+        if need_images_dir:
             images_dir = QFileDialog.getExistingDirectory(
                 self, "选择图像文件夹 (images)", "",
                 QFileDialog.Option.ShowDirsOnly
@@ -1286,13 +1488,13 @@ class ImportPage(QWidget):
         # 如果有标注，提示是否覆盖
         overwrite = False
         if has_annotations:
-            reply = QMessageBox.question(
-                self, "覆盖标注",
-                "项目中已经存在标注，是否覆盖？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            overwrite = confirm_destructive(
+                self, "覆盖已有标注",
+                "项目里已经有标注了。继续导入会用新文件里的标注覆盖它们，覆盖后无法恢复。",
+                detail="两种选择都会继续导入；选「保留现有标注」只是不动已经标好的那些图片。",
+                confirm_text="覆盖",
+                cancel_text="保留现有标注",
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                overwrite = True
         
         # 显示加载动画
         self.loading_overlay = LoadingOverlay(self, "正在导入YOLO标注...")
@@ -1347,12 +1549,9 @@ class ImportPage(QWidget):
         
         # 显示结果
         if success:
-            QMessageBox.information(
-                self, "导入完成",
-                f"YOLO标注导入完成！\n成功导入: {imported} 个标注\n跳过: {skipped} 个"
-            )
+            show_info(self, "标注导入完成", f"导入了 {imported} 个标注，跳过 {skipped} 个。")
         else:
-            QMessageBox.critical(self, "导入失败", message)
+            show_warning(self, "标注导入失败", message)
     
     def import_coco_annotations(self, group_id: int = None):
         """导入COCO标注"""
@@ -1376,13 +1575,13 @@ class ImportPage(QWidget):
         # 如果有标注，提示是否覆盖
         overwrite = False
         if has_annotations:
-            reply = QMessageBox.question(
-                self, "覆盖标注",
-                "项目中已经存在标注，是否覆盖？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            overwrite = confirm_destructive(
+                self, "覆盖已有标注",
+                "项目里已经有标注了。继续导入会用新文件里的标注覆盖它们，覆盖后无法恢复。",
+                detail="两种选择都会继续导入；选「保留现有标注」只是不动已经标好的那些图片。",
+                confirm_text="覆盖",
+                cancel_text="保留现有标注",
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                overwrite = True
         
         # 显示加载动画
         self.loading_overlay = LoadingOverlay(self, "正在导入COCO标注...")
@@ -1444,13 +1643,13 @@ class ImportPage(QWidget):
         # 如果有标注，提示是否覆盖
         overwrite = False
         if has_annotations:
-            reply = QMessageBox.question(
-                self, "覆盖标注",
-                "项目中已经存在标注，是否覆盖？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            overwrite = confirm_destructive(
+                self, "覆盖已有标注",
+                "项目里已经有标注了。继续导入会用新文件里的标注覆盖它们，覆盖后无法恢复。",
+                detail="两种选择都会继续导入；选「保留现有标注」只是不动已经标好的那些图片。",
+                confirm_text="覆盖",
+                cancel_text="保留现有标注",
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                overwrite = True
         
         # 显示加载动画
         self.loading_overlay = LoadingOverlay(self, "正在导入VOC标注...")
@@ -1518,48 +1717,47 @@ class ImportPage(QWidget):
         if not self.images:
             return
         
-        reply = QMessageBox.question(
-            self, "确认清空",
-            f"确定要删除当前项目中的所有 {len(self.images)} 张图片吗？\n此操作不可恢复！",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self.stop_image_loading()
-            deleted = 0
-            failed = 0
-            
-            # 使用副本迭代，避免删除过程中修改原列表导致遍历异常
-            images_snapshot = list(self.images)
-            for image in images_snapshot:
-                if db.delete_image(image['id']):
-                    deleted += 1
-                else:
-                    failed += 1
+        total = len(self.images)
+        if not confirm_destructive(
+            self, "清空图片",
+            "当前项目里的图片会全部删除，标注也一起没了，无法恢复。",
+            detail=f"共 {total} 张图片。",
+            confirm_text=f"删除 {total} 张",
+        ):
+            return
 
-            # 全部删除成功时，直接本地清空，避免触发整页重载
-            if failed == 0:
-                removed_storage_paths = [img.get('storage_path', '') for img in self.images]
-                self.images.clear()
-                self.image_list.clear()
-                self.thumbnail_widgets.clear()
-                self._remove_cached_thumbnails(removed_storage_paths)
-                self.update_status_bar()
-                self.update_view_mode()
+        self.stop_image_loading()
+        deleted = 0
+        failed = 0
+
+        # 使用副本迭代，避免删除过程中修改原列表导致遍历异常
+        images_snapshot = list(self.images)
+        for image in images_snapshot:
+            if db.delete_image(image['id']):
+                deleted += 1
             else:
-                # 部分失败时回退到全量重载，确保UI与数据库一致
-                self.load_project_images()
-            
-            if failed == 0:
-                QMessageBox.information(self, "清空完成", f"已成功删除 {deleted} 张图片")
-            else:
-                QMessageBox.warning(self, "清空完成", f"成功删除 {deleted} 张，失败 {failed} 张")
+                failed += 1
+
+        # 全部删除成功时，直接本地清空，避免触发整页重载
+        if failed == 0:
+            removed_storage_paths = [img.get('storage_path', '') for img in self.images]
+            self.images.clear()
+            self.image_list.clear()
+            self.thumbnail_widgets.clear()
+            self._remove_cached_thumbnails(removed_storage_paths)
+            self.update_status_bar()
+            self.update_view_mode()
+            show_info(self, "已清空", f"删除了 {deleted} 张图片。")
+        else:
+            # 部分失败时回退到全量重载，确保UI与数据库一致
+            self.load_project_images()
+            show_warning(self, "没有全部删掉", f"成功删除 {deleted} 张，失败 {failed} 张。")
     
     def move_selected_to_group(self):
         """将选中图片移动到指定分组"""
         selected_items = self.image_list.selectedItems()
         if not selected_items:
-            QMessageBox.information(self, "提示", "请先选择要移动的图片")
+            show_info(self, "还没选图片", "先在下面的图片里选中要移动的那几张。")
             return
         if not self.current_project_id:
             return
@@ -1601,26 +1799,22 @@ class ImportPage(QWidget):
         self.refresh_view_filter_options()
         self.filter_images(self.view_combo.currentText())
 
-        QMessageBox.information(
-            self, "移动完成",
-            f"已将 {updated} 张图片移动到「{group_label}」"
-        )
+        show_info(self, "移动完成", f"已把 {updated} 张图片移到「{group_label}」。")
 
     def delete_selected_images(self):
         """删除选中的图片"""
         selected_items = self.image_list.selectedItems()
         if not selected_items:
-            QMessageBox.information(self, "提示", "请先选择要删除的图片")
+            show_info(self, "还没选图片", "先在下面的图片里选中要删除的那几张。")
             return
-        
+
         count = len(selected_items)
-        reply = QMessageBox.question(
-            self, "确认删除",
-            f"确定要删除选中的 {count} 张图片吗？\n此操作不可恢复！",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirm_destructive(
+            self, "删除选中的图片",
+            "选中的图片和它们的标注都会删掉，无法恢复。",
+            detail=f"选中了 {count} 张图片。",
+            confirm_text=f"删除 {count} 张",
+        ):
             return
 
         self.stop_image_loading()
@@ -1666,6 +1860,6 @@ class ImportPage(QWidget):
             self.update_view_mode()
 
         if failed == 0:
-            QMessageBox.information(self, "删除完成", f"已成功删除 {deleted} 张图片")
+            show_info(self, "已删除", f"删除了 {deleted} 张图片。")
         else:
-            QMessageBox.warning(self, "删除完成", f"成功删除 {deleted} 张，失败 {failed} 张")
+            show_warning(self, "没有全部删掉", f"成功删除 {deleted} 张，失败 {failed} 张。")

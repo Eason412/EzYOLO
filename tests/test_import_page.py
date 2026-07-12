@@ -22,12 +22,13 @@ import sys
 import time
 import tempfile
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from PyQt6.QtGui import QImage, QColor
-from PyQt6.QtWidgets import QMessageBox, QInputDialog
+from PyQt6.QtWidgets import QFileDialog
 
-from gui.pages.import_page import ImportPage
+from gui.pages.import_page import ImportPage, short_task_label
 from gui.main_window import MainWindow
 from gui.workflow import PAGE_SETTINGS, STEP_IMPORT
 from core.import_manager import ImportManager
@@ -38,31 +39,49 @@ db = _bootstrap.db
 _TMP_DIR = Path(tempfile.mkdtemp(prefix="ezyolo-import-page-"))
 
 
-class _SilentMessageBox:
-    """吞掉成功/失败弹窗，测试不该被模态框卡住。"""
+def _silent_dialogs():
+    """吞掉应用内弹窗（确认框 / 提示框），测试不该被模态框卡住。
 
-    StandardButton = QMessageBox.StandardButton
-    Icon = QMessageBox.Icon
+    页面现在用的是 gui.widgets.app_dialog 里那几个函数，不再是 QMessageBox，
+    所以要挡的是这几个名字。确认框一律当成「用户点了确认」。
+    """
+    stack = ExitStack()
+    stack.enter_context(patch("gui.pages.import_page.show_info"))
+    stack.enter_context(patch("gui.pages.import_page.show_warning"))
+    stack.enter_context(patch("gui.pages.import_page.confirm", return_value=True))
+    stack.enter_context(patch("gui.pages.import_page.confirm_destructive", return_value=True))
+    return stack
 
-    @staticmethod
-    def information(*_args, **_kwargs):
-        return QMessageBox.StandardButton.Ok
 
-    @staticmethod
-    def warning(*_args, **_kwargs):
-        return QMessageBox.StandardButton.Ok
-
-    @staticmethod
-    def critical(*_args, **_kwargs):
-        return QMessageBox.StandardButton.Ok
-
-    @staticmethod
-    def question(*_args, **_kwargs):
-        return QMessageBox.StandardButton.Yes
+def _video_plan(frame_interval=5, mode="interval", sample_count=None):
+    """替掉抽帧设置框：直接返回一个抽帧方案，不弹窗。"""
+    return patch(
+        "gui.pages.import_page.ask_video_extract_plan",
+        return_value={
+            'mode': mode,
+            'frame_interval': frame_interval,
+            'sample_count': sample_count,
+        },
+    )
 
 
 def _make_project() -> int:
     return _bootstrap.create_temp_project(name="导入页测试项目", project_type="detect", classes=[])
+
+
+def _make_annotated_project() -> int:
+    """一个已经有标注的项目：导入标注时才会问「要不要覆盖」。"""
+    project_id = _make_project()
+    image_path = _make_images(_TMP_DIR / f"annotated_{project_id}", 1)[0]
+    image_id = db.add_image(
+        project_id=project_id, filename=Path(image_path).name,
+        storage_path=image_path, width=32, height=32,
+    )
+    db.add_annotation(
+        image_id=image_id, project_id=project_id, class_id=0, class_name="人",
+        annotation_type="rectangle", data={'x': 1, 'y': 1, 'width': 5, 'height': 5},
+    )
+    return project_id
 
 
 def _make_images(folder: Path, count: int) -> list:
@@ -114,8 +133,8 @@ def test_video_import_shows_busy_state_within_same_call():
 
     video_path = _make_video(_TMP_DIR / "busy.mp4", frame_count=40)
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
-         patch.object(QInputDialog, "getInt", return_value=(5, True)):
+    with _silent_dialogs(), \
+         _video_plan(5):
         page.process_video_import(str(video_path), group_id=None)
 
         # 不经过任何 processEvents，直接检查：必须已经是「导入中」状态
@@ -125,18 +144,20 @@ def test_video_import_shows_busy_state_within_same_call():
         assert "打开视频" in page.import_status_label.text()
         assert page.btn_cancel_import.isHidden() is False
 
-        for button in (
+        # 会再起一个导入的、和会毁掉当前项目的，导入中都不能点。
+        # 后两个现在住在「管理」菜单里，禁的是菜单项本身
+        for control in (
             page.btn_import_folder, page.btn_import_images,
             page.btn_import_video, page.btn_import_annotations,
-            page.btn_delete_project, page.btn_clear,
+            page.action_delete_project, page.action_clear,
         ):
-            assert not button.isEnabled(), f"{button.text()} 导入中应该被禁用"
+            assert not control.isEnabled(), f"{control.text()} 导入中应该被禁用"
 
         _wait_import_done(page)
 
     assert len(page.images) > 0
-    for button in (page.btn_import_folder, page.btn_import_video, page.btn_delete_project):
-        assert button.isEnabled(), "导入结束后按钮应该恢复可用"
+    for control in (page.btn_import_folder, page.btn_import_video, page.action_delete_project):
+        assert control.isEnabled(), "导入结束后应该恢复可用"
 
 
 def test_images_import_shows_determinate_progress_immediately():
@@ -147,7 +168,7 @@ def test_images_import_shows_determinate_progress_immediately():
 
     file_paths = _make_images(_TMP_DIR / "determinate", 5)
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox):
+    with _silent_dialogs():
         page.process_image_import(file_paths, group_id=None)
 
         assert page._import_busy is True
@@ -266,7 +287,7 @@ def test_folder_and_images_import_do_not_block_caller_thread():
         time.sleep(0.5)
         return real_import_folder(self, *args, **kwargs)
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
+    with _silent_dialogs(), \
          patch.object(ImportManager, "import_folder", slow_import_folder):
         start = time.monotonic()
         page.process_folder_import(str(folder), group_id=None)
@@ -308,8 +329,8 @@ def test_unknown_total_frames_video_import_completes_without_crash():
         def release(self):
             self._real.release()
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
-         patch.object(QInputDialog, "getInt", return_value=(5, True)), \
+    with _silent_dialogs(), \
+         _video_plan(5), \
          patch("core.import_manager.cv2.VideoCapture", lambda p: _FakeCap(p)):
         page.process_video_import(str(video_path), group_id=None)
         assert page.import_progress_bar.maximum() == 0
@@ -339,7 +360,7 @@ def test_project_switch_keeps_old_thread_alive_until_it_actually_finishes():
         time.sleep(0.3)
         return result
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
+    with _silent_dialogs(), \
          patch.object(ImportManager, "import_folder", slow_import_folder):
         page.process_folder_import(str(folder), group_id=None)
         old_thread = page._active_import_thread
@@ -370,7 +391,7 @@ def test_normal_cancel_and_failure_paths_all_release_thread_reference():
 
     # 路径一：正常完成
     file_paths = _make_images(_TMP_DIR / "release_normal", 3)
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox):
+    with _silent_dialogs():
         page.process_image_import(file_paths, group_id=None)
         _wait_import_done(page)
         ok = _pump_until(lambda: page._active_import_thread is None and not page._retired_import_threads)
@@ -379,7 +400,7 @@ def test_normal_cancel_and_failure_paths_all_release_thread_reference():
     assert page._retired_import_threads == []
 
     # 路径二：失败（后台抛异常）
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
+    with _silent_dialogs(), \
          patch.object(ImportManager, "import_images", side_effect=RuntimeError("boom")):
         page.process_image_import(file_paths, group_id=None)
         _wait_import_done(page)
@@ -390,8 +411,8 @@ def test_normal_cancel_and_failure_paths_all_release_thread_reference():
 
     # 路径三：取消
     video_path = _make_video(_TMP_DIR / "release_cancel.mp4", frame_count=40)
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
-         patch.object(QInputDialog, "getInt", return_value=(1, True)):
+    with _silent_dialogs(), \
+         _video_plan(1):
         page.process_video_import(str(video_path), group_id=None)
         page._cancel_active_import()
         _wait_import_done(page)
@@ -431,8 +452,8 @@ def test_cancelled_import_progress_bar_is_not_shown_as_full_completion():
         def release(self):
             self._real.release()
 
-    with patch("gui.pages.import_page.QMessageBox", _SilentMessageBox), \
-         patch.object(QInputDialog, "getInt", return_value=(1, True)), \
+    with _silent_dialogs(), \
+         _video_plan(1), \
          patch("core.import_manager.cv2.VideoCapture", lambda p: _SlowCap(p)):
         page.process_video_import(str(video_path), group_id=None)
 
@@ -445,6 +466,232 @@ def test_cancelled_import_progress_bar_is_not_shown_as_full_completion():
     assert "已取消" in page.import_status_label.text()
     assert page.import_progress_bar.value() < 100, "取消后不应该把进度条显示成 100% 完成"
     assert len(page.images) < 40, "取消应该在导完全部帧之前生效"
+
+
+def test_new_project_uses_the_in_app_text_dialog_not_the_system_one():
+    """新建项目不能再弹系统的 QInputDialog：那个框跟原来那个丑抽帧框是同一个模子。"""
+    import gui.pages.import_page as import_page_module
+
+    assert not hasattr(import_page_module, "QInputDialog"), \
+        "导入页不该再依赖系统输入框"
+
+    page = ImportPage()
+    created = []
+    page.projects_changed.connect(created.append)
+
+    asked = {}
+
+    def fake_ask_text(_parent, title, _label, **kwargs):
+        asked['title'] = title
+        asked['confirm_text'] = kwargs.get('confirm_text')
+        return "新的安全帽项目"
+
+    with patch("gui.pages.import_page.ask_text", fake_ask_text), \
+         patch("gui.pages.import_page.ask_task_type", return_value="detect"):
+        page.create_new_project()
+
+    assert asked['title'] == "新建项目"
+    assert asked['confirm_text'] == "创建项目", "确认按钮要说清楚它会干什么"
+
+    assert len(created) == 1, "应该建出一个项目并通知主窗口"
+    project = db.get_project(created[0])
+    assert project['name'] == "新的安全帽项目"
+
+    db.delete_project(created[0])
+
+
+def test_new_project_is_not_created_when_the_name_dialog_is_cancelled():
+    """取消起名字（ask_text 返回 None）就什么都不建。"""
+    page = ImportPage()
+    created = []
+    page.projects_changed.connect(created.append)
+
+    with patch("gui.pages.import_page.ask_text", return_value=None), \
+         patch("gui.pages.import_page.ask_task_type", return_value="detect") as task_type:
+        page.create_new_project()
+
+    assert created == []
+    assert not task_type.called, "名字都没起，不该继续问任务类型"
+
+
+def test_annotation_import_confirmations_use_honest_button_labels():
+    """导入标注这一路上的两个二选一，按钮要照实说，不能都叫「取消」。
+
+    「不覆盖」实际是「保留现有标注」并继续导入，写「取消」会让人以为
+    整个导入都放弃了；「不另选图像文件夹」是「不用」，也不是取消。
+    """
+    project_id = _make_annotated_project()
+    page = ImportPage()
+    page.set_project(project_id)
+
+    labels_dir = _TMP_DIR / "yolo_labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    calls = []
+
+    def record(_parent, title, _message, **kwargs):
+        calls.append((title, kwargs.get('confirm_text'), kwargs.get('cancel_text')))
+        return False  # 两个都选「安全的那一个」
+
+    with _silent_dialogs(), \
+         patch("gui.pages.import_page.confirm", record), \
+         patch("gui.pages.import_page.confirm_destructive", record), \
+         patch("gui.pages.import_page.ask_import_group", return_value=(True, None)), \
+         patch.object(QFileDialog, "getExistingDirectory", return_value=str(labels_dir)):
+        page.import_yolo_annotations(group_id=None)
+        _pump_until(lambda: not hasattr(page, 'loading_overlay'), timeout=10.0)
+
+    titles = {title: (confirm_text, cancel_text) for title, confirm_text, cancel_text in calls}
+
+    assert "图像文件夹" in titles, calls
+    assert titles["图像文件夹"] == ("去选择", "不用"), titles["图像文件夹"]
+
+    assert "覆盖已有标注" in titles, calls
+    assert titles["覆盖已有标注"] == ("覆盖", "保留现有标注"), titles["覆盖已有标注"]
+
+    for _title, _confirm_text, cancel_text in calls:
+        assert cancel_text != "取消", f"「{_title}」的安全按钮不该笼统叫「取消」"
+
+    db.delete_project(project_id)
+
+
+# ==================== 工具栏胶囊 / 管理菜单的状态 ====================
+
+def _seed_images(project_id, count=3):
+    for i in range(count):
+        db.add_image(project_id, f"seed_{i}.jpg", f"/tmp/seed_{i}.jpg", width=32, height=32)
+
+
+def test_task_chip_shows_the_short_chinese_label_only():
+    """工具栏胶囊只写中文：「任务：目标检测」，不再拖一个 detect 的尾巴。
+
+    共用的任务类型对话框仍然显示带英文的完整标签——那里 detect / segment
+    要和 YOLO 的术语对得上，是有用的；在胶囊上它只是把宽度撑长。
+    """
+    from gui.widgets.task_type_dialog import task_type_label
+
+    assert short_task_label('detect') == "目标检测"
+    assert short_task_label('segment') == "实例分割"
+    assert short_task_label(None) == "未设置"
+
+    # 对话框那份标签没被改动
+    assert task_type_label('detect') == "目标检测 detect"
+
+    project_id = _make_project()
+    page = ImportPage()
+    page.set_project(project_id)
+
+    assert page.btn_task_type.text() == "任务：目标检测", page.btn_task_type.text()
+
+    db.delete_project(project_id)
+
+
+def test_selection_actions_are_disabled_until_something_is_selected():
+    """没选图片时「移动分组 / 删除选中」就该是灰的。
+
+    以前它们一直亮着，点下去只弹一句「还没选图片」——用一个弹窗代替了
+    本来一眼就该看出来的状态。
+    """
+    project_id = _make_project()
+    _seed_images(project_id, 3)
+
+    page = ImportPage()
+    page.set_project(project_id)
+    _app.processEvents()
+
+    assert not page.action_move_group.isEnabled(), "没选图片，移动分组不该能点"
+    assert not page.action_delete_selected.isEnabled(), "没选图片，删除选中不该能点"
+
+    page.image_list.item(0).setSelected(True)
+    _app.processEvents()
+
+    assert page.action_move_group.isEnabled(), "选了图片就该能移动分组"
+    assert page.action_delete_selected.isEnabled(), "选了图片就该能删除选中"
+
+    page.image_list.clearSelection()
+    _app.processEvents()
+
+    assert not page.action_move_group.isEnabled(), "取消选中之后要变回灰的"
+    assert not page.action_delete_selected.isEnabled()
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_menu_recomputes_state_when_it_opens():
+    """菜单弹出前重算一次：选中状态可能是在菜单关着的时候变的。"""
+    project_id = _make_project()
+    _seed_images(project_id, 2)
+
+    page = ImportPage()
+    page.set_project(project_id)
+    _app.processEvents()
+
+    # 绕过信号，直接把选中状态做出来——模拟「菜单不知道的变化」
+    page.action_move_group.setEnabled(False)
+    page.image_list.item(0).setSelected(True)
+    page.action_move_group.setEnabled(False)
+
+    page.manage_menu.aboutToShow.emit()
+
+    assert page.action_move_group.isEnabled(), "菜单打开时应该重算可用性"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_clear_all_is_disabled_when_there_is_nothing_to_clear():
+    """项目里没有图片时「清空全部图片」是灰的；有图片才亮。"""
+    project_id = _make_project()
+
+    page = ImportPage()
+    page.set_project(project_id)
+    _app.processEvents()
+
+    assert not page.action_clear.isEnabled(), "没有图片就没有东西可清空"
+    # 项目本身还是删得掉的
+    assert page.action_delete_project.isEnabled()
+
+    _seed_images(project_id, 2)
+    page.load_project_images()
+    _app.processEvents()
+
+    assert page.action_clear.isEnabled(), "有图片了就该能清空"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_import_busy_blocks_destruction_but_still_allows_moving_selected_images():
+    """导入中：清空 / 删除项目一律关掉；已选中图片的移动、删除照常可用。
+
+    正在往项目里写图片的时候不能把项目端了；但对已有图片的操作没有理由禁掉。
+    """
+    project_id = _make_project()
+    _seed_images(project_id, 3)
+
+    page = ImportPage()
+    page.set_project(project_id)
+    _app.processEvents()
+
+    page.image_list.item(0).setSelected(True)
+    _app.processEvents()
+
+    page._start_import_ui("正在导入…")
+
+    assert not page.action_clear.isEnabled(), "导入中不能清空图片"
+    assert not page.action_delete_project.isEnabled(), "导入中不能删除项目"
+    assert page.action_move_group.isEnabled(), "导入中仍然可以移动已选中的图片"
+    assert page.action_delete_selected.isEnabled(), "导入中仍然可以删除已选中的图片"
+
+    page._end_import_ui()
+    _app.processEvents()
+
+    assert page.action_clear.isEnabled(), "导入结束后要恢复"
+    assert page.action_delete_project.isEnabled()
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
 
 
 if __name__ == "__main__":

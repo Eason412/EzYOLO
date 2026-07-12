@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 
-from gui.styles import COLORS, RADIUS_SM
+from gui.styles import COLORS, RADIUS_SM, set_menu_indicator
 from gui.workflow import APP_ROOT, find_project_runs
 from gui.widgets.workflow_widgets import EmptyState
 
@@ -770,6 +770,7 @@ class ResultPage(QWidget):
             action.setToolTip(tip)
             action.triggered.connect(lambda _checked, f=fmt: self.on_export_format(f))
         self.btn_export_model.setMenu(export_menu)
+        set_menu_indicator(self.btn_export_model)
         row.addWidget(self.btn_export_model)
 
         self.btn_export_folder = QPushButton("导出结果文件夹")

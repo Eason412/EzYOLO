@@ -6,7 +6,7 @@
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
+    QScrollArea, QGridLayout, QFrame, QFileDialog,
     QMenu, QMessageBox, QComboBox, QLineEdit, QSplitter,
     QListWidget, QListWidgetItem, QButtonGroup,
     QRadioButton, QSpinBox, QDoubleSpinBox, QFormLayout,
@@ -33,13 +33,31 @@ import gc
 import json
 import threading
 import random
+import sys
 
-from gui.styles import COLORS, RADIUS_SM, CONTROL_HEIGHT, get_primary_font_family
+from gui.styles import COLORS, RADIUS_SM, get_primary_font_family, set_menu_indicator
+from gui.display_names import display_name, display_names
+from gui.widgets.collapsible_section import CollapsibleSection
 from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
+from gui.view_zoom import (
+    ZOOM_MAX, ZOOM_MIN, native_zoom_factor, pinch_zoom_factor,
+    wheel_zoom_factor, zoom_at,
+)
 
 SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
 NEGATIVE_SAMPLE_CLASS_ID = -1
+
+_ASSETS_DIR = Path(__file__).parent.parent / "assets"
+
+
+def _asset_icon(name: str) -> QIcon:
+    """gui/assets 下的 SVG 图标。"""
+    return QIcon(str(_ASSETS_DIR / name))
+
+# 工具栏按钮基础高度：实际高度还会按当前字体和 sizeHint 动态向上增长。
+# QToolButton（带下拉箭头）和 QPushButton 的默认高度不一致，所以需要统一下限。
+TOOLBAR_BUTTON_HEIGHT = 32
 
 
 def _readable_on_light(color: str) -> str:
@@ -622,7 +640,11 @@ class AnnotationCanvas(QFrame):
         self.current_image_path = None
         self.image_scale = 1.0
         self.image_offset = QPoint(0, 0)
-        
+
+        # 视图锁：锁上之后切换图片不再重新适配窗口，保持当前缩放和位置
+        self.view_locked = False
+        self.lock_button = None
+
         # 标注数据
         self.annotations = []  # 当前图像的所有标注
         self.selected_annotation_id = None
@@ -713,29 +735,137 @@ class AnnotationCanvas(QFrame):
         # 设置鼠标追踪
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-    
+
+        # macOS 的 Cocoa ZoomNativeGesture 已经是原生捏合输入；再让 Qt 合成
+        # PinchGesture 会把同一次手势缩放两遍。其他平台保留 Qt Pinch 作为入口。
+        self.pinch_gesture_registered = sys.platform != 'darwin'
+        if self.pinch_gesture_registered:
+            self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+            self.grabGesture(Qt.GestureType.PinchGesture)
+
+        # 视图锁按钮：浮在画布右上角
+        self.lock_button = QToolButton(self)
+        self.lock_button.setCheckable(True)
+        self.lock_button.setFixedSize(28, 28)
+        self.lock_button.setIconSize(QSize(16, 16))
+        self.lock_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lock_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.lock_button.toggled.connect(self._on_view_lock_toggled)
+        self.lock_button.hide()
+        self._refresh_lock_button()
+
+    def _refresh_lock_button(self):
+        """锁按钮的图标、提示、配色跟着锁的状态走。"""
+        if self.lock_button is None:
+            return
+
+        locked = self.lock_button.isChecked()
+        self.lock_button.setIcon(
+            _asset_icon('lock-closed.svg' if locked else 'lock-open.svg')
+        )
+        self.lock_button.setToolTip(
+            "已锁定：切换图片保持缩放和位置" if locked else "锁定视图"
+        )
+        background = COLORS['selected'] if locked else COLORS['panel']
+        border = COLORS['primary'] if locked else COLORS['border']
+        # padding 必须显式清零：全局 QToolButton 给了 5px 10px，28px 的方按钮会把
+        # 图标压成一个小点
+        self.lock_button.setStyleSheet(f"""
+            QToolButton {{
+                background-color: {background};
+                border: 1px solid {border};
+                border-radius: {RADIUS_SM}px;
+                padding: 0px;
+            }}
+            QToolButton:hover {{
+                border-color: {COLORS['primary']};
+            }}
+        """)
+
+    def _on_view_lock_toggled(self, checked: bool):
+        """只改锁的状态，不动当前视图——锁上是为了保住现在看到的画面。"""
+        self.view_locked = checked
+        self._refresh_lock_button()
+
+    def _position_lock_button(self):
+        """右上角，距离右边和上边各 8px。"""
+        if self.lock_button is None:
+            return
+        self.lock_button.move(self.width() - self.lock_button.width() - 8, 8)
+        self.lock_button.raise_()
+
+    def _sync_lock_button(self):
+        """没有图片就没有视图可锁，按钮跟着藏起来。"""
+        if self.lock_button is None:
+            return
+        self.lock_button.setVisible(self.current_image is not None)
+        self._position_lock_button()
+
+    def _capture_locked_view(self) -> Optional[Tuple[float, float, float]]:
+        """锁定时记下缩放，以及视口中心落在当前图上的归一化位置（0~1）。"""
+        if not self.view_locked or self.current_image is None or self.image_scale <= 0:
+            return None
+
+        center = self.rect().center()
+        img_x, img_y = self.widget_to_image(center.x(), center.y())
+        return (
+            self.image_scale,
+            img_x / max(self.current_image.width(), 1),
+            img_y / max(self.current_image.height(), 1),
+        )
+
+    def _apply_locked_view(self, view: Tuple[float, float, float]):
+        """把上一张图的缩放和归一化中心搬到新图上：同尺寸时等于原样保留。"""
+        scale, norm_x, norm_y = view
+        self.image_scale = scale
+
+        width = self.current_image.width()
+        height = self.current_image.height()
+        center = self.rect().center()
+        self.image_offset = QPoint(
+            self._clamp_offset(center.x() - norm_x * width * scale, width * scale, self.width()),
+            self._clamp_offset(center.y() - norm_y * height * scale, height * scale, self.height()),
+        )
+
+    @staticmethod
+    def _clamp_offset(offset: float, scaled_length: float, viewport_length: int) -> int:
+        """新旧图尺寸差得离谱时，别让图整个滑出画布——至少留一条边在视口里。"""
+        overlap = min(40.0, scaled_length)
+        low = overlap - scaled_length
+        high = viewport_length - overlap
+        return int(round(min(max(offset, low), high)))
+
     def load_image(self, image_path: str):
         """加载图像"""
         if not image_path or not os.path.exists(image_path):
             self.current_image = None
             self.current_image_path = None
+            self._sync_lock_button()
             self.update()
             return
-        
+
         # 使用OpenCV加载图像
         img = cv2.imread(image_path)
         if img is not None:
+            # 换图之前先问上一张：锁着就把它的缩放和视口中心留下来
+            locked_view = self._capture_locked_view()
+
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = img.shape
             bytes_per_line = ch * w
             qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             self.current_image = QPixmap.fromImage(qt_image)
             self.current_image_path = image_path
-            
-            # 重置视图
-            self.reset_view()
+
+            if locked_view is None:
+                # 没锁（或上一张压根没图）：照旧适配窗口
+                self.reset_view()
+            else:
+                self._apply_locked_view(locked_view)
+
+            self._sync_lock_button()
             self.update()
-    
+
     def reset_view(self):
         """重置视图"""
         if self.current_image is None:
@@ -1913,32 +2043,65 @@ class AnnotationCanvas(QFrame):
     
     def wheelEvent(self, event: QWheelEvent):
         """鼠标滚轮事件 - 缩放"""
-        if self.current_image is None:
-            return
-        
-        # 获取鼠标位置
-        mouse_pos = event.position().toPoint()
-        
-        # 计算缩放前鼠标对应的图像坐标
-        img_x_before = (mouse_pos.x() - self.image_offset.x()) / self.image_scale
-        img_y_before = (mouse_pos.y() - self.image_offset.y()) / self.image_scale
-        
-        # 计算缩放因子
         delta = event.angleDelta().y()
-        zoom_factor = 1.1 if delta > 0 else 0.9
-        
-        # 应用缩放
-        new_scale = self.image_scale * zoom_factor
-        new_scale = max(0.1, min(5.0, new_scale))  # 限制缩放范围
-        
-        # 调整偏移量，使鼠标位置对应的图像点保持不变
-        self.image_offset = QPoint(
-            int(mouse_pos.x() - img_x_before * new_scale),
-            int(mouse_pos.y() - img_y_before * new_scale)
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        self._zoom_by_factor(wheel_zoom_factor(delta), event.position())
+        event.accept()
+
+    def event(self, event):
+        """统一接住原生捏合和 Qt PinchGesture，避免平台分支各自算缩放。"""
+        event_type = event.type()
+        if event_type == QEvent.Type.NativeGesture:
+            gesture_type = event.gestureType()
+            if gesture_type in (
+                Qt.NativeGestureType.BeginNativeGesture,
+                Qt.NativeGestureType.EndNativeGesture,
+            ):
+                event.accept()
+                return True
+            if gesture_type == Qt.NativeGestureType.ZoomNativeGesture:
+                self._zoom_by_factor(native_zoom_factor(event.value()), event.position())
+                event.accept()
+                return True
+            return super().event(event)
+
+        if event_type == QEvent.Type.Gesture:
+            pinch = event.gesture(Qt.GestureType.PinchGesture)
+            if pinch is None:
+                return super().event(event)
+
+            anchor = self.mapFromGlobal(pinch.centerPoint().toPoint())
+            if not self.rect().contains(anchor):
+                anchor = self.rect().center()
+            self._zoom_by_factor(pinch_zoom_factor(pinch.scaleFactor()), anchor)
+            event.accept(pinch)
+            return True
+
+        return super().event(event)
+
+    def _zoom_by_factor(self, factor: float, anchor) -> bool:
+        """所有缩放入口共用这里；只在最终落到像素坐标时取整，并至多刷新一次。"""
+        if self.current_image is None:
+            return False
+
+        new_scale, offset_x, offset_y = zoom_at(
+            self.image_scale,
+            self.image_offset.x(),
+            self.image_offset.y(),
+            anchor.x(),
+            anchor.y(),
+            factor,
+            (ZOOM_MIN, ZOOM_MAX),
         )
+        new_offset = QPoint(int(round(offset_x)), int(round(offset_y)))
+        if new_scale == self.image_scale and new_offset == self.image_offset:
+            return False
+
         self.image_scale = new_scale
-        
+        self.image_offset = new_offset
         self.update()
+        return True
     
     def keyPressEvent(self, event: QKeyEvent):
         """键盘事件"""
@@ -2372,7 +2535,9 @@ class AnnotationCanvas(QFrame):
     def resizeEvent(self, event):
         """窗口大小改变"""
         super().resizeEvent(event)
-        if self.current_image:
+        self._position_lock_button()
+        # 锁定时不重新适配：用户锁的就是当前这个缩放和位置
+        if self.current_image and not self.view_locked:
             self.reset_view()
 
 
@@ -2398,7 +2563,9 @@ class AnnotatePage(QWidget):
         self._negative_sample_count_cache = 0
         self._sample_stats_dirty = True
         self.default_draw_tool = 'rectangle'
-        
+        # 图片栏收起前的三栏宽度，展开时照着还回去；初值和 init_ui 里的初始比例一致
+        self._splitter_sizes = [205, 412, 247]
+
         # 自动标注相关属性
         self.auto_label_dialog = None
         self.model_manager = None
@@ -2480,6 +2647,7 @@ class AnnotatePage(QWidget):
         # 创建分割器
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        self.splitter = splitter
 
         # 左侧：图片列表
         self.left_panel = self.create_left_panel()
@@ -2493,11 +2661,10 @@ class AnnotatePage(QWidget):
         self.right_panel = self.create_right_panel()
         splitter.addWidget(self.right_panel)
 
-        # 初始比例要落在三个面板各自的 min/max 区间内（左 175~320 / 中 ≥380 / 右 245~340），
-        # 否则第一次绘制时会被重新夹紧，看起来像「跳」了一下。这里按 1100px 窗口的可用宽度分。
-        # 三栏在 1100 宽窗口下的实际分配（内容区约 884）。右栏要留出足够视口宽度：
-        # 它内部内容的最小宽度是 263px，少 1px 就会冒出一条横向滚动条。
-        splitter.setSizes([215, 385, 285])
+        # 初始比例要落在三个面板各自的 min/max 区间内（左 175~320 / 中 ≥412 / 右 232~280），
+        # 否则第一次绘制时会被重新夹紧，看起来像「跳」了一下。这里按 1100px 窗口的可用宽度分
+        # （内容区约 884）：中栏先拿够画布要的 412，剩下的给图片栏和属性栏。
+        splitter.setSizes([205, 412, 247])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
@@ -2509,6 +2676,7 @@ class AnnotatePage(QWidget):
         self.main_layout.addWidget(self.status_bar)
 
         self._init_navigation_shortcuts()
+        self._restore_image_list_collapsed()
         self._update_context_bar()
         self._update_action_availability()
 
@@ -2517,34 +2685,38 @@ class AnnotatePage(QWidget):
         self._refresh_navigation_shortcuts()
         super().showEvent(event)
 
-    def resizeEvent(self, event):
-        """窗口变化后重算工具栏高度：出现横向滚动条时别把按钮压掉一截。"""
-        super().resizeEvent(event)
-        self._sync_toolbar_scroll_height()
-
     def create_context_bar(self) -> QWidget:
-        """顶部信息条：当前项目 / 标注方式 / 当前图片 / 标注进度 / 当前类别。"""
+        """顶部信息条：当前图片 / 工具 / 标注方式。
+
+        这里不再放「当前项目」——左侧流程栏一直显示着当前项目，同一屏写两遍
+        不会让人更清楚自己在哪，只是把宽度从「当前图片」那一格里抠走。
+
+        「标注方式」留着并放在最右：它决定工具栏给的是方框、多边形还是关键点，
+        不是纯展示，撤掉的话用户就没有地方换标注形状了。
+        """
         bar = QWidget()
         bar.setObjectName("page_header")
 
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(20)
+        layout = QGridLayout(bar)
+        layout.setContentsMargins(16, 6, 16, 6)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(2)
 
-        # 当前项目（项目名可能很长：宽度封顶 + 省略号，完整名字进 tooltip）
-        self.project_name_label = QLabel()
-        self.project_name_label.setObjectName("h2")
-        self.project_name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.project_name_label.setMinimumWidth(110)
-        self.project_name_label.setMaximumWidth(200)
-        self._register_elided_label(self.project_name_label)
-        self._set_elided_text(self.project_name_label, "未选择项目")
-        layout.addLayout(self._context_field("当前项目", self.project_name_label), 1)
+        # 当前图片：第几张 + 是哪张 + 标没标。文件名可省略，但不会挤动工具。
+        self.image_name_label = QLabel()
+        self.image_name_label.setObjectName("title")
+        self.image_name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.image_name_label.setMinimumWidth(240)
+        self.image_name_label.setMaximumWidth(320)
+        self.image_name_label.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
+        self._register_elided_label(self.image_name_label)
+        self._set_elided_text(self.image_name_label, "未选择图片")
 
-        # 标注方式（任务类型）：决定用什么形状标注
+        # 标注方式（任务类型）：决定用什么形状标注。
         self.task_combo = QComboBox()
         self.task_combo.addItems(["detect", "segment", "pose", "classify"])
         self.task_combo.setFixedWidth(128)
+        self.task_combo.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
         self.task_combo.setToolTip(
             "决定用什么形状标注：\n"
             "detect 检测 = 画矩形框\n"
@@ -2553,39 +2725,21 @@ class AnnotatePage(QWidget):
             "classify 分类 = 整张图给一个类别"
         )
         self.task_combo.currentTextChanged.connect(self.on_task_changed)
-        layout.addLayout(self._context_field("标注方式", self.task_combo))
 
-        # 当前图片：文件名 + 第几张 + 标没标
-        self.image_name_label = QLabel()
-        self.image_name_label.setObjectName("title")
-        # 窗口变窄时优先压缩这一格，不把右边的进度和类别挤出去；压不下就打省略号，不切半个字
-        self.image_name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.image_name_label.setMinimumWidth(150)
-        self._register_elided_label(self.image_name_label)
-        self._set_elided_text(self.image_name_label, "未选择图片")
-        layout.addLayout(self._context_field("当前图片", self.image_name_label), 2)
+        # 工具栏直接落在顶栏的值行，不再占画布上方的一整行。
+        # 高度不钉死；赋值完成后再刷新一次，这时 refresh 方法才能拿到
+        # self.toolbar，并把按钮按字体算出的共同最小高度同步给容器。
+        self.toolbar = self.create_toolbar()
+        self.refresh_toolbar_button_layout()
 
-        # 标注进度
-        progress_row = QWidget()
-        progress_layout = QHBoxLayout(progress_row)
-        progress_layout.setContentsMargins(0, 0, 0, 0)
-        progress_layout.setSpacing(8)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(120)
-        self.progress_bar.setTextVisible(False)
-        progress_layout.addWidget(self.progress_bar)
-        self.progress_label = QLabel("0/0 张已标注")
-        progress_layout.addWidget(self.progress_label)
-        layout.addLayout(self._context_field("标注进度", progress_row))
-
-        # 当前类别：右侧类别列表里选中的那个（类别名可能很长，同样封顶 + 省略号）
-        self.current_class_chip = QLabel()
-        self.current_class_chip.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.current_class_chip.setMinimumWidth(90)
-        self.current_class_chip.setMaximumWidth(160)
-        self._register_elided_label(self.current_class_chip)
-        self._set_elided_text(self.current_class_chip, "未选择")
-        layout.addLayout(self._context_field("当前类别", self.current_class_chip), 1)
+        for column, caption in ((0, "当前图片"), (1, "工具"), (3, "标注方式")):
+            label = QLabel(caption)
+            label.setObjectName("caption")
+            layout.addWidget(label, 0, column)
+        layout.addWidget(self.image_name_label, 1, 0)
+        layout.addWidget(self.toolbar, 1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.addWidget(self.task_combo, 1, 3)
 
         return bar
 
@@ -2617,30 +2771,6 @@ class AnnotatePage(QWidget):
         if event.type() == QEvent.Type.Resize and obj in getattr(self, '_elided_labels', ()):
             self._apply_elide(obj)
         return super().eventFilter(obj, event)
-
-    def _context_field(self, caption: str, widget: QWidget) -> QVBoxLayout:
-        """信息条里的一格：上面一行小字说明，下面是值。
-
-        每一格从顶上开始排，值占一行统一的高度。不这么钉住的话，放下拉框的那一格
-        （标注方式）比放纯文字的高一截，五个说明文字就会在垂直居中里各自漂移——
-        「标注方式」比旁边的「当前项目」高出 4px，整条信息条看着是歪的。
-        """
-        column = QVBoxLayout()
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(3)
-        column.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        label = QLabel(caption)
-        label.setObjectName("caption")
-        # 值有宽度上限时，说明文字也跟着封顶，否则整格会被说明文字撑得比值还宽
-        if widget.maximumWidth() < 16777215:
-            label.setMaximumWidth(widget.maximumWidth())
-        column.addWidget(label)
-
-        # 值这一行统一高度：文字格和控件格的下边缘也要对齐，不只是上边缘
-        widget.setMinimumHeight(CONTROL_HEIGHT)
-        column.addWidget(widget)
-        return column
 
     def _init_navigation_shortcuts(self):
         """初始化翻页快捷键，避免依赖控件焦点。"""
@@ -2677,6 +2807,7 @@ class AnnotatePage(QWidget):
         if hasattr(self, 'btn_prev'):
             self.btn_prev.setText(f"◀ 上一张 ({keys['prev']})")
             self.btn_next.setText(f"下一张 ({keys['next']}) ▶")
+            self._sync_navigation_button_sizes()
 
         if hasattr(self, 'btn_move'):
             self.btn_move.setToolTip(f"拖动画布和已有标注\n快捷键: {keys['move']}")
@@ -2742,10 +2873,25 @@ class AnnotatePage(QWidget):
         layout.setContentsMargins(10, 10, 6, 10)
         layout.setSpacing(8)
 
-        # 标题
-        title = QLabel("图片")
-        title.setObjectName("h2")
-        layout.addWidget(title)
+        # 标题行：「图片 · 张数」+ 收起按钮。收起后这一整栏的宽度让给画布。
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+
+        self.image_list_title = QLabel("图片")
+        self.image_list_title.setObjectName("h2")
+        title_row.addWidget(self.image_list_title)
+        title_row.addStretch(1)
+
+        self.btn_collapse_image_list = self._ghost_icon_button(
+            'chevron-left.svg', 24, "收起图片列表"
+        )
+        self.btn_collapse_image_list.clicked.connect(
+            lambda: self._set_image_list_collapsed(True)
+        )
+        title_row.addWidget(self.btn_collapse_image_list)
+
+        layout.addLayout(title_row)
 
         # 这个项目里有多少图、标了多少
         self.image_list_caption = QLabel("还没有图片")
@@ -2777,28 +2923,66 @@ class AnnotatePage(QWidget):
 
         return panel
 
-    def create_center_panel(self) -> QWidget:
-        """创建中间面板 - 工具栏 + 标注画布 + 翻页"""
-        panel = QWidget()
-        # 左 175 + 中 380 + 右 245 + 手柄，1100px 窗口下还留得出余量
-        panel.setMinimumWidth(380)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(6, 10, 6, 10)
-        layout.setSpacing(8)
+    def _ghost_icon_button(self, icon_name: str, size: int, tooltip: str) -> QToolButton:
+        """只有图标、没有底色的小按钮：收起 / 展开图片栏用。"""
+        button = QToolButton()
+        button.setIcon(_asset_icon(icon_name))
+        button.setIconSize(QSize(12, 12))
+        button.setFixedSize(size, size)
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # padding 显式清零：全局 QToolButton 有 5px 10px，会把这么小的按钮里的图标压没
+        button.setStyleSheet(f"""
+            QToolButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: {RADIUS_SM}px;
+                padding: 0px;
+            }}
+            QToolButton:hover {{
+                background-color: {COLORS['hover']};
+            }}
+        """)
+        return button
 
-        # 工具栏：放进横向滚动区。窗口够宽时看不出区别；窗口很窄时工具栏自己滚，
-        # 而不是把「删除」这类按钮挤出屏幕，也不会把整页的最小宽度拉大。
-        toolbar = self.create_toolbar()
-        toolbar_scroll = QScrollArea()
-        toolbar_scroll.setWidgetResizable(True)
-        toolbar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        toolbar_scroll.setWidget(toolbar)
-        toolbar_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.toolbar_scroll = toolbar_scroll
-        self._sync_toolbar_scroll_height()
-        layout.addWidget(toolbar_scroll)
+    def _set_image_list_collapsed(self, collapsed: bool, persist: bool = True):
+        """收起 / 展开左侧图片栏。
+
+        收起前先记下三栏当前宽度：QSplitter 把左栏让出来的空间分给中栏，
+        展开时再按记下的宽度还回去（受窗口约束可能有几个像素出入）。
+        """
+        if collapsed and self.left_panel.isVisible():
+            self._splitter_sizes = self.splitter.sizes()
+
+        self.left_panel.setVisible(not collapsed)
+        self.btn_expand_image_list.setVisible(collapsed)
+
+        if not collapsed and self._splitter_sizes:
+            self.splitter.setSizes(self._splitter_sizes)
+
+        if persist:
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("EzYOLO", "Settings")
+            settings.setValue("annotate_image_list_collapsed", collapsed)
+
+    def _restore_image_list_collapsed(self):
+        """按上次退出时的状态决定图片栏是收着还是开着。"""
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("EzYOLO", "Settings")
+        collapsed = str(settings.value("annotate_image_list_collapsed", False)).lower() in ('true', '1')
+        self._set_image_list_collapsed(collapsed, persist=False)
+
+    def create_center_panel(self) -> QWidget:
+        """创建中间面板 - 标注画布 + 翻页"""
+        panel = QWidget()
+        # 画布自己的最小宽度就是 400，加上左右各 6px 边距，这一栏少于 412 就会把画布
+        # 的右缘（以及贴在右上角的视图锁）裁掉。左 175 + 中 412 + 右 232 + 手柄，
+        # 1100px 窗口下仍然放得下。
+        panel.setMinimumWidth(412)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 6, 6, 10)
+        layout.setSpacing(8)
 
         # 标注画布
         self.canvas = AnnotationCanvas()
@@ -2816,25 +3000,6 @@ class AnnotatePage(QWidget):
         self.adjust_tool_visibility(current_task)
 
         return panel
-
-    def _sync_toolbar_scroll_height(self):
-        """工具栏高度跟着实际内容走：按钮换行更高、或者出现横向滚动条时，都不会被悄悄切掉。"""
-        scroll = getattr(self, 'toolbar_scroll', None)
-        if scroll is None:
-            return
-
-        content = scroll.widget()
-        if content is None:
-            return
-
-        height = content.sizeHint().height() + 12
-        scrollbar = scroll.horizontalScrollBar()
-        if scrollbar is not None and scrollbar.isVisible():
-            height += scrollbar.sizeHint().height()
-
-        if scroll.minimumHeight() != height:
-            scroll.setMinimumHeight(height)
-            scroll.setMaximumHeight(height)
 
     def create_navigation_bar(self) -> QWidget:
         """画布下方的翻页条：上一张 / 下一张（主操作）。"""
@@ -2854,20 +3019,53 @@ class AnnotatePage(QWidget):
         self.btn_next = QPushButton("下一张 ▶")
         self.btn_next.setObjectName("primary")
         self.btn_next.setMinimumHeight(34)
-        self.btn_next.setMinimumWidth(130)
         self.btn_next.clicked.connect(self.next_image)
         layout.addWidget(self.btn_next)
 
+        self._sync_navigation_button_sizes()
+
         return bar
+
+    def _sync_navigation_button_sizes(self):
+        """翻页按钮始终取两者所需的较大尺寸，避免左右一大一小。"""
+        buttons = (self.btn_prev, self.btn_next)
+        for button in buttons:
+            button.setMinimumSize(0, 0)
+            button.setMaximumSize(16777215, 16777215)
+
+        width = max(button.sizeHint().width() for button in buttons)
+        height = max(34, *(button.sizeHint().height() for button in buttons))
+        for button in buttons:
+            button.setFixedSize(width, height)
     
     def create_toolbar(self) -> QWidget:
-        """创建工具栏：只放画标注和改标注的动作，AI 相关的入口在右侧面板。"""
-        toolbar = QFrame()
-        toolbar.setObjectName("toolbar")
+        """创建工具栏：一行安静的控件条，只放画标注和改标注的动作。
+
+        以前这里是一张带边框的卡片，还给每组按钮顶了一行小标题（「标注工具」「修改」）。
+        三五个按钮不需要目录：标题多占一行高度，边框把它框成一个和画布平起平坐的区块，
+        画布因此矮了一截——而画布才是这一页真正要看的东西。
+        现在只留按钮本身，中间一根竖线把「画」和「改/删」分开。
+        """
+        toolbar = QWidget()
+        toolbar.setObjectName("annotate_toolbar")
+        # 卡片底色和边框都不要：它是浮在画布上方的一条控件，不是又一张卡片
+        toolbar.setStyleSheet(
+            "QWidget#annotate_toolbar { background-color: transparent; border: none; }"
+        )
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(8, 6, 8, 6)
-        toolbar_layout.setSpacing(8)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(6)
         base_tool_button_style = self._toolbar_chip_style('tool')
+
+        # 图片栏收起时，这里是把它叫回来的唯一入口；平时不占位
+        self.btn_expand_image_list = self._ghost_icon_button(
+            'chevron-right.svg', 28, "展开图片列表"
+        )
+        self.btn_expand_image_list.clicked.connect(
+            lambda: self._set_image_list_collapsed(False)
+        )
+        self.btn_expand_image_list.hide()
+        toolbar_layout.addWidget(self.btn_expand_image_list)
 
         # 工具按钮组
         self.tool_group = QButtonGroup(self)
@@ -2914,9 +3112,10 @@ class AnnotatePage(QWidget):
         self.btn_move.setStyleSheet(base_tool_button_style)
         self.tool_group.addButton(self.btn_move)
 
-        # 撤销按钮
+        # 撤销按钮（和左边几个工具用同一套尺寸，一行排开时高度、内边距才对得齐）
         self.btn_undo = QPushButton("撤销")
         self.btn_undo.setToolTip("撤销上一步\n快捷键: Ctrl+Z")
+        self.btn_undo.setStyleSheet(base_tool_button_style)
         self.btn_undo.clicked.connect(self.undo)
 
         # 删除按钮（主动作删标注，下拉菜单删图片）
@@ -2932,18 +3131,18 @@ class AnnotatePage(QWidget):
         self.delete_menu.aboutToShow.connect(self.update_delete_menu_state)
         self.btn_delete.setMenu(self.delete_menu)
 
+        # 画的工具 | 改和删。一行排开，中间一根细线分开——
+        # 「删除」离「画方框」远一点，手滑的代价小一点。
         self.toolbar_draw_buttons = [self.btn_draw_tool, self.btn_keypoint, self.btn_move]
         self.toolbar_edit_buttons = [self.btn_undo, self.btn_delete]
-        self.toolbar_draw_group = self._create_toolbar_button_group("标注工具", self.toolbar_draw_buttons)
-        self.toolbar_edit_group = self._create_toolbar_button_group("修改", self.toolbar_edit_buttons)
-        self.toolbar_groups = [
-            (self.toolbar_draw_group, self.toolbar_draw_buttons),
-            (self.toolbar_edit_group, self.toolbar_edit_buttons),
-        ]
+        self.toolbar_buttons = self.toolbar_draw_buttons + self.toolbar_edit_buttons
 
-        toolbar_layout.addWidget(self.toolbar_draw_group)
-        toolbar_layout.addWidget(self._toolbar_separator())
-        toolbar_layout.addWidget(self.toolbar_edit_group)
+        for button in self.toolbar_draw_buttons:
+            toolbar_layout.addWidget(button)
+        self.toolbar_separator = self._toolbar_separator()
+        toolbar_layout.addWidget(self.toolbar_separator)
+        for button in self.toolbar_edit_buttons:
+            toolbar_layout.addWidget(button)
         toolbar_layout.addStretch(1)
 
         self.refresh_draw_tool_button()
@@ -2951,29 +3150,11 @@ class AnnotatePage(QWidget):
 
         return toolbar
 
-    def _create_toolbar_button_group(self, caption: str, buttons) -> QWidget:
-        """创建工具栏按钮组：上面一行小字说明这组是干什么的。"""
-        group_widget = QWidget()
-        layout = QVBoxLayout(group_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        label = QLabel(caption)
-        label.setObjectName("caption")
-        layout.addWidget(label)
-
-        button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 0, 0, 0)
-        button_row.setSpacing(8)
-        for button in buttons:
-            button_row.addWidget(button)
-        layout.addLayout(button_row)
-        return group_widget
-
     def _toolbar_separator(self) -> QFrame:
         """工具栏里的竖直分隔线。"""
         line = QFrame()
         line.setFixedWidth(1)
+        line.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT - 8)
         line.setStyleSheet(
             f"background-color: {COLORS['border']}; border: none; border-radius: 0px;"
         )
@@ -3002,14 +3183,26 @@ class AnnotatePage(QWidget):
             },
         }
         palette = palette_map[role]
+        arrow_name = 'chevron_down.svg' if role == 'tool' else 'chevron_down_red.svg'
+        arrow_url = (_ASSETS_DIR / arrow_name).as_posix()
+        disabled_arrow_url = (_ASSETS_DIR / 'chevron_down_disabled.svg').as_posix()
+        checked_menu_background = COLORS['panel'] if role == 'tool' else palette['checked']
+        checked_menu_border = COLORS['border'] if role == 'tool' else COLORS['panel']
         return f"""
             QPushButton, QToolButton {{
                 background-color: {COLORS['panel']};
                 color: {palette['text']};
                 border: 1px solid {palette['border']};
                 border-radius: {RADIUS_SM}px;
-                padding: 4px 10px;
                 font-weight: 600;
+            }}
+            QPushButton {{
+                padding: 4px 10px;
+            }}
+            /* QToolButton 在这里永远带菜单：右边留 36px 给 24px 宽的 menu-button
+               子控件（+ 一点呼吸空间），文字才不会被压进箭头区。 */
+            QToolButton {{
+                padding: 4px 36px 4px 10px;
             }}
             QPushButton:hover, QToolButton:hover {{
                 background-color: {COLORS['hover']};
@@ -3028,7 +3221,7 @@ class AnnotatePage(QWidget):
             QToolButton::menu-button {{
                 subcontrol-origin: padding;
                 subcontrol-position: right center;
-                width: 16px;
+                width: 24px;
                 background-color: {COLORS['panel']};
                 border-left: 1px solid {COLORS['border']};
                 border-top-right-radius: {RADIUS_SM}px;
@@ -3041,57 +3234,74 @@ class AnnotatePage(QWidget):
                Qt 认不出子控件，会把这条的底色刷满整个按钮——没选中的「删除」
                也会变成一整块实心红。 */
             QToolButton::menu-button:checked {{
-                background-color: {palette['checked']};
-                border-left: 1px solid {COLORS['panel']};
+                background-color: {checked_menu_background};
+                border-left: 1px solid {checked_menu_border};
             }}
             QToolButton::menu-button:checked:hover {{
-                background-color: {palette['checked_hover']};
-                border-left: 1px solid {COLORS['panel']};
+                background-color: {checked_menu_background if role == 'tool' else palette['checked_hover']};
+                border-left: 1px solid {checked_menu_border};
             }}
             QToolButton::menu-button:disabled {{
                 background-color: {COLORS['panel']};
                 border-left: 1px solid {COLORS['border']};
             }}
-            QToolButton::menu-arrow {{
-                width: 10px;
-                height: 10px;
-            }}
+            QToolButton::menu-arrow,
             QToolButton::menu-indicator {{
-                width: 10px;
-                height: 10px;
+                image: url({arrow_url});
+                width: 12px;
+                height: 12px;
+            }}
+            QToolButton::menu-arrow:disabled,
+            QToolButton::menu-indicator:disabled {{
+                image: url({disabled_arrow_url});
             }}
         """
 
     def _get_toolbar_button_width(self, button) -> int:
-        """计算按钮建议宽度，菜单按钮额外预留箭头空间。"""
+        """计算按钮建议宽度，菜单按钮额外预留箭头空间。
+
+        菜单按钮不能信 QToolButton 原生的 minimumSizeHint——它不知道我们把
+        menu-button 子控件挤宽到了多少，算出来的宽度会比实际需要的窄，文字
+        就被顶进箭头区。这里按实际的内边距（左 10 + 右 36）和双边框（2px）
+        自己算，再留 6px 安全边，最后跟 sizeHint 取较大值兜底。
+        """
         text_width = button.fontMetrics().horizontalAdvance(button.text())
-        extra_padding = 24
         if isinstance(button, QToolButton) and button.menu() is not None:
-            extra_padding += 16
-        return text_width + extra_padding
+            width = text_width + 10 + 36 + 2 + 6
+            return max(width, button.sizeHint().width())
+        return text_width + 24
 
     def refresh_toolbar_button_layout(self):
-        """统一顶部按钮高度，宽度按各自文字走。
+        """统一工具栏按钮高度，宽度按各自文字走。
 
         以前是按分组统一宽度（都撑到组里最宽的那个），工具栏因此要 577px，
         窗口一小就把删除按钮挤出可视区。这里只保证高度一致和一个最小宽度。
-        """
-        button_height = 32
-        min_button_width = 78
-        for group_widget, group in getattr(self, 'toolbar_groups', []):
-            visible_buttons = [
-                button for button in group
-                if button is not None and not button.isHidden()
-            ]
-            group_widget.setVisible(bool(visible_buttons))
-            for button in visible_buttons:
-                button.setFixedHeight(button_height)
-                button.setMinimumWidth(
-                    max(min_button_width, self._get_toolbar_button_width(button))
-                )
 
-        # 按钮显隐/文字变了，工具栏本身可能变高，容器高度要跟上
-        self._sync_toolbar_scroll_height()
+        高度对所有按钮一视同仁——带下拉箭头的 QToolButton（画方框、删除）和
+        普通 QPushButton（撤销）默认的 sizeHint 不一样，不钉住的话一行排开就是
+        参差不齐的。高度不再写死成 TOOLBAR_BUTTON_HEIGHT：换一套更高的系统字体时，
+        固定高度会把文字压扁，这里改成按实际按钮取需要的最大高度，再用
+        minimumHeight 兜底，长得下的字体可以自己撑高。
+        """
+        min_button_width = 78
+        visible_buttons = [
+            button for button in getattr(self, 'toolbar_buttons', [])
+            if button is not None and not button.isHidden()
+        ]
+        toolbar_height = max(
+            [TOOLBAR_BUTTON_HEIGHT]
+            + [button.sizeHint().height() for button in visible_buttons]
+            + [button.fontMetrics().height() + 12 for button in visible_buttons]
+        )
+        for button in visible_buttons:
+            button.setMinimumHeight(toolbar_height)
+            button.setMinimumWidth(
+                max(min_button_width, self._get_toolbar_button_width(button))
+            )
+        if hasattr(self, 'toolbar'):
+            self.toolbar.setMinimumHeight(toolbar_height)
+        if hasattr(self, 'toolbar_separator'):
+            self.toolbar_separator.setFixedHeight(max(1, toolbar_height - 8))
 
     def refresh_draw_tool_button(self):
         """刷新绘制工具按钮文本与选项状态。"""
@@ -3147,6 +3357,7 @@ class AnnotatePage(QWidget):
         except Exception:
             pass
         self.btn_sam.setMenu(None)
+        set_menu_indicator(self.btn_sam, False)
 
         sam_config = AutoLabelDialog.get_saved_sam_config()
         sam_type = sam_config.get("sam_type", "SAM")
@@ -3159,6 +3370,7 @@ class AnnotatePage(QWidget):
                 "菜单：更新记忆 / 清空记忆 / 单张推理 / 批量推理"
             )
             self.btn_sam.setMenu(self.create_sam_memory_menu())
+            set_menu_indicator(self.btn_sam, True)
         else:
             self.btn_sam.setText("SAM 交互分割")
             self.btn_sam.setToolTip(
@@ -3190,8 +3402,8 @@ class AnnotatePage(QWidget):
         整块可以滚动：窗口再矮也不会把下面的按钮压没。
         """
         panel = QWidget()
-        panel.setMinimumWidth(245)
-        panel.setMaximumWidth(340)
+        panel.setMinimumWidth(232)
+        panel.setMaximumWidth(280)
 
         outer = QVBoxLayout(panel)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3221,11 +3433,13 @@ class AnnotatePage(QWidget):
     def _create_class_group(self) -> QGroupBox:
         """类别：标注的第一步——先说清楚要画的是什么。"""
         class_group = QGroupBox("类别")
+        class_group.setObjectName("annotate_class_group")
+        class_group.setStyleSheet(self._compact_group_style("annotate_class_group"))
         class_layout = QVBoxLayout(class_group)
         class_layout.setSpacing(8)
 
         self.class_list = QListWidget()
-        self.class_list.setMinimumHeight(120)
+        self.class_list.setMinimumHeight(96)
         self.class_list.setSpacing(2)
         self.class_list.setToolTip("数字键 1-9 切换类别；右键类别可改名或删除")
         self.class_list.itemClicked.connect(self.on_class_selected)
@@ -3240,27 +3454,54 @@ class AnnotatePage(QWidget):
 
         self.btn_add_class = QPushButton("+ 添加类别")
         self.btn_add_class.clicked.connect(self.add_class)
-        self.btn_add_class.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         # 只有「选中了一个标注、且选的类别和它现在的不一样」时才可点
         self.btn_apply_attr = QPushButton("改为选中类别")
         self.btn_apply_attr.setToolTip("把画布上选中的那个标注，改成当前选中的类别")
         self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
-        self.btn_apply_attr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_apply_attr.setEnabled(False)
 
-        class_button_row = QHBoxLayout()
+        # 两个按钮真 1:1 等宽：QHBoxLayout 的 stretch 只分「多出来的」空间，
+        # 文字长的那个起点就更宽，最后还是不等。栅格按列分宽度，才真的一样宽。
+        class_button_row = QGridLayout()
         class_button_row.setContentsMargins(0, 0, 0, 0)
-        class_button_row.setSpacing(8)
-        class_button_row.addWidget(self.btn_add_class, 1)
-        class_button_row.addWidget(self.btn_apply_attr, 1)
+        class_button_row.setHorizontalSpacing(8)
+        class_button_row.setColumnStretch(0, 1)
+        class_button_row.setColumnStretch(1, 1)
+        for column, button in enumerate((self.btn_add_class, self.btn_apply_attr)):
+            # 最小宽度放到 10：窄栏里由栅格来分宽度，按钮自己不许把列撑开
+            button.setMinimumWidth(10)
+            button.setMinimumHeight(28)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            class_button_row.addWidget(button, 0, column)
         class_layout.addLayout(class_button_row)
 
         return class_group
 
+    def _compact_group_style(self, object_name: str) -> str:
+        """只给这一页的某个分组用的紧凑内边距（全局 QGroupBox / QPushButton 不动）。
+
+        组里的按钮也一并收紧左右内边距：右栏窄，全局那份 padding 会让「改为选中类别」
+        这种六个字的按钮在 1100px 窗口下切字。
+        """
+        return f"""
+            QGroupBox#{object_name} {{
+                margin-top: 20px;
+                padding: 10px 12px 12px 12px;
+            }}
+            QGroupBox#{object_name} QPushButton {{
+                padding: 5px 6px;
+            }}
+            QGroupBox#{object_name} QPushButton[menuIndicator="true"] {{
+                padding-right: 30px;
+            }}
+        """
+
     def _create_ai_group(self) -> QGroupBox:
         """AI 自动标注：让模型先画一遍，人只做检查和微调。"""
         ai_group = QGroupBox("AI 自动标注")
+        ai_group.setObjectName("annotate_ai_group")
+        ai_group.setStyleSheet(self._compact_group_style("annotate_ai_group"))
         ai_group.setToolTip("模型先标一遍，你只做检查和微调")
         ai_layout = QVBoxLayout(ai_group)
         ai_layout.setSpacing(8)
@@ -3269,6 +3510,7 @@ class AnnotatePage(QWidget):
         self.btn_auto_label = QPushButton("用已有模型标注")
         self.btn_auto_label.setToolTip("用一个已经训练好的 .pt 模型自动标注\n菜单：设置 / 单张推理 / 批量推理")
         self.btn_auto_label.setMenu(self.create_auto_label_menu())
+        set_menu_indicator(self.btn_auto_label)
 
         # SAM：点一下就分割（文本和菜单由 apply_sam_button_mode 按设置决定）
         self.btn_sam = QPushButton("SAM")
@@ -3277,14 +3519,11 @@ class AnnotatePage(QWidget):
         self.btn_llm_label = QPushButton("大模型标注")
         self.btn_llm_label.setToolTip("用多模态大模型识别图片里的目标\n菜单：单张推理 / 批量推理")
         self.btn_llm_label.setMenu(self.create_llm_menu())
+        set_menu_indicator(self.btn_llm_label)
 
-        self.btn_batch_process = QPushButton("批处理")
-        self.btn_batch_process.setToolTip("按选中的像素点批量处理图片")
-        self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
-
-        self.ai_action_buttons = [
-            self.btn_auto_label, self.btn_sam, self.btn_llm_label, self.btn_batch_process
-        ]
+        # 批处理不在这里：它不是「让模型帮你标」，是按像素点批量改图，
+        # 归到下面的样本管理（进阶）里，见 _create_sample_group
+        self.ai_action_buttons = [self.btn_auto_label, self.btn_sam, self.btn_llm_label]
         for button in self.ai_action_buttons:
             button.setMinimumHeight(32)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -3294,12 +3533,22 @@ class AnnotatePage(QWidget):
 
         return ai_group
 
-    def _create_sample_group(self) -> QGroupBox:
-        """样本管理：负样本标记 + 按类别随机删图，用来平衡数据。"""
-        sample_group = QGroupBox("样本管理（进阶）")
+    def _create_sample_group(self) -> CollapsibleSection:
+        """样本管理：批处理 + 负样本标记 + 按类别随机删图，用来平衡数据。
+
+        默认收起：这几件事不是每天都干，但里面有一个会真删图片文件的按钮——
+        既不该常驻占掉类别和 AI 入口的位置，也不该藏进菜单里让人找不到。
+        """
+        sample_group = CollapsibleSection("样本管理（进阶）")
         sample_group.setToolTip("按整张图片随机删除，用来平衡类别；负样本 = 已标注但没有任何框的图片")
-        sample_layout = QVBoxLayout(sample_group)
-        sample_layout.setSpacing(8)
+        sample_layout = sample_group.content_layout()
+
+        self.btn_batch_process = QPushButton("批处理")
+        self.btn_batch_process.setToolTip("按选中的像素点批量处理图片")
+        self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
+        self.btn_batch_process.setMinimumHeight(30)
+        self.btn_batch_process.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sample_layout.addWidget(self.btn_batch_process)
 
         self.btn_mark_negative_sample = QPushButton("把当前图片标为负样本")
         self.btn_mark_negative_sample.setToolTip("这张图里没有任何目标，也是有用的学习材料")
@@ -3353,12 +3602,11 @@ class AnnotatePage(QWidget):
 
         return sample_group
 
-    def _create_export_group(self) -> QGroupBox:
-        """导出：训练不需要手动导出，这里是给外部工具用的。"""
-        export_group = QGroupBox("数据导出（可选）")
+    def _create_export_group(self) -> CollapsibleSection:
+        """导出：训练不需要手动导出，这里是给外部工具用的。默认收起。"""
+        export_group = CollapsibleSection("数据导出（可选）")
         export_group.setToolTip("训练会直接读标注，不用先导出；只有要把数据给别的工具用时才需要")
-        export_layout = QVBoxLayout(export_group)
-        export_layout.setSpacing(8)
+        export_layout = export_group.content_layout()
 
         format_layout = QFormLayout()
         format_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -3415,7 +3663,7 @@ class AnnotatePage(QWidget):
         return menu
     
     def create_status_bar(self) -> QFrame:
-        """创建状态栏：位置、本图标注数、当前工具；快捷键收进右侧按钮的提示里。"""
+        """创建状态栏：图片、进度、类别、工具和临时批处理状态。"""
         status_bar = QFrame()
         # 固定高度会在字体放大时把文字切掉，这里只给下限
         status_bar.setMinimumHeight(34)
@@ -3433,11 +3681,29 @@ class AnnotatePage(QWidget):
         """)
 
         layout = QHBoxLayout(status_bar)
-        layout.setContentsMargins(16, 4, 16, 4)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(8)
 
         self.status_image = QLabel("当前: 0/0")
         layout.addWidget(self.status_image)
+
+        layout.addWidget(QLabel("|"))
+
+        self.status_progress = QLabel("标注: 0/0")
+        layout.addWidget(self.status_progress)
+
+        layout.addWidget(QLabel("|"))
+
+        # 不能用 Ignored：布局会把它按近零宽度排，随后控件又被 minimumWidth 撑开，
+        # 造成与右侧分隔符重叠。Preferred 让布局按实际可见宽度为它留出位置。
+        # 当前类别仍保留颜色方块；长名称省略，完整名称放在 tooltip。
+        self.current_class_chip = QLabel()
+        self.current_class_chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.current_class_chip.setMinimumWidth(120)
+        self.current_class_chip.setMaximumWidth(150)
+        self._register_elided_label(self.current_class_chip)
+        self._set_elided_text(self.current_class_chip, "类别: 未选择")
+        layout.addWidget(self.current_class_chip)
 
         layout.addWidget(QLabel("|"))
 
@@ -3449,9 +3715,11 @@ class AnnotatePage(QWidget):
         self.status_tool = QLabel("工具: 矩形")
         layout.addWidget(self.status_tool)
 
-        # 临时进度用（批量自动标注时显示正在处理哪张图），平时为空
-        self.status_position = QLabel("")
-        layout.addWidget(self.status_position, 1)
+        # 临时进度用（批量自动标注时显示正在处理哪张图），平时为空。
+        self.status_batch = QLabel("")
+        self.status_batch.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._register_elided_label(self.status_batch)
+        layout.addWidget(self.status_batch, 1)
 
         # 快捷键表以前是一整条常驻文字，窗口一窄就被切断；现在收进这个按钮的提示里
         self.btn_shortcut_help = QPushButton("快捷键")
@@ -3502,17 +3770,17 @@ class AnnotatePage(QWidget):
             self._set_elided_text(self.image_name_label, "未选择图片")
         else:
             image = self.images[index]
-            filename = image.get('filename', '')
             status = "已标注" if image.get('status') == 'annotated' else "还没标注"
+            # 位置和状态在前：它们每张图都有、长度稳定，窗口再窄也看得见。
+            # 名字放最后，压不下时省略掉的是它——不是「第几张」和「标没标」。
             self._set_elided_text(
                 self.image_name_label,
-                f"{filename} · 第 {index + 1}/{total} 张 · {status}",
-                tooltip=filename
+                f"第 {index + 1}/{total} 张 · {self._image_display_name(image)} · {status}",
+                tooltip=self._image_tooltip(image)
             )
 
-        self.progress_bar.setMaximum(max(total, 1))
-        self.progress_bar.setValue(annotated)
-        self.progress_label.setText(f"{annotated}/{total} 张已标注" if total else "还没有图片")
+        if hasattr(self, 'image_list_title'):
+            self.image_list_title.setText(f"图片 · {total}" if total else "图片")
 
         if hasattr(self, 'image_list_caption'):
             if total:
@@ -3526,7 +3794,7 @@ class AnnotatePage(QWidget):
         self._update_canvas_placeholder()
 
     def _update_current_class_chip(self):
-        """信息条上的「当前类别」：画上去的就是它。"""
+        """状态栏上的「当前类别」：画上去的就是它。"""
         if not hasattr(self, 'current_class_chip'):
             return
 
@@ -3534,7 +3802,7 @@ class AnnotatePage(QWidget):
         if current is None:
             self.current_class_chip.setStyleSheet(f"color: {COLORS['text_secondary']};")
             self._set_elided_text(
-                self.current_class_chip, "未选择",
+                self.current_class_chip, "类别: 未选择",
                 tooltip="画上去的标注算哪个类别，在右侧「类别」里换"
             )
             return
@@ -3543,7 +3811,7 @@ class AnnotatePage(QWidget):
             f"color: {_readable_on_light(current.get('color'))}; font-weight: 600;"
         )
         self._set_elided_text(
-            self.current_class_chip, f"■ {current['name']}",
+            self.current_class_chip, f"类别: ■ {current['name']}",
             tooltip=f"当前类别：{current['name']}\n在右侧「类别」里切换"
         )
 
@@ -3591,7 +3859,9 @@ class AnnotatePage(QWidget):
             self.btn_add_class.setEnabled(has_project)
         if hasattr(self, 'btn_mark_negative_sample'):
             self.btn_mark_negative_sample.setEnabled(has_image)
-        for name in ('btn_delete_random_samples', 'btn_export_annotations', 'btn_export_dataset'):
+        # 批处理跟着项目走（和它还在 AI 组里时一样）：它的对话框自己会提示先选图片
+        for name in ('btn_batch_process', 'btn_delete_random_samples',
+                     'btn_export_annotations', 'btn_export_dataset'):
             button = getattr(self, name, None)
             if button is not None:
                 button.setEnabled(has_project)
@@ -3664,22 +3934,15 @@ class AnnotatePage(QWidget):
         # 保存图片数据
         self.images = data.get('images', [])
         
-        # 设置项目名和任务类型选择器
+        # 同步任务类型选择器（项目名归左侧流程栏显示，这一页不再重复）
         if self.current_project_id:
             project = db.get_project(self.current_project_id)
             if project:
-                self._set_elided_text(
-                    self.project_name_label,
-                    project.get('name') or f"项目 {self.current_project_id}"
-                )
-
                 task_type = project.get('type')
                 if task_type in ['detect', 'segment', 'pose', 'classify', 'obb']:
                     index = self.task_combo.findText(task_type)
                     if index >= 0:
                         self.task_combo.setCurrentIndex(index)
-        else:
-            self._set_elided_text(self.project_name_label, "未选择项目")
 
         # 开始加载图片列表（使用多线程加载缩略图）
         self.load_image_list()
@@ -3713,18 +3976,20 @@ class AnnotatePage(QWidget):
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
         self._invalidate_sample_stats_cache()
-        
+        self._refresh_image_display_names()
+
         # 先创建所有列表项（显示占位符）
         for image in self.images:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, image['id'])
-            
+
             # 设置显示文本
             status_text = "✓" if image.get('status') == 'annotated' else "○"
-            item.setText(f"{status_text} {image['filename']}")
-            
+            item.setText(f"{status_text} {self._image_display_name(image)}")
+            item.setToolTip(self._image_tooltip(image))
+
             self.image_list.addItem(item)
-        
+
         self.update_status_bar()
         self.update_sample_control_panel()
         
@@ -3746,23 +4011,47 @@ class AnnotatePage(QWidget):
         """加载完成回调"""
         pass
     
+    def _refresh_image_display_names(self):
+        """整个列表一起算显示名：重名的（两段视频抽到同一个帧号）才需要补区分信息，
+        所以必须整批算，不能一张一张各算各的。"""
+        aliases = display_names([img.get('filename', '') for img in self.images])
+        self._image_display_names = {
+            img['id']: alias for img, alias in zip(self.images, aliases)
+        }
+
+    def _image_display_name(self, image: Dict) -> str:
+        """列表里显示的名字：抽帧名念成「帧 223」，普通文件名原样。"""
+        cached = getattr(self, '_image_display_names', {}).get(image['id'])
+        return cached or display_name(image.get('filename', ''))
+
+    def _image_tooltip(self, image: Dict) -> str:
+        """完整文件名和分辨率不丢，只是从列表挪进了提示里。"""
+        filename = image.get('filename', '')
+        width = image.get('width', 0)
+        height = image.get('height', 0)
+        if width and height:
+            return f"{filename}\n{width}x{height}"
+        return filename
+
     def update_image_list_display(self):
         """更新图片列表显示"""
         # 重新加载图片数据
         if self.current_project_id:
             self.images = db.get_project_images(self.current_project_id)
-            
+            self._refresh_image_display_names()
+
             # 更新图片列表项
             for i in range(self.image_list.count()):
                 item = self.image_list.item(i)
                 image_id = item.data(Qt.ItemDataRole.UserRole)
-                
+
                 # 找到对应的图片数据
                 image_data = next((img for img in self.images if img['id'] == image_id), None)
                 if image_data:
                     # 更新显示文本
                     status_text = "✓" if image_data.get('status') == 'annotated' else "○"
-                    item.setText(f"{status_text} {image_data['filename']}")
+                    item.setText(f"{status_text} {self._image_display_name(image_data)}")
+                    item.setToolTip(self._image_tooltip(image_data))
 
             # 图片的已标注状态变了，进度也要跟着变
             self.update_status_bar()
@@ -3793,7 +4082,7 @@ class AnnotatePage(QWidget):
             # 设置颜色
             color = QColor(cls.get('color', '#808080'))
             item.setForeground(color)
-            item.setSizeHint(QSize(item.sizeHint().width(), 30))
+            item.setSizeHint(QSize(item.sizeHint().width(), 28))
             
             self.class_list.addItem(item)
             
@@ -5139,9 +5428,7 @@ class AnnotatePage(QWidget):
     
     def on_batch_inference_progress(self, progress, current, total, image_name):
         """批量推理进度回调"""
-        # 更新状态栏
-        self.status_annotation.setText(f"自动标注: {current}/{total}")
-        self.status_position.setText(f"当前: {image_name}")
+        self._set_elided_text(self.status_batch, f"批处理: {current}/{total} · {image_name}")
         self.repaint()
     
     def on_batch_inference_completed(self, success, message, processed_count):
@@ -5979,10 +6266,12 @@ class AnnotatePage(QWidget):
     def update_status_bar(self):
         """更新状态栏，并顺带刷新顶部信息条和按钮可用性。"""
         total = len(self.images)
+        annotated = sum(1 for img in self.images if img.get('status') == 'annotated')
         index = self._current_image_index()
         current = index + 1 if index >= 0 else 0
 
         self.status_image.setText(f"当前: {current}/{total}")
+        self.status_progress.setText(f"标注: {annotated}/{total}")
         self.status_annotation.setText(f"本图标注: {len(self.annotations)}")
         tool_names = {
             'rectangle': '矩形',
@@ -5993,7 +6282,7 @@ class AnnotatePage(QWidget):
         }
         self.status_tool.setText(f"工具: {tool_names.get(self.canvas.current_tool, self.canvas.current_tool)}")
         # 批量任务留下的临时进度文字到这里就该清掉
-        self.status_position.setText("")
+        self._set_elided_text(self.status_batch, "")
 
         self._update_context_bar()
         self._update_action_availability()

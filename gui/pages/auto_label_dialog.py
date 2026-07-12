@@ -20,6 +20,7 @@ import json
 from typing import Dict, List, Optional
 
 from gui.styles import COLORS
+from gui.widgets.app_dialog import confirm, show_warning
 
 # LLM配置文件路径
 LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
@@ -804,25 +805,17 @@ class AutoLabelDialog(QDialog):
         self.lbl_notice.setStyleSheet(f"color: {color};")
 
     def on_save_clicked(self):
-        """保存按钮点击事件，输出调试信息"""
+        """保存设置。
+
+        原来这里不管写没写成功都直接 accept()——SAM / LLM 配置写失败（目录只读、
+        磁盘满、文件被占用）时窗口照样关掉，用户看到的是「点了保存，什么都没发生」，
+        下次打开发现设置根本没存上。现在：写成功才关窗，写失败就留在原地把原因说出来。
+        """
         # 自定义来源却没选文件：存下去只会得到一个用不了的配置
         if self.model_source == "custom" and not self.custom_model_path:
             self.tab_widget.setCurrentIndex(0)
-            QMessageBox.warning(self, "提示", "已选择自定义模型，请先浏览选择模型文件")
+            self._set_status("已选择自定义模型，请先浏览选择模型文件。", COLORS['error'])
             return
-
-        # 获取模型信息
-        model_path = self.get_model_path()
-        model_task = self.cb_model_task.currentText() if hasattr(self, 'cb_model_task') else 'detect'
-        model_version = self.cb_model_version.currentText() if hasattr(self, 'cb_model_version') else ''
-        model_size = self.cb_model_size.currentData() or self.cb_model_size.currentText() if hasattr(self, 'cb_model_size') else ''
-
-        # 构建模型名称
-        if self.model_source == "custom":
-            model_name = os.path.basename(model_path) if model_path else "自定义模型"
-        else:
-            model_name = f"{model_version}-{model_size}-{model_task}" if model_version else model_path
-
 
         # 检查SAM模型是否存在
         if hasattr(self, 'cb_sam_type') and hasattr(self, 'cb_sam_model'):
@@ -831,42 +824,51 @@ class AutoLabelDialog(QDialog):
 
             if model_file and not _sam_model_exists(model_file):
                 if sam_type == "SAM3":
-                    QMessageBox.warning(
-                        self,
-                        "SAM3模型未找到",
-                        f"SAM3模型文件不存在: {model_file}\n\n"
-                        f"SAM3不支持自动下载。\n"
-                        f"请到以下页面下载 sam3.pt，放到项目根目录后重试：\n"
-                        f"{SAM3_DOWNLOAD_URL}"
+                    self.tab_widget.setCurrentIndex(1)
+                    show_warning(
+                        self, "找不到 SAM3 模型",
+                        f"{model_file} 不在本地，而 SAM3 不支持自动下载。",
+                        detail=f"请到 {SAM3_DOWNLOAD_URL} 下载 sam3.pt，放到项目根目录后重试。",
                     )
                     return
 
-                # 模型不存在，提示用户下载
-                reply = QMessageBox.question(
-                    self,
-                    "模型不存在",
-                    f"SAM模型文件不存在: {model_file}\n\n"
-                    f"模型类型: {sam_type}\n"
-                    f"需要下载模型才能使用SAM功能。\n\n"
-                    f"是否现在下载？\n"
-                    f"（下载可能需要一些时间，取决于网络状况）",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-
-                if reply == QMessageBox.StandardButton.Yes:
-                    # 尝试下载模型
+                # 模型不存在，问一下要不要现在下
+                if confirm(
+                    self, "模型还没下载",
+                    f"{sam_type} 要用的 {model_file} 不在本地，下载之后才能用 SAM 标注。",
+                    detail="下载要花一些时间，取决于网络。也可以先保存其他设置，之后再下。",
+                    confirm_text="现在下载",
+                ):
                     self.download_sam_model(sam_type, model_file)
-                else:
-                    # 用户选择不下载，清空SAM配置
-                    print(f"[SAM] 用户选择不下载模型，SAM功能将不可用")
 
-        # 保存SAM配置
-        self.save_sam_config()
+        # 两份配置都写盘成功，才算保存成功
+        sam_saved = self.save_sam_config()
+        llm_saved = self.save_llm_config()
 
-        # 保存LLM配置
-        self.save_llm_config()
+        if not (sam_saved and llm_saved):
+            # 只有一份写失败时，另一份是真的已经写进去了——不能笼统说「设置没有写入」，
+            # 那会让用户以为可以放心重试或放弃，实际上磁盘上已经是半新半旧的状态。
+            failed = []
+            saved_ok = []
+            if sam_saved:
+                saved_ok.append("SAM 配置")
+            else:
+                failed.append(f"SAM 配置（{SAM_CONFIG_FILE}）")
+            if llm_saved:
+                saved_ok.append("LLM 配置")
+            else:
+                failed.append(f"LLM 配置（{LLM_CONFIG_FILE}）")
 
-        # 调用accept保存设置
+            message = "保存失败：" + "；".join(failed) + " 没有写入"
+            if saved_ok:
+                message += "；" + "、".join(saved_ok) + " 已经写入"
+            message += "。请检查文件是否可写后重试。"
+
+            self._set_status(message, COLORS['error'])
+            return
+
+        # 走到这里 = 两份配置都落盘了。accept() 只在这一条路上发生，
+        # 所以调用方拿到 Accepted 就等于「真的保存成功了」。
         self.accept()
 
     def download_sam_model(self, sam_type: str, model_file: str):
@@ -1120,16 +1122,21 @@ class AutoLabelDialog(QDialog):
         self._update_sam_usage_mode_options(sam_type, config.get("usage_mode", "normal"))
 
     def save_sam_config(self) -> bool:
-        """保存SAM配置到配置文件。"""
+        """保存SAM配置到配置文件。写不进去返回 False（调用方要据此留住窗口）。
+
+        建目录也要算在「写失败」里：原来 makedirs 在 try 外面，配置目录建不出来时
+        直接抛异常，而不是返回 False——调用方以为只会拿到 True/False，结果是崩一下。
+        """
         config = self.get_sam_config()
-        config_dir = os.path.dirname(SAM_CONFIG_FILE)
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
         try:
+            config_dir = os.path.dirname(SAM_CONFIG_FILE)
+            if config_dir and not os.path.exists(config_dir):
+                os.makedirs(config_dir)
             with open(SAM_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"保存SAM配置失败: {e}")
             return False
 
     @classmethod
@@ -1254,13 +1261,11 @@ class AutoLabelDialog(QDialog):
             'user_prompt': self.te_llm_user_prompt.toPlainText()
         }
 
-        # 确保配置目录存在
-        config_dir = os.path.dirname(LLM_CONFIG_FILE)
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
-
-        # 保存到文件
+        # 建目录和写文件都可能失败，一起算在「没保存成功」里
         try:
+            config_dir = os.path.dirname(LLM_CONFIG_FILE)
+            if config_dir and not os.path.exists(config_dir):
+                os.makedirs(config_dir)
             with open(LLM_CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
             return True

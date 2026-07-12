@@ -21,6 +21,7 @@ from gui.workflow import (
     get_blocker, get_next_action,
 )
 from gui.widgets.workflow_widgets import StepNav, PageHeader, StepGate, NoticeBar
+from gui.widgets.elided_combo import ElidedComboBox
 from gui.pages.import_page import ImportPage
 from gui.pages.annotate_page import AnnotatePage
 from gui.pages.train_page import TrainPage
@@ -31,6 +32,12 @@ from gui.pages.about_page import AboutPage
 from models.database import db
 
 GATE_INDEX = 7  # 前置条件说明页在 content_stack 中的位置
+
+# 导入/标注是业务页：左侧 StepNav 已经承担了流程和下一步导航，PageHeader
+# 整块（标题/序号/说明/下一步按钮）在这两页上是和 StepNav 重复的第二套导航，
+# 隐藏掉、把页面内容往上提。其余页面（含前置条件不满足时显示的 Gate）
+# 仍然显示 PageHeader。
+HIDDEN_HEADER_STEPS = {STEP_IMPORT, STEP_ANNOTATE}
 
 AUX_PAGES = {
     PAGE_SETTINGS: ("设置", "模型路径、自动保存与快捷键。"),
@@ -110,9 +117,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(project_label)
         layout.addSpacing(6)
 
-        self.project_combo = QComboBox()
+        # 项目名可以很长，下拉框不能被它撑出侧栏；装不下时要省略号收尾，
+        # 不能像原生 QComboBox 那样把最后一个中文字切掉一半
+        self.project_combo = ElidedComboBox()
         self.project_combo.setToolTip("图片、标注和训练结果都存在当前项目里")
-        # 项目名可以很长，下拉框不能被它撑出侧栏
         self.project_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
@@ -225,6 +233,12 @@ class MainWindow(QMainWindow):
             self.project_combo.addItem("请选择项目…", None)
             for project in projects:
                 self.project_combo.addItem(project['name'], project['id'])
+                # 名字长到要省略时，完整名字至少还能在悬停里看到
+                self.project_combo.setItemData(
+                    self.project_combo.count() - 1,
+                    project['name'],
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         else:
             self.project_combo.addItem("还没有项目", None)
 
@@ -294,10 +308,28 @@ class MainWindow(QMainWindow):
 
         配置窗口是标注页那一个实例（AutoLabelDialog），但用户不用先切到标注页、
         再去工具栏里找按钮——设置页发信号，窗口层直接开。SAM / LLM 的配置是
-        全局文件，没有项目也能配。关掉之后把设置页显示的状态重新读一遍。
+        全局文件，没有项目也能配。
+
+        关窗之后回到「打开它的那个页面」，而不是跳去别的步骤：从设置页点开的，
+        保存完还留在设置页，并且就地把 AI 状态刷新成刚存的值 + 给一句「已保存」——
+        否则用户点完保存，窗口一关，界面上没有任何东西变过，跟没保存一样。
         """
-        self.annotate_page.open_auto_label_config(section)
+        origin_index = self.current_index
+
+        saved = self.annotate_page.open_auto_label_config(section)
+
+        # 配置窗口开着的这段时间里页面不该被换掉；真被换了（以后有人加了新逻辑）
+        # 也要回到用户点开配置的那一页，不能把人甩到别的步骤去。
+        if self.current_index != origin_index:
+            self.switch_page(origin_index)
+
         self.settings_page.refresh_ai_status()
+
+        if origin_index == PAGE_SETTINGS:
+            if saved:
+                self.settings_page.set_status("自动标注设置已保存。", 'success')
+            else:
+                self.settings_page.set_status("没有改动自动标注设置。")
 
     def on_gate_bypassed(self):
         """用户选择「我有现成的模型，直接测试」这类跳过。"""
@@ -327,19 +359,22 @@ class MainWindow(QMainWindow):
         self.btn_about.setChecked(index == PAGE_ABOUT)
 
     def update_header(self, index: int):
+        """页头数据永远按「请求的那一步」来算，不受 Gate 遮挡影响；
+        只有显示与否才看 content_stack 实际显示的是业务页还是 Gate。
+        """
         if index in AUX_PAGES:
             title, desc = AUX_PAGES[index]
             self.header.set_step(index, title, desc)
             self.header.set_next_action(None)
+        elif index in STEP_BY_INDEX:
+            self.header.set_step(index)
+            self.header.set_next_action(
+                get_next_action(self.snapshot, self.step_states, index)
+            )
+        else:
             return
 
-        if index not in STEP_BY_INDEX:
-            return
-
-        self.header.set_step(index)
-        self.header.set_next_action(
-            get_next_action(self.snapshot, self.step_states, index)
-        )
+        self.header.setVisible(self.content_stack.currentIndex() not in HIDDEN_HEADER_STEPS)
 
     # ==================== 窗口状态 ====================
 

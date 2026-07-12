@@ -23,6 +23,7 @@ EzYOLO 样式定义
     subtitle 说明 / caption 辅助小字 / muted 弱化 / value 大数字
 """
 
+from pathlib import Path
 from typing import List
 
 # ==================== 颜色令牌 ====================
@@ -175,12 +176,47 @@ def _font_family_declaration() -> str:
     return f"    font-family: {', '.join(families)};\n"
 
 
+# ==================== 箭头图标 ====================
+
+# 下拉框和数字框的箭头。Qt 的规矩是：一旦用样式表接管 ::drop-down / ::up-button，
+# 系统画的那个箭头就一起没了——下拉框会剩一个 macOS 原生的黑色小三角贴在角上，
+# 数字框则连上下箭头都不剩（试过：只写 ::up-button 不写 ::up-arrow，步进器整个消失）。
+# 所以箭头得自己给。QSS 里能画出箭头的只有 image: url(...)：border 拼三角那套
+# CSS 技巧 Qt 不认（它不做斜接，直接糊成一个方块）。
+#
+# 这些 svg 由本项目自己画，没有第三方素材。颜色跟下面的令牌对齐——
+# 正常态 COLORS['primary']、禁用态 COLORS['text_disabled']；改令牌时记得一起改。
+_ASSETS_DIR = Path(__file__).parent / "assets"
+
+
+def _arrow_url(name: str) -> str:
+    """QSS 的 url() 要一个能直接打开的路径，所以给绝对路径（POSIX 分隔符，Windows 也认）。"""
+    return (_ASSETS_DIR / name).as_posix()
+
+
+def set_menu_indicator(button, enabled: bool = True):
+    """标记带菜单的按钮，并立即刷新动态属性对应的样式。"""
+    button.setProperty("menuIndicator", bool(enabled))
+    style = button.style()
+    if style is not None:
+        style.unpolish(button)
+        style.polish(button)
+    button.updateGeometry()
+    button.update()
+
+
 # ==================== 样式表 ====================
 
 def generate_stylesheet(colors: dict) -> str:
     """根据颜色令牌生成全局样式表。"""
     c = colors
     font_family = _font_family_declaration()
+
+    chevron_down = _arrow_url("chevron_down.svg")
+    chevron_down_white = _arrow_url("chevron_down_white.svg")
+    chevron_up = _arrow_url("chevron_up.svg")
+    chevron_down_off = _arrow_url("chevron_down_disabled.svg")
+    chevron_up_off = _arrow_url("chevron_up_disabled.svg")
 
     return f"""
 /* ---------- 基础 ---------- */
@@ -418,6 +454,29 @@ QPushButton:disabled {{
     border-color: {c['border']};
 }}
 
+/* QPushButton 的菜单箭头不交给平台绘制：macOS 会退化成黑点或空白。 */
+QPushButton[menuIndicator="true"] {{
+    padding-right: 32px;
+}}
+
+QPushButton[menuIndicator="true"]::menu-indicator {{
+    image: url({chevron_down});
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    width: 12px;
+    height: 12px;
+    right: 10px;
+}}
+
+QPushButton#primary[menuIndicator="true"]::menu-indicator {{
+    image: url({chevron_down_white});
+}}
+
+QPushButton[menuIndicator="true"]::menu-indicator:disabled,
+QPushButton#primary[menuIndicator="true"]::menu-indicator:disabled {{
+    image: url({chevron_down_off});
+}}
+
 QPushButton#secondary {{
     background-color: {c['panel']};
     color: {c['text_primary']};
@@ -531,7 +590,39 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
     border-color: {c['border']};
 }}
 
-/* 下拉箭头交给 Qt 自己画：自定义 ::drop-down 会把箭头一起干掉 */
+/* 箭头区要先占住位置，否则长选项的文字会压到箭头底下 */
+QComboBox {{
+    padding-right: 28px;
+}}
+
+QSpinBox, QDoubleSpinBox {{
+    padding-right: 22px;
+}}
+
+/* 下拉框：整块都能点开，所以不给箭头区画边框/底色，只在悬停时亮一个浅色圆角块 */
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    margin: 3px 3px 3px 0;
+    border: none;
+    border-radius: 6px;
+    background-color: transparent;
+}}
+
+QComboBox::drop-down:hover {{
+    background-color: {c['hover']};
+}}
+
+QComboBox::down-arrow {{
+    image: url({chevron_down});
+    width: 12px;
+    height: 12px;
+}}
+
+QComboBox::down-arrow:disabled {{
+    image: url({chevron_down_off});
+}}
 
 QComboBox QAbstractItemView {{
     background-color: {c['panel']};
@@ -544,16 +635,63 @@ QComboBox QAbstractItemView {{
     selection-color: {c['text_primary']};
 }}
 
+/* 行距。注意：macOS 上下拉弹层是系统画的，样式表管不到它——选中行仍是系统那条
+   蓝底白字（清楚可读，所以不去动它；强行换成 QListView 反而会让当前项没有任何
+   高亮）。这条和上面的 selection-* 是给其他平台的。 */
+QComboBox QAbstractItemView::item {{
+    padding: 5px 8px;
+    border-radius: 6px;
+    min-height: 20px;
+}}
+
+/* 数字框的步进器：跟下拉框同一套雪佛龙，上下各占一半高 */
 QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
-    background-color: transparent;
+    subcontrol-origin: padding;
+    width: 20px;
+    height: 11px;
     border: none;
-    width: 16px;
+    border-radius: 4px;
+    margin-right: 3px;
+    background-color: transparent;
+}}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-position: top right;
+    margin-top: 3px;
+}}
+
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-position: bottom right;
+    margin-bottom: 3px;
 }}
 
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
     background-color: {c['hover']};
+}}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    image: url({chevron_up});
+    width: 9px;
+    height: 9px;
+}}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image: url({chevron_down});
+    width: 9px;
+    height: 9px;
+}}
+
+/* 到头了 / 整个控件禁用：箭头转灰，不再假装还能点 */
+QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off,
+QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:off {{
+    image: url({chevron_up_off});
+}}
+
+QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off,
+QDoubleSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:off {{
+    image: url({chevron_down_off});
 }}
 
 QTextEdit {{
