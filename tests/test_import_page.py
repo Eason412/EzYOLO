@@ -19,15 +19,16 @@
 import _bootstrap  # noqa: F401  必须第一个导入
 
 import sys
+import threading
 import time
 import tempfile
 from pathlib import Path
 from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
-from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QImage, QColor, QIcon
-from PyQt6.QtWidgets import QFileDialog, QLabel
+from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtGui import QImage, QColor, QIcon, QPixmap
+from PyQt6.QtWidgets import QFileDialog, QLabel, QStyleFactory
 
 import models.database as database_module
 from gui.pages.import_page import ImportPage, short_task_label
@@ -530,18 +531,26 @@ def test_annotation_import_confirmations_use_honest_button_labels():
     labels_dir.mkdir(parents=True, exist_ok=True)
 
     calls = []
+    finished = []
 
     def record(_parent, title, _message, **kwargs):
         calls.append((title, kwargs.get('confirm_text'), kwargs.get('cancel_text')))
         return False  # 两个都选「安全的那一个」
 
+    # 等的是「标注导入真的收尾了」（收尾时会报一句结果），不是「loading_overlay 没了」：
+    # 那个遮罩也会被缩略图加载线程的 on_load_finished 顺手删掉，它先到的话，这里就会
+    # 在标注导入线程还没收尾时退出 patch，收尾时的那句提示就成了一个真模态框，
+    # 挂在后面某个测试的事件泵里。
     with _silent_dialogs(), \
+         patch("gui.pages.import_page.show_info", lambda *a, **k: finished.append(a)), \
          patch("gui.pages.import_page.confirm", record), \
          patch("gui.pages.import_page.confirm_destructive", record), \
          patch("gui.pages.import_page.ask_import_group", return_value=(True, None)), \
          patch.object(QFileDialog, "getExistingDirectory", return_value=str(labels_dir)):
         page.import_yolo_annotations(group_id=None)
-        _pump_until(lambda: not hasattr(page, 'loading_overlay'), timeout=10.0)
+        ok = _pump_until(lambda: bool(finished), timeout=10.0)
+        assert ok, "标注导入没有在超时时间内收尾"
+        page.import_thread.wait()
 
     titles = {title: (confirm_text, cancel_text) for title, confirm_text, cancel_text in calls}
 
@@ -742,11 +751,26 @@ def _seed_image_with_boxes(project_id, folder: Path, name: str,
     return image_id, str(path), annotation_ids
 
 
+def _settle_thumbnails(page: ImportPage, timeout=30.0):
+    """等到缩略图这条线彻底安静下来：读盘线程结束、框查回来、分块重画画完。
+
+    框的查询在后台线程里、叠框又是分块排队做的，所以「页面刷完了」不再是同一次
+    调用里的事——测试要断言最终画面，就必须等这三件事都落地。
+    """
+    ok = _pump_until(
+        lambda: (page.load_worker is None
+                 and not page._previews_pending
+                 and not page._icon_refresh_pending),
+        timeout=timeout,
+    )
+    assert ok, "缩略图（读盘 / 查框 / 分块重画）没有在超时时间内全部结束"
+
+
 def _loaded_page(project_id) -> ImportPage:
     """建页面并等缩略图后台线程真的跑完。"""
     page = ImportPage()
     page.set_project(project_id)
-    assert _pump_until(lambda: page.load_worker is None), "缩略图加载没有在超时时间内结束"
+    _settle_thumbnails(page)
     return page
 
 
@@ -855,8 +879,12 @@ def test_unannotated_image_gets_no_empty_box():
     db.delete_project(project_id)
 
 
-def test_toggle_switches_thumbnails_immediately_without_touching_annotations():
-    """开关立刻换图；不写数据库，也不再去读一次磁盘。"""
+def test_toggle_switches_thumbnails_without_touching_annotations():
+    """切开关只换图：不写数据库，也不再去读一次磁盘。
+
+    换图本身是分块排队做的（见 test_toggling_boxes_on_600_thumbnails_never_blocks_the_ui），
+    所以这里等它把队排完再看画面；但「不写库、不读盘」这两条一个字都不松。
+    """
     project_id = _make_box_project()
     image_id, path, _ = _seed_image_with_boxes(
         project_id, _TMP_DIR / "boxes_toggle", "toggle.jpg",
@@ -872,15 +900,17 @@ def test_toggle_switches_thumbnails_immediately_without_touching_annotations():
     annotations_before = db.get_image_annotations(image_id)
     version_before = db.get_project_annotation_versions(project_id)
 
-    # 关掉：同一次调用里就要换成没框的图，不能等下一轮事件循环
     with patch("gui.pages.import_page.cv2.imread") as imread:
         page.chk_show_boxes.setChecked(False)
+        assert page.show_annotation_boxes is False
+        _settle_thumbnails(page)
 
         assert _icon_image(page) == base, "关掉开关后缩略图上还有框"
-        assert page.show_annotation_boxes is False
 
         # 再开回来
         page.chk_show_boxes.setChecked(True)
+        _settle_thumbnails(page)
+
         assert _icon_image(page) == with_boxes, "开回来之后框没有回来"
 
         assert imread.call_count == 0, "切开关不该重新读磁盘——底图缓存里就有"
@@ -940,6 +970,8 @@ def test_loading_the_page_does_not_query_annotations_once_per_image():
     statements = []
     with _traced_sql(statements):
         page.set_project(project_id)
+        # 查框现在在后台线程里，必须等它回来再数——不然数到的是「还没查」
+        assert _pump_until(lambda: not page._previews_pending), "框没有在超时时间内查回来"
 
     annotation_queries = [s for s in statements if 'FROM annotations' in s]
     assert len(annotation_queries) == 2, (
@@ -947,7 +979,7 @@ def test_loading_the_page_does_not_query_annotations_once_per_image():
         "逐图查就是 N+1"
     )
 
-    _pump_until(lambda: page.load_worker is None)
+    _settle_thumbnails(page)
     page.stop_image_loading()
     db.delete_project(project_id)
 
@@ -1012,6 +1044,7 @@ def test_editing_one_box_refreshes_only_that_thumbnail():
 
     # 主窗口从标注页切回导入页时调的就是这个
     page.refresh_project_images()
+    _settle_thumbnails(page)
 
     assert page.load_worker is None, "重画框不该再去读一次磁盘"
 
@@ -1048,6 +1081,7 @@ def test_recolouring_a_class_recolours_its_boxes():
     ])
 
     page.refresh_project_images()
+    _settle_thumbnails(page)
 
     shown = _icon_image(page)
     assert _color_count(shown, _GREEN) > 0, "类别改成绿色了，框却没换色"
@@ -1158,9 +1192,272 @@ def test_importing_annotations_makes_boxes_appear_without_a_manual_refresh():
     )
 
     page.refresh_project_images()
+    _settle_thumbnails(page)
 
     assert _color_count(_icon_image(page), _RED) > 0, "新导入的标注没有出现在缩略图上"
 
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+# ==================== 600 张图：刷新不能把界面按住 ====================
+# 用户的项目动辄几百张图。三件事必须同时成立：
+#   查框在后台线程（不是 GUI 线程），叠框分块排队（不是一次循环 600 张），
+#   过期的结果和过期的队列一律作废（不能拿旧数据盖掉新状态）。
+
+_BIG_COUNT = 600
+
+_KEEP_STYLES = []  # QWidget.setStyle 不接管所有权：样式被回收就等于没测
+
+
+def _seed_boxed_images(project_id, count: int):
+    """真往库里写 count 张图，每张一个 bbox——不是 mock 出来的假数据。"""
+    for i in range(count):
+        image_id = db.add_image(
+            project_id, f"big_{i:04d}.jpg",
+            str(_TMP_DIR / "big" / f"{project_id}_{i:04d}.jpg"),
+            width=40, height=20,
+        )
+        db.add_annotation(
+            image_id=image_id, project_id=project_id, class_id=0, class_name="类0",
+            annotation_type='bbox', data={'x': 8, 'y': 4, 'width': 20, 'height': 12},
+        )
+
+
+def _page_with_cached_thumbnails(project_id) -> ImportPage:
+    """底图预先放进缓存：这里测的是「底图都有了之后怎么刷」，不掺读盘那条线。"""
+    page = ImportPage()
+    for image in db.get_project_images(project_id):
+        pixmap = QPixmap(160, 160)
+        pixmap.fill(QColor(240, 240, 240))
+        page.thumbnail_cache[image['storage_path']] = pixmap
+    return page
+
+
+def _seed_light_image(project_id, folder: Path, name: str, size=(40, 20)) -> str:
+    """一张浅色的、没有标注的图：用来看「文字」本身，不被图片/框的颜色干扰。"""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    image = QImage(size[0], size[1], QImage.Format.Format_RGB888)
+    image.fill(QColor(250, 250, 250))
+    image.save(str(path))
+    db.add_image(project_id, name, str(path), width=size[0], height=size[1])
+    return str(path)
+
+
+def test_annotation_previews_are_read_off_the_gui_thread():
+    """600 张图的框 + 版本号：各查一次，而且是在后台线程里查的。
+
+    这两次查询压在 GUI 线程上时，打开一个大项目就是「界面先僵一下」。查完之前
+    列表必须已经建好、能滚动——所以查询发出去的那一刻，主线程手上还没有任何框。
+    """
+    project_id = _make_box_project()
+    _seed_boxed_images(project_id, _BIG_COUNT)
+
+    page = _page_with_cached_thumbnails(project_id)
+
+    reader_threads = []
+    real_bboxes = database_module.Database.get_project_bbox_previews
+    real_versions = database_module.Database.get_project_annotation_versions
+
+    def traced_bboxes(self, pid):
+        reader_threads.append(threading.current_thread().ident)
+        return real_bboxes(self, pid)
+
+    def traced_versions(self, pid):
+        reader_threads.append(threading.current_thread().ident)
+        return real_versions(self, pid)
+
+    statements = []
+    with _traced_sql(statements), \
+         patch.object(database_module.Database, "get_project_bbox_previews", traced_bboxes), \
+         patch.object(database_module.Database, "get_project_annotation_versions", traced_versions):
+        page.set_project(project_id)
+
+        # set_project 返回的这一刻：600 个格子已经在了，框还在后台查
+        assert page.image_list.count() == _BIG_COUNT
+        assert page.load_worker is None, "底图全在缓存里，不该起读盘线程"
+        assert page._previews_pending is True
+        assert page._annotation_versions == {}, "框是在 GUI 线程里同步查完的"
+
+        assert _pump_until(lambda: not page._previews_pending, timeout=30.0), \
+            "框没有在超时时间内查回来"
+
+    main_ident = threading.main_thread().ident
+    assert reader_threads, "根本没去查框"
+    assert all(ident != main_ident for ident in reader_threads), \
+        "框 / 版本号是在 GUI 线程里查的"
+
+    annotation_selects = [s for s in statements if 'FROM annotations' in s]
+    assert len(annotation_selects) == 2, (
+        f"600 张图应该只查 2 次 annotations（框 + 版本号），实际 {len(annotation_selects)} 次；"
+        "逐图查就是 N+1"
+    )
+    assert len(page._annotation_versions) == _BIG_COUNT
+
+    _settle_thumbnails(page)
+    assert _color_count(_icon_image(page, _BIG_COUNT - 1), _RED) > 0, \
+        "框查回来之后没有叠到缩略图上"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_toggling_boxes_on_600_thumbnails_never_blocks_the_ui():
+    """切「显示标注框」必须立刻返回：600 张分块重画，中间把事件循环还回去。"""
+    project_id = _make_box_project()
+    _seed_boxed_images(project_id, _BIG_COUNT)
+
+    page = _page_with_cached_thumbnails(project_id)
+    page.set_project(project_id)
+    _settle_thumbnails(page)
+
+    assert page.image_list.count() == _BIG_COUNT
+    last_with_boxes = _icon_image(page, _BIG_COUNT - 1)
+    assert _color_count(last_with_boxes, _RED) > 0, "前提：600 张现在都带框"
+
+    heartbeats = []
+    page.chk_show_boxes.setChecked(False)
+    # 0ms 心跳：它排在分块重画的后面，只要重画肯把控制权还回来，它就能跑起来
+    QTimer.singleShot(0, lambda: heartbeats.append(page._icon_refresh_pending))
+
+    assert page._icon_refresh_pending is True, \
+        "切开关在这一次调用里就把 600 张画完了——这段时间界面是僵的"
+    assert _icon_image(page, _BIG_COUNT - 1) == last_with_boxes, \
+        "最后一张已经被重画：说明开关里同步循环了全部 600 项"
+
+    assert _pump_until(lambda: not page._icon_refresh_pending, timeout=30.0), \
+        "分块重画没有在超时时间内跑完"
+
+    assert heartbeats == [True], \
+        "0ms 心跳没能在重画还没做完的时候插进来——事件循环被一口气占住了"
+
+    for row in (0, _BIG_COUNT // 2, _BIG_COUNT - 1):
+        assert _color_count(_icon_image(page, row), _RED) == 0, f"第 {row} 张的框没去掉"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_a_stale_refresh_queue_cannot_overwrite_the_newer_state():
+    """刷到一半又切了一次开关：旧队列整队作废，不能把它那批旧图补回来。"""
+    project_id = _make_box_project()
+    _seed_boxed_images(project_id, _BIG_COUNT)
+
+    page = _page_with_cached_thumbnails(project_id)
+    page.set_project(project_id)
+    _settle_thumbnails(page)
+
+    page.chk_show_boxes.setChecked(False)   # 队列 A：把框去掉
+    _app.processEvents()                    # 先让 A 画掉一块
+    assert page._icon_refresh_pending is True
+    assert page._icon_refresh_cursor > 0, "A 一块都没画，这条测试就没意义了"
+    stale_generation = page._icon_refresh_generation
+
+    page.chk_show_boxes.setChecked(True)    # 队列 B：框加回来，A 当场作废
+    assert page._icon_refresh_generation != stale_generation
+
+    # A 剩下的块就算真被调起来，也必须自己退出，一个格子都不许画
+    page._refresh_icon_chunk(stale_generation)
+
+    assert _pump_until(lambda: not page._icon_refresh_pending, timeout=30.0)
+
+    for row in (0, 11, _BIG_COUNT // 2, _BIG_COUNT - 1):
+        assert _color_count(_icon_image(page, row), _RED) > 0, \
+            f"第 {row} 张的框被过期的刷新队列抹掉了"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_stale_preview_results_never_land_on_the_current_project():
+    """晚到的查询结果（旧项目 / 旧世代）一律丢掉，不能盖掉当前项目的状态。"""
+    project_a = _make_box_project()
+    project_b = _make_box_project()
+    _seed_image_with_boxes(
+        project_b, _TMP_DIR / "stale_previews", "b.jpg",
+        size=(40, 20), boxes=[(0, {'x': 10, 'y': 5, 'width': 20, 'height': 10})],
+    )
+
+    page = _loaded_page(project_b)
+    versions_before = dict(page._annotation_versions)
+    previews_before = dict(page._bbox_previews)
+    shown_before = _icon_image(page)
+
+    # 旧项目的结果晚到了
+    page._on_annotation_previews_ready({
+        'project_id': project_a,
+        'generation': page._preview_generation,
+        'bbox_previews': {999: [{'class_id': 1, 'data': {'x': 0, 'y': 0, 'width': 9, 'height': 9}}]},
+        'annotation_versions': {999: (1, 1, 'stale')},
+        'class_colors': {0: _GREEN},
+    })
+    # 同一个项目，但世代已经被后来的一次刷新作废了
+    page._on_annotation_previews_ready({
+        'project_id': project_b,
+        'generation': page._preview_generation - 1,
+        'bbox_previews': {},
+        'annotation_versions': {},
+        'class_colors': {},
+    })
+
+    assert page._annotation_versions == versions_before, "过期结果盖掉了当前项目的标注版本"
+    assert page._bbox_previews == previews_before, "过期结果盖掉了当前项目的框"
+    assert page._class_colors.get(0) == _RED, "过期结果把类别配色也改了"
+
+    _settle_thumbnails(page)
+    assert _icon_image(page) == shown_before, "过期结果改变了缩略图"
+
+    page.stop_image_loading()
+    db.delete_project(project_a)
+    db.delete_project(project_b)
+
+
+def test_selected_item_text_stays_dark_under_fusion():
+    """Fusion 下选中一张图，格子里的文件名不能变成白字、直接消失。
+
+    不显式写 color 时，选中项的文字用的是调色板里的 HighlightedText——Fusion 下
+    那是白色；而选中项的底色仍然是浅色（我们不给它铺蓝底，铺了会把标注框压得看
+    不清），于是白字落在浅底上，整行字就没了。选中与否只由蓝色边框表达。
+    """
+    from gui.styles import COLORS
+
+    project_id = _make_box_project()
+    _seed_light_image(project_id, _TMP_DIR / "fusion_selected", "fusion.jpg")
+
+    page = _loaded_page(project_id)
+
+    fusion = QStyleFactory.create("Fusion")
+    _KEEP_STYLES.append(fusion)
+    page.image_list.setStyle(fusion)
+    page.image_list.resize(260, 260)
+    page.image_list.show()
+    _app.processEvents()
+
+    page.image_list.item(0).setSelected(True)
+    _app.processEvents()
+
+    canvas = QPixmap(page.image_list.size())
+    canvas.fill(QColor('#FFFFFF'))
+    page.image_list.render(canvas)
+    shot = canvas.toImage()
+
+    # 这张图、它的格子、它的边框全是浅色，所以深色像素只可能来自文字本身
+    dark_pixels = sum(
+        1
+        for y in range(shot.height())
+        for x in range(shot.width())
+        if QColor(shot.pixel(x, y)).lightness() < 100
+    )
+    assert dark_pixels > 0, "Fusion 下选中项的文字是白的，落在浅色格子上等于没有"
+
+    assert f"color: {COLORS['text_primary']}" in page.image_list.styleSheet(), \
+        "选中态的文字颜色必须写死成正文色，不能听凭调色板给一个白色"
+
+    # 选中了也不给图片蒙一层蓝
+    assert _icon_image(page, 0, QIcon.Mode.Selected) == _icon_image(page, 0, QIcon.Mode.Normal)
+
+    page.image_list.close()
     page.stop_image_loading()
     db.delete_project(project_id)
 

@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import json
 import threading
+import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable
 import os
@@ -259,6 +260,14 @@ class ImportPage(QWidget):
     # 项目的图片显示名称规则变了（附带 project_id）：标注页据此只重刷文字/tooltip，
     # 不重新加载画布或标注状态
     display_name_rule_changed = pyqtSignal(int)
+    # 后台线程把整批标注框/版本号查回来了：载荷是一个纯 Python dict，
+    # 跨线程只传数据，不传任何 Qt 控件或 QPixmap
+    _annotation_previews_ready = pyqtSignal(object)
+
+    # 整批重画缩略图时，一轮事件循环里最多画这么多张、最多花这么长时间，
+    # 剩下的排到下一轮。600 张一次性画完会把界面按住不动好几秒。
+    _ICON_CHUNK_SIZE = 12
+    _ICON_CHUNK_BUDGET = 0.008  # 秒
 
     def __init__(self):
         super().__init__()
@@ -279,6 +288,14 @@ class ImportPage(QWidget):
         # image_id -> (版本号, 合成好的带框缩略图)。版本号对得上就直接复用，
         # 所以改一张图的标注只会重画那一张，其余的连碰都不碰。
         self._overlay_cache = {}
+        # 查框/版本号的后台世代：切项目、再刷一次都会 +1，回来的过期结果直接丢
+        self._preview_generation = 0
+        self._previews_pending = False
+        # 整批重画缩略图的分块状态：世代用来作废旧队列，游标记录画到第几个格子
+        self._icon_refresh_generation = 0
+        self._icon_refresh_cursor = 0
+        self._icon_refresh_pending = False
+        self._annotation_previews_ready.connect(self._on_annotation_previews_ready)
 
         # 导入任务状态：与上面的缩略图加载状态（load_worker/_image_load_generation）
         # 完全分离，切页、刷新缩略图都不应该影响这一组状态
@@ -614,7 +631,9 @@ class ImportPage(QWidget):
         # 选中哪些图片，决定了「移动分组 / 删除选中」能不能点
         self.image_list.itemSelectionChanged.connect(self.update_manage_action_state)
         # 注意：这里不写 item 的 background-color，
-        # 让代码里 setBackground 设的「已标注」底色能显示出来
+        # 让代码里 setBackground 设的「已标注」底色能显示出来。
+        # 选中态的 color 必须显式写死：Fusion 的 HighlightedText 是白色，而格子
+        # 不铺蓝底，默认白字会在浅色主题里消失。主题切换时继续由统一方法重算。
         self.image_list.setStyleSheet(self._image_list_stylesheet())
         return self.image_list
 
@@ -634,6 +653,7 @@ class ImportPage(QWidget):
             }}
             QListWidget::item:selected {{
                 border: 1px solid {COLORS['primary']};
+                color: {COLORS['text_primary']};
             }}
         """
 
@@ -703,9 +723,13 @@ class ImportPage(QWidget):
         for image_id in image_ids:
             self._overlay_cache.pop(image_id, None)
 
-    def _load_class_colors(self) -> Dict[int, str]:
-        """项目类别的配色，跟标注页读的是同一份，所以同一类在两个页面永远同色。"""
-        project = db.get_project(self.current_project_id) if self.current_project_id else None
+    def _load_class_colors(self, project_id) -> Dict[int, str]:
+        """项目类别的配色，跟标注页读的是同一份，所以同一类在两个页面永远同色。
+
+        project_id 是参数不是 self.current_project_id：这个方法也在后台线程里跑，
+        必须查「发起时那个项目」，不能读一个随时会被主线程改掉的字段。
+        """
+        project = db.get_project(project_id) if project_id else None
         raw = (project or {}).get('classes') or '[]'
         try:
             classes = json.loads(raw) if isinstance(raw, str) else (raw or [])
@@ -719,22 +743,68 @@ class ImportPage(QWidget):
         }
 
     def _load_annotation_previews(self):
-        """整批读一次当前项目的框和版本号：600 张图也只查两次库，不是 600 次。"""
+        """整批读一次当前项目的框和版本号：600 张图也只查两次库，不是 600 次。
+
+        查库放在后台线程里：两次查询本身不算慢，但它们卡在 GUI 线程上时，用户
+        点开一个大项目就是「界面先僵一下」。sqlite 每次调用都开一条新连接，跨线程
+        安全；后台只组一个纯 Python dict 回来，一个 QWidget / QPixmap 都不碰。
+
+        结果带着 project_id 和世代号回来：切了项目、或者又刷了一次，过期的那份
+        就直接丢掉，不会把旧项目的框盖到新项目的图上。
+        """
+        self._preview_generation += 1
+
         if not self.current_project_id:
+            self._previews_pending = False
             self._bbox_previews = {}
             self._annotation_versions = {}
             self._class_colors = {}
             self._invalidate_thumbnail_overlays()
             return
 
-        self._bbox_previews = db.get_project_bbox_previews(self.current_project_id)
-        self._annotation_versions = db.get_project_annotation_versions(self.current_project_id)
+        # 结果回来之前先当作「还不知道有没有框」：格子上先摆没框的底图，
+        # 不拿上一批的框去合成——版本号一旦对不上，合出来的就是错的框。
+        self._previews_pending = True
+        self._bbox_previews = {}
+        self._annotation_versions = {}
 
-        class_colors = self._load_class_colors()
-        if class_colors != self._class_colors:
+        threading.Thread(
+            target=self._fetch_annotation_previews,
+            args=(self.current_project_id, self._preview_generation),
+            daemon=True,
+        ).start()
+
+    def _fetch_annotation_previews(self, project_id: int, generation: int):
+        """后台线程：只查库、只组纯 Python dict，不碰任何 Qt 控件。"""
+        self._annotation_previews_ready.emit({
+            'project_id': project_id,
+            'generation': generation,
+            'bbox_previews': db.get_project_bbox_previews(project_id),
+            'annotation_versions': db.get_project_annotation_versions(project_id),
+            'class_colors': self._load_class_colors(project_id),
+        })
+
+    def _on_annotation_previews_ready(self, payload: Dict):
+        """回到 GUI 线程：过期的结果（切了项目 / 又刷了一次）直接丢掉。
+
+        丢掉过期结果时不清 _previews_pending：过期只说明「有一份更新的还在路上」，
+        这时候声称「查完了」是假的。
+        """
+        if (payload['project_id'] != self.current_project_id
+                or payload['generation'] != self._preview_generation):
+            return
+
+        self._previews_pending = False
+        self._bbox_previews = payload['bbox_previews']
+        self._annotation_versions = payload['annotation_versions']
+
+        if payload['class_colors'] != self._class_colors:
             # 配色变了，已经合成好的那些框颜色就是错的，只能全部重画
             self._invalidate_thumbnail_overlays()
-            self._class_colors = class_colors
+            self._class_colors = payload['class_colors']
+
+        # 框现在才知道，所以现在才叠上去——分块叠，不在一个事件循环里啃完
+        self._schedule_icon_refresh()
 
     def _thumbnail_icon(self, pixmap: QPixmap) -> QIcon:
         """normal / selected / active 用同一张图。
@@ -784,21 +854,73 @@ class ImportPage(QWidget):
         item.setIcon(self._thumbnail_icon(pixmap))
         return True
 
+    def _apply_base_icon(self, item: QListWidgetItem, image_data: Dict) -> bool:
+        """只贴没有框的底图（缓存里那张）；没缓存返回 False，交给后台线程去读盘。
+
+        建列表的循环专用：600 个格子要在一次调用里建完，这里绝不能顺手合成框
+        ——那是 600 次 QPainter，界面会直接僵住。框等后台把标注查回来之后再分块叠。
+        """
+        base = self.thumbnail_cache.get(image_data.get('storage_path', ''))
+        if base is None or base.isNull():
+            return False
+        item.setIcon(self._thumbnail_icon(base))
+        return True
+
     def _image_by_id(self, image_id) -> Optional[Dict]:
         return next((img for img in self.images if img.get('id') == image_id), None)
 
     def on_toggle_annotation_boxes(self, checked: bool):
-        """「显示标注框」开关：只换图，不写数据库、不重读磁盘。"""
-        self.show_annotation_boxes = checked
-        self._refresh_item_icons()
+        """「显示标注框」开关：只换图，不写数据库、不重读磁盘。
 
-    def _refresh_item_icons(self):
-        """按当前开关，把已经在列表里的格子重画一遍。底图都在缓存里，不碰磁盘。"""
-        for i in range(self.image_list.count()):
-            item = self.image_list.item(i)
-            image_data = self._image_by_id(item.data(Qt.ItemDataRole.UserRole))
-            if image_data:
-                self._apply_item_icon(item, image_data)
+        点一下要立刻回到事件循环——所以这里只排队，不在这一次调用里把 600 张
+        缩略图重画完（那样开关会「按下去半天弹不起来」）。
+        """
+        self.show_annotation_boxes = checked
+        self._schedule_icon_refresh()
+
+    def _cancel_icon_refresh(self):
+        """让还排着队的分块重画作废：列表马上要清掉或者换一批图了。"""
+        self._icon_refresh_generation += 1
+        self._icon_refresh_pending = False
+
+    def _schedule_icon_refresh(self):
+        """按当前开关和标注，把列表里的格子重画一遍——分块跑，不一口气啃完。
+
+        底图都在缓存里，全程不碰磁盘、不查数据库；每一块之间把控制权还给事件
+        循环，所以刷新期间界面照样能滚动、能点。中途再来一次刷新（或者切了项目）
+        会换一个世代号，排在队里的旧块自己就退出了，不会拿旧数据盖掉新状态。
+        """
+        self._icon_refresh_generation += 1
+        self._icon_refresh_cursor = 0
+        self._icon_refresh_pending = True
+        generation = self._icon_refresh_generation
+        QTimer.singleShot(0, lambda: self._refresh_icon_chunk(generation))
+
+    def _refresh_icon_chunk(self, generation: int):
+        """重画一块格子；没画完就把自己排到下一轮事件循环。"""
+        if generation != self._icon_refresh_generation:
+            return  # 过期的队列：期间又刷了一次，或者列表已经换了一批图
+
+        by_id = {img['id']: img for img in self.images}
+        deadline = time.monotonic() + self._ICON_CHUNK_BUDGET
+        drawn = 0
+
+        while self._icon_refresh_cursor < self.image_list.count():
+            item = self.image_list.item(self._icon_refresh_cursor)
+            self._icon_refresh_cursor += 1
+            if item is not None:
+                image_data = by_id.get(item.data(Qt.ItemDataRole.UserRole))
+                if image_data:
+                    self._apply_item_icon(item, image_data)
+            drawn += 1
+            # 先画再看预算：哪怕预算已经花光，一块也至少画一张，否则一张都画不出来
+            if drawn >= self._ICON_CHUNK_SIZE or time.monotonic() >= deadline:
+                break
+
+        if self._icon_refresh_cursor < self.image_list.count():
+            QTimer.singleShot(0, lambda: self._refresh_icon_chunk(generation))
+        else:
+            self._icon_refresh_pending = False
 
     def _apply_item_status(self, item: QListWidgetItem, image_data: Dict):
         """让「哪些图已经标过」在网格里一眼看得出来：勾号 + 绿字，不只靠颜色。
@@ -870,6 +992,9 @@ class ImportPage(QWidget):
             self._end_import_ui()
         self.current_project_id = project_id
         self.images = []
+        # 列表马上要被清空：排在队里的分块重画得先作废，不然它们会去画一批
+        # 已经不存在的格子
+        self._cancel_icon_refresh()
         self.image_list.clear()
         self.thumbnail_widgets.clear()
         # 换项目：合成好的带框缩略图全作废（底图按 storage_path 缓存，可以留着）
@@ -958,7 +1083,7 @@ class ImportPage(QWidget):
             for img in self.images
         ]
         if (latest_signature == current_signature
-                and self._load_class_colors() == self._class_colors):
+                and self._load_class_colors(self.current_project_id) == self._class_colors):
             return
 
         self.load_project_images()
@@ -1036,6 +1161,7 @@ class ImportPage(QWidget):
 
             removed_storage_paths = [img.get('storage_path', '') for img in self.images]
             self.current_project_id = None
+            self._cancel_icon_refresh()
             self.image_list.clear()
             self.images = []
             self.thumbnail_widgets.clear()
@@ -1064,14 +1190,15 @@ class ImportPage(QWidget):
         # 停止之前的加载，并创建新的加载世代
         self.stop_image_loading(reset_progress=False)
 
-        # 清空列表
+        # 清空列表（先作废排队中的分块重画：它们画的是马上要没的那批格子）
+        self._cancel_icon_refresh()
         self.image_list.clear()
         self.thumbnail_widgets.clear()
 
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
         self._refresh_image_display_names()
-        # 标注框：整批读，不在下面的循环里逐图查库
+        # 标注框：整批读，而且是在后台线程里读——回来之后才分块叠到格子上
         self._load_annotation_previews()
         self.update_status_bar()
         self.update_view_mode()
@@ -1092,8 +1219,9 @@ class ImportPage(QWidget):
             # 设置项目大小提示，确保即使没有图标也有足够高度
             item.setSizeHint(QSize(180, 200))
 
-            # 底图已经在缓存里就直接用（连同框一起合成），否则丢给后台线程去读盘
-            if not self._apply_item_icon(item, image_data):
+            # 底图已经在缓存里就先按原样贴上（框等后台查回来再分块叠），
+            # 否则丢给后台线程去读盘
+            if not self._apply_base_icon(item, image_data):
                 uncached_tasks.append((index, image_data))
 
             self.image_list.addItem(item)
@@ -1237,7 +1365,8 @@ class ImportPage(QWidget):
             self.image_list.addItem(item)
             row_index = self.image_list.count() - 1
 
-            if not self._apply_item_icon(item, image_data):
+            # 同样只贴底图：一次导入可能进来几百张，框留给分块刷新
+            if not self._apply_base_icon(item, image_data):
                 uncached_tasks.append((row_index, image_data))
 
         # 新导入的图可能和已有的重名（另一段视频的同一个帧号），
@@ -2040,6 +2169,7 @@ class ImportPage(QWidget):
         if failed == 0:
             removed_storage_paths = [img.get('storage_path', '') for img in self.images]
             self.images.clear()
+            self._cancel_icon_refresh()
             self.image_list.clear()
             self.thumbnail_widgets.clear()
             self._remove_cached_thumbnails(removed_storage_paths)
