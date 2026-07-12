@@ -935,5 +935,141 @@ def test_llm_batch_writes_use_the_snapshot_project_not_the_current_page_project(
     db.delete_project(project_b)
 
 
+# ==================== 关窗收尾 ====================
+#
+# MainWindow.closeEvent 会调 AnnotatePage.shutdown()。它以前只收 LLM 线程，
+# 完全没管 YOLO 的 BatchLabelingManager：批量推理跑着的时候关窗，manager 跟着
+# 页面一起销毁，它手上那个还在跑的 QThread 就撞上「destroyed while running」——
+# 进程直接崩，而不是干净退出。
+
+class _RecordingBatchManager:
+    """假 manager：不起线程，只记下谁被调了、什么顺序。"""
+
+    def __init__(self, events, running=True):
+        self.events = events
+        self._running = running
+
+    def request_cancel(self):
+        self.events.append('yolo:request_cancel')
+
+    def cleanup(self):
+        self.events.append('yolo:cleanup')
+        self._running = False       # cleanup 里 stop() + wait()，回来线程就该停了
+
+    def is_running(self):
+        return self._running
+
+
+class _RecordingLlmWorker:
+    """假 LLM 线程：同样只记调用，不真的跑。"""
+
+    def __init__(self, events, running=True):
+        self.events = events
+        self._running = running
+
+    def isRunning(self):
+        return self._running
+
+    def cancel(self):
+        self.events.append('llm:cancel')
+
+    def wait(self, msec=None):
+        self.events.append('llm:wait')
+        self._running = False
+        return True
+
+
+def test_shutdown_cancels_the_yolo_batch_before_it_waits_on_anything():
+    """先把两边的取消都发出去，再去等——顺序本身就是要求。
+
+    取消是放个标志就返回，等待才真的堵着。要是反过来先站在 LLM 那儿等满 5 秒，
+    YOLO 线程这 5 秒里还在一张张往下推图，全是白跑的活。
+    """
+    events = []
+    page = _page()
+    page.batch_labeling_manager = _RecordingBatchManager(events)
+    page.llm_batch_worker = _RecordingLlmWorker(events)
+
+    page.shutdown()
+
+    assert events == [
+        'yolo:request_cancel',   # 先发 YOLO 的取消
+        'llm:cancel',            # 再发 LLM 的取消（两边都已经收到停的指令）
+        'yolo:cleanup',          # 然后才开始等：YOLO 线程退出 + 卸载模型
+        'llm:wait',              # 最后等 LLM 线程退出
+    ], f"关窗收尾的顺序不对：{events}"
+
+    page.deleteLater()
+
+
+def test_shutdown_is_safe_when_no_batch_was_ever_started():
+    """从没跑过批量的页面（manager 还是 None），关窗不能报错；重复调也不能。"""
+    page = _page()
+    assert page.batch_labeling_manager is None, "夹具前提变了：manager 本该还没建"
+
+    page.shutdown()
+    page.shutdown()   # 幂等：closeEvent 万一走两遍也得安然无恙
+
+    page.deleteLater()
+
+
+def test_shutdown_still_finishes_the_llm_workers_it_always_did():
+    """别为了接上 YOLO 就把原来的 LLM 收尾弄丢了：单张、批量、退休的线程都要收。"""
+    events = []
+    page = _page()
+    single = _RecordingLlmWorker(events)
+    batch = _RecordingLlmWorker(events)
+    retired = _RecordingLlmWorker(events)
+    page.llm_worker = single
+    page.llm_batch_worker = batch
+    page._retired_llm_workers = [retired]
+
+    page.shutdown()
+
+    for worker, name in ((single, "单张"), (batch, "批量"), (retired, "已退休")):
+        assert not worker.isRunning(), f"{name} LLM 线程没等到它退出"   # wait() 才会把它放倒
+    assert events.count('llm:cancel') == 3, "三个 LLM 线程都得收到取消"
+    assert events.count('llm:wait') == 3, "三个 LLM 线程都得等到它退出"
+
+    page.deleteLater()
+
+
+def test_shutdown_actually_stops_a_running_yolo_batch_thread():
+    """真线程、真 manager：关窗之后不能再有还在跑的线程引用。
+
+    这条是这次修复的正主。假 manager 只能证明「调了 request_cancel / cleanup」，
+    证明不了那两个调用真的把线程摁下去了——所以这里起一个真的
+    BatchLabelingManager（只把推理换成假的），跑起来，然后关窗。
+    """
+    project_id, _ = _make_project(image_count=40, annotated=0)
+    _reset_fake_labeler()
+
+    manager = BatchLabelingManager()
+    page = _page(project_id, _image_rows(project_id))
+    page.batch_labeling_manager = manager
+    plan = _plan(project_id, _image_rows(project_id))
+
+    with patch.object(auto_labeler_module, "AutoLabeler", _SlowFakeLabeler):
+        assert manager.start_batch_processing(plan, model_manager=None) is True
+        assert _pump_until(lambda: manager.is_running()), "线程根本没跑起来"
+
+        page.shutdown()      # ← 关窗。cleanup() 里 stop() + wait()，回来线程必须已经退出
+
+        assert not manager.is_running(), \
+            "shutdown 之后线程还在跑——QThread 正要在这个状态下被销毁"
+
+        # wait() 是在界面线程里堵着等的，thread.finished 那会儿投递不出去；
+        # 泵一轮事件，让 manager 把引用真正放掉。
+        assert _pump_until(lambda: manager.current_thread is None), \
+            "线程退出了，manager 手上还攥着它的引用"
+
+    done = _annotation_count(project_id)
+    assert done < 40, "取消没起作用：40 张全跑完了，说明它是自然跑完而不是被停下的"
+
+    page.deleteLater()
+    _reset_fake_labeler()
+    db.delete_project(project_id)
+
+
 if __name__ == "__main__":
     sys.exit(_bootstrap.run_module_tests(globals()))
