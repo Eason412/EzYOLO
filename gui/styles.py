@@ -361,11 +361,11 @@ QScrollArea {{
 }}
 
 QToolTip {{
-    background-color: {c['panel']};
-    color: {c['text_primary']};
-    border: 1px solid {c['border_strong']};
-    border-radius: {RADIUS_SM}px;
-    padding: 6px 9px;
+    background-color: #3A3A3C;
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 8px 10px;
 }}
 
 /* ---------- 文字 ---------- */
