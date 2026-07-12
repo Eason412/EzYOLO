@@ -23,7 +23,9 @@ from typing import List, Dict, Optional, Tuple, Callable
 import os
 
 from gui.styles import COLORS, set_menu_indicator
-from gui.display_names import display_name, display_names
+from gui.display_names import (
+    build_project_display_names, display_name, display_names, parse_display_name_rule,
+)
 from gui.thumbnail_overlay import bbox_preview_boxes, draw_boxes_on_thumbnail
 from models.database import db
 from core.import_manager import ImportManager, VIDEO_MODE_INTERVAL, VIDEO_MODE_RANDOM
@@ -37,6 +39,7 @@ from gui.widgets.app_dialog import (
     ask_text, confirm, confirm_destructive, show_info, show_warning,
 )
 from gui.widgets.video_extract_dialog import ask_video_extract_plan
+from gui.widgets.display_name_rule_dialog import DisplayNameRuleDialog
 
 
 def short_task_label(task_type: str) -> str:
@@ -253,6 +256,9 @@ class ImportPage(QWidget):
     projects_changed = pyqtSignal(object)
     # 当前项目的图片或标注数量变了，主窗口据此刷新流程进度
     project_data_changed = pyqtSignal()
+    # 项目的图片显示名称规则变了（附带 project_id）：标注页据此只重刷文字/tooltip，
+    # 不重新加载画布或标注状态
+    display_name_rule_changed = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
@@ -475,6 +481,14 @@ class ImportPage(QWidget):
 
         self.manage_menu.addSeparator()
 
+        self.action_display_name_rule = self.manage_menu.addAction("图片显示名称…")
+        self.action_display_name_rule.setToolTip(
+            "设置这个项目里图片显示成什么名字，不改文件名、不影响标注和训练"
+        )
+        self.action_display_name_rule.triggered.connect(self.open_display_name_rule_dialog)
+
+        self.manage_menu.addSeparator()
+
         # 一个点不动的标题，把下面两条框成「危险」的那一段
         danger_caption = self.manage_menu.addAction("危险操作")
         danger_caption.setEnabled(False)
@@ -510,6 +524,7 @@ class ImportPage(QWidget):
 
         self.action_move_group.setEnabled(has_project and has_selection)
         self.action_delete_selected.setEnabled(has_project and has_selection)
+        self.action_display_name_rule.setEnabled(has_project)
 
         # 破坏性的两个在导入进行中一律关掉：正在往里写图片的时候不能把项目端了。
         # 移动/删除选中不受影响——那是对已有图片的操作，导入中照样可以做。
@@ -634,11 +649,19 @@ class ImportPage(QWidget):
             self._refresh_item_labels()
 
     def _refresh_image_display_names(self):
-        """整批算显示名：抽帧出来的图叫「帧 223」，重名的才补区分信息。
+        """整批算显示名：按项目的显示名称规则来（默认等价于旧的「帧号化名」逻辑）。
 
-        必须整批算——「这个帧号在这批图里是不是独一份」只有看全列表才知道。
+        必须整批算——「这个帧号/编号在这批图里是不是独一份」只有看全列表才知道。
         """
-        aliases = display_names([img.get('filename', '') for img in self.images])
+        project = db.get_project(self.current_project_id) if self.current_project_id else None
+        rule = parse_display_name_rule((project or {}).get('display_name_rule'))
+        project_name = (project or {}).get('name', '')
+        try:
+            aliases = build_project_display_names(rule, self.images, project_name)
+        except ValueError:
+            # 规则本该在保存前就校验过全量图片；万一还是生成失败，退回「保留原名」，
+            # 不能让整页刷不出来。
+            aliases = display_names([img.get('filename', '') for img in self.images])
         self._image_display_names = {
             img['id']: alias for img, alias in zip(self.images, aliases)
         }
@@ -646,6 +669,26 @@ class ImportPage(QWidget):
     def _image_display_name(self, image_data: Dict) -> str:
         cached = getattr(self, '_image_display_names', {}).get(image_data.get('id'))
         return cached or display_name(image_data.get('filename', ''))
+
+    def _image_tooltip(self, image_data: Dict, group_name: Optional[str] = None) -> str:
+        """提示文字跟显示名规则无关：永远是原始文件名、分辨率、来源路径这三行。
+
+        显示名可能被规则改写成完全认不出的样子（比如「阀门_00001」），这里必须
+        留一个用户随时能找到真实文件的地方——哪怕某项元数据缺失，也只把这一项
+        换成「未知/未记录」，不能整行消失，不然用户会以为软件漏读了数据。
+        """
+        width = image_data.get('width')
+        height = image_data.get('height')
+        resolution = f"{width}x{height}" if width and height else "未知"
+        original_path = image_data.get('original_path') or "未记录"
+        lines = [
+            image_data.get('filename', ''),
+            f"分辨率: {resolution}",
+            f"来源: {original_path}",
+        ]
+        if group_name is not None:
+            lines.append(f"分组: {group_name}")
+        return "\n".join(lines)
 
     # ==================== 缩略图上的标注框预览 ====================
 
@@ -1042,7 +1085,7 @@ class ImportPage(QWidget):
         for index, image_data in enumerate(self.images):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, image_data['id'])
-            item.setToolTip(f"{image_data['filename']}\n{image_data.get('width', 0)}x{image_data.get('height', 0)}")
+            item.setToolTip(self._image_tooltip(image_data))
 
             self._apply_item_status(item, image_data)
 
@@ -1150,11 +1193,7 @@ class ImportPage(QWidget):
             if group:
                 group_name = group['name']
 
-        item.setToolTip(
-            f"{image_data['filename']}\n"
-            f"{image_data.get('width', 0)}x{image_data.get('height', 0)}\n"
-            f"分组: {group_name}"
-        )
+        item.setToolTip(self._image_tooltip(image_data, group_name=group_name))
 
         self._apply_item_status(item, image_data)
 
@@ -1217,13 +1256,65 @@ class ImportPage(QWidget):
         return len(new_images)
 
     def _refresh_item_labels(self):
-        """按当前的显示名，把所有格子的文字重刷一遍。"""
+        """按当前的显示名，把所有格子的文字和提示重刷一遍。"""
         by_id = {img['id']: img for img in self.images}
+        group_names = {
+            group['id']: group['name']
+            for group in db.get_project_image_groups(self.current_project_id)
+        } if self.current_project_id else {}
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             image_data = by_id.get(item.data(Qt.ItemDataRole.UserRole))
             if image_data:
                 self._apply_item_status(item, image_data)
+                group_name = group_names.get(image_data.get('group_id'), "未分组")
+                item.setToolTip(self._image_tooltip(image_data, group_name=group_name))
+
+    # ==================== 图片显示名称规则（U6） ====================
+
+    def open_display_name_rule_dialog(self):
+        """管理 → 图片显示名称…：整个项目切换显示名规则，只改界面上的字，不改文件名。"""
+        if not self.current_project_id:
+            return
+
+        project = db.get_project(self.current_project_id)
+        if not project:
+            return
+
+        project_name = project.get('name', '')
+        current_rule = parse_display_name_rule(project.get('display_name_rule'))
+        all_images = db.get_project_images(self.current_project_id)
+
+        dialog = DisplayNameRuleDialog(
+            self,
+            current_rule=current_rule,
+            sample_images=all_images,
+            project_name=project_name,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        rule = dialog.selected_rule()
+        if rule is None:
+            return
+
+        # 对话框只预览了前三张；真正保存前必须对项目全部图片做一次完整的
+        # 合法性/唯一性校验，冲突了就不保存，把原因原样告诉用户。
+        try:
+            build_project_display_names(rule, all_images, project_name)
+        except ValueError as exc:
+            show_warning(self, "显示名称规则不合法", str(exc))
+            return
+
+        if not db.update_project(self.current_project_id, display_name_rule=rule):
+            # 没写进去就不能假装成功：列表保持原样，也不能通知标注页去刷一个
+            # 数据库里其实没有的规则。
+            show_warning(self, "保存失败", "显示名称规则没有写入成功，请重试。")
+            return
+
+        self._refresh_image_display_names()
+        self._refresh_item_labels()
+        self.display_name_rule_changed.emit(self.current_project_id)
 
     def refresh_view_filter_options(self):
         """刷新筛选下拉框（含分组列表）。"""
@@ -1998,11 +2089,7 @@ class ImportPage(QWidget):
             image_id = item.data(Qt.ItemDataRole.UserRole)
             image_data = next((img for img in self.images if img['id'] == image_id), None)
             if image_data:
-                item.setToolTip(
-                    f"{image_data['filename']}\n"
-                    f"{image_data.get('width', 0)}x{image_data.get('height', 0)}\n"
-                    f"分组: {group_label}"
-                )
+                item.setToolTip(self._image_tooltip(image_data, group_name=group_label))
 
         self.refresh_view_filter_options()
         self.filter_images(self.view_combo.currentText())

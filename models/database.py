@@ -199,6 +199,14 @@ class Database:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_image_groups_project ON image_groups(project_id)"
         )
+
+        cursor.execute("PRAGMA table_info(projects)")
+        project_columns = {row[1] for row in cursor.fetchall()}
+        if 'display_name_rule' not in project_columns:
+            # 只加列，不填默认值：NULL 就表示「没设置过规则」，
+            # gui.display_names.parse_display_name_rule(None) 会把它当成 original 处理，
+            # 旧项目的显示行为不会因为升级数据库结构而改变。
+            cursor.execute("ALTER TABLE projects ADD COLUMN display_name_rule TEXT")
     
     # ==================== 项目操作 ====================
     
@@ -258,15 +266,25 @@ class Database:
     
     def update_project(self, project_id: int, **kwargs) -> bool:
         """更新项目信息"""
-        allowed_fields = ['name', 'description', 'type', 'classes', 'status', 'storage_path']
+        allowed_fields = [
+            'name', 'description', 'type', 'classes', 'status', 'storage_path',
+            'display_name_rule',
+        ]
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
-        
+
         if not updates:
             return False
-        
+
         # 处理classes字段
         if 'classes' in updates and isinstance(updates['classes'], list):
             updates['classes'] = json.dumps(updates['classes'], ensure_ascii=False)
+
+        # display_name_rule 存的是 JSON 字符串；传字典进来时顺手序列化，
+        # 调用方也可以自己先用 serialize_display_name_rule 转好再传字符串。
+        if 'display_name_rule' in updates and isinstance(updates['display_name_rule'], dict):
+            updates['display_name_rule'] = json.dumps(
+                updates['display_name_rule'], ensure_ascii=False
+            )
         
         updates['updated_at'] = datetime.now().isoformat()
         
