@@ -775,12 +775,17 @@ class ImportPage(QWidget):
         ).start()
 
     def _fetch_annotation_previews(self, project_id: int, generation: int):
-        """后台线程：只查库、只组纯 Python dict，不碰任何 Qt 控件。"""
+        """后台线程：只查库、只组纯 Python dict，不碰任何 Qt 控件。
+
+        框和版本号一次读回来：分两次读会读到「旧框 + 新版本号」，缩略图会把旧框
+        按新版本号缓存住，之后再也不刷新（见 get_project_bbox_preview_snapshot）。
+        """
+        bbox_previews, annotation_versions = db.get_project_bbox_preview_snapshot(project_id)
         self._annotation_previews_ready.emit({
             'project_id': project_id,
             'generation': generation,
-            'bbox_previews': db.get_project_bbox_previews(project_id),
-            'annotation_versions': db.get_project_annotation_versions(project_id),
+            'bbox_previews': bbox_previews,
+            'annotation_versions': annotation_versions,
             'class_colors': self._load_class_colors(project_id),
         })
 
