@@ -3303,10 +3303,10 @@ class AnnotatePage(QWidget):
             QPushButton {{
                 padding: 4px 10px;
             }}
-            /* QToolButton 在这里永远带菜单：右边留 36px 给 24px 宽的 menu-button
+            /* QToolButton 在这里永远带菜单：右边留 46px 给 34px 宽的 menu-button
                子控件（+ 一点呼吸空间），文字才不会被压进箭头区。 */
             QToolButton {{
-                padding: 4px 36px 4px 10px;
+                padding: 4px 46px 4px 10px;
             }}
             QPushButton:hover, QToolButton:hover {{
                 background-color: {COLORS['hover']};
@@ -3325,7 +3325,7 @@ class AnnotatePage(QWidget):
             QToolButton::menu-button {{
                 subcontrol-origin: padding;
                 subcontrol-position: right center;
-                width: 24px;
+                width: 34px;
                 background-color: {COLORS['panel']};
                 border-left: 1px solid {COLORS['border']};
                 border-top-right-radius: {RADIUS_SM}px;
@@ -3352,8 +3352,8 @@ class AnnotatePage(QWidget):
             QToolButton::menu-arrow,
             QToolButton::menu-indicator {{
                 image: url({arrow_url});
-                width: 12px;
-                height: 12px;
+                width: 16px;
+                height: 16px;
             }}
             QToolButton::menu-arrow:disabled,
             QToolButton::menu-indicator:disabled {{
@@ -3366,12 +3366,12 @@ class AnnotatePage(QWidget):
 
         菜单按钮不能信 QToolButton 原生的 minimumSizeHint——它不知道我们把
         menu-button 子控件挤宽到了多少，算出来的宽度会比实际需要的窄，文字
-        就被顶进箭头区。这里按实际的内边距（左 10 + 右 36）和双边框（2px）
+        就被顶进箭头区。这里按实际的内边距（左 10 + 右 46）和双边框（2px）
         自己算，再留 6px 安全边，最后跟 sizeHint 取较大值兜底。
         """
         text_width = button.fontMetrics().horizontalAdvance(button.text())
         if isinstance(button, QToolButton) and button.menu() is not None:
-            width = text_width + 10 + 36 + 2 + 6
+            width = text_width + 10 + 46 + 2 + 6
             return max(width, button.sizeHint().width())
         return text_width + 24
 
