@@ -9,7 +9,7 @@ import sqlite3
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from contextlib import contextmanager
 
 
@@ -690,6 +690,65 @@ class Database:
                 annotations.append(ann)
             return annotations
     
+    def get_project_bbox_previews(self, project_id: int) -> Dict[int, List[Dict]]:
+        """整个项目的 bbox，一次查完，按 image_id 分好组。
+
+        导入页要在几百张缩略图上画框。逐图调 get_image_annotations 就是典型的
+        N+1：600 张图 = 600 次查询，翻页时全压在主线程上。这里一次查回来，
+        而且只取画框用得上的三列，不去读 attributes 那些用不到的字段。
+
+        只返回 bbox；缩略图预览不画多边形和关键点。
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT image_id, class_id, data
+                FROM annotations
+                WHERE project_id = ? AND type = 'bbox'
+                ORDER BY image_id, id
+            """, (project_id,))
+
+            previews: Dict[int, List[Dict]] = {}
+            for row in cursor.fetchall():
+                try:
+                    data = json.loads(row['data'])
+                except (TypeError, ValueError):
+                    continue  # 坏掉的一条标注不该让整页缩略图画不出来
+                previews.setdefault(row['image_id'], []).append({
+                    'type': 'bbox',
+                    'class_id': row['class_id'],
+                    'data': data,
+                })
+            return previews
+
+    def get_project_annotation_versions(self, project_id: int) -> Dict[int, Tuple[int, int, str]]:
+        """每张图的标注版本号：(框数, 最大标注 id, 最近改动时间)，同样只查一次。
+
+        版本号是给缩略图缓存用的——「这张图的标注变了没有」。三个字段缺一不可：
+
+          框数        加框、删框
+          最大 id     删一个再加一个：框数没变，但新标注的 id 一定更大
+          改动时间    框被拖动 / 改类别：走 update_annotation，updated_at 会刷新
+
+        只看框数会漏掉后两种，缩略图就会一直停在旧的框上；只看 status 更糟，
+        改完框图片还是 annotated，界面永远不刷新。
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT image_id,
+                       COUNT(*) AS box_count,
+                       MAX(id) AS max_id,
+                       MAX(COALESCE(updated_at, created_at)) AS last_changed
+                FROM annotations
+                WHERE project_id = ?
+                GROUP BY image_id
+            """, (project_id,))
+            return {
+                row['image_id']: (row['box_count'], row['max_id'], row['last_changed'])
+                for row in cursor.fetchall()
+            }
+
     def delete_annotation(self, annotation_id: int) -> bool:
         """删除标注"""
         with self.get_connection() as conn:
