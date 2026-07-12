@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QColorDialog, QDialog, QApplication, QAbstractSpinBox
 )
 import math
+import copy
 
 # 导入自动标注相关模块
 from gui.pages.auto_label_dialog import AutoLabelDialog
@@ -627,7 +628,7 @@ class AnnotationCanvas(QFrame):
     
     annotation_created = pyqtSignal(dict)  # 标注创建信号
     annotation_selected = pyqtSignal(int)  # 标注选中信号
-    annotation_modified = pyqtSignal(int, dict)  # 标注修改信号
+    annotation_modified = pyqtSignal(int, dict, dict)  # 标注修改信号：id, 修改前 data, 修改后 data
     annotation_deleted = pyqtSignal(int)  # 标注删除信号
     
     def __init__(self, parent=None):
@@ -1630,7 +1631,9 @@ class AnnotationCanvas(QFrame):
                                 self.dragging_vertex = True
                                 self.drag_vertex_index = vertex_idx
                                 self.drag_start = event.pos()
-                                self.drag_start_annotation = None
+                                self.drag_start_annotation = (
+                                    copy.deepcopy(ann_data) if isinstance(ann_data, dict) else {}
+                                )
                                 self.annotation_selected.emit(self.selected_annotation_id)
                                 self.update()
                                 return
@@ -1780,32 +1783,33 @@ class AnnotationCanvas(QFrame):
                 self.drawing = False
                 self.create_obb_annotation()
             elif self.resizing:
+                old_data = copy.deepcopy(self.resize_start_rect) if self.resize_start_rect else None
                 self.resizing = False
                 self.resize_handle = None
                 self.resize_start_rect = None
-                # 发送修改信号
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
                     if annotation:
-                        self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
+                        self._emit_annotation_modified(annotation, old_data)
             elif self.dragging_vertex:
+                old_data = copy.deepcopy(self.drag_start_annotation) if self.drag_start_annotation else None
                 self.dragging_vertex = False
                 self.drag_vertex_index = None
                 self.drag_start = None
-                # 发送修改信号
+                self.drag_start_annotation = None
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
                     if annotation:
-                        self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
+                        self._emit_annotation_modified(annotation, old_data)
             elif self.dragging:
+                old_data = copy.deepcopy(self.drag_start_annotation) if self.drag_start_annotation else None
                 self.dragging = False
                 self.drag_start = None
                 self.drag_start_annotation = None
-                # 发送修改信号
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
                     if annotation:
-                        self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
+                        self._emit_annotation_modified(annotation, old_data)
             elif self.panning:
                 self.panning = False
                 self.pan_start = None
@@ -1905,6 +1909,17 @@ class AnnotationCanvas(QFrame):
         
         return None
     
+    def _emit_annotation_modified(self, annotation: Dict, old_data: Optional[dict]):
+        """拖动/缩放结束后上报修改，并带上修改前的 data 供撤销使用。"""
+        if not old_data or self.selected_annotation_id is None:
+            return
+        new_data = copy.deepcopy(annotation.get('data', {}))
+        self.annotation_modified.emit(
+            self.selected_annotation_id,
+            copy.deepcopy(old_data),
+            new_data,
+        )
+
     def drag_annotation(self, pos: QPoint):
         """拖动标注"""
         if self.drag_start is None or self.drag_start_annotation is None:
@@ -2604,6 +2619,39 @@ class AnnotatePage(QWidget):
             if hasattr(worker, 'cancel'):
                 worker.cancel()
             worker.wait(5000)
+
+    def refresh_theme(self):
+        """主题切换后刷新工具栏、状态栏与画布。"""
+        base_tool_style = self._toolbar_chip_style('tool')
+        for button in (
+            getattr(self, 'btn_draw_tool', None),
+            getattr(self, 'btn_keypoint', None),
+            getattr(self, 'btn_move', None),
+            getattr(self, 'btn_undo', None),
+        ):
+            if button is not None:
+                button.setStyleSheet(base_tool_style)
+        if hasattr(self, 'btn_delete'):
+            self.btn_delete.setStyleSheet(self._toolbar_chip_style('danger'))
+        if hasattr(self, 'status_bar'):
+            self.status_bar.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {COLORS['panel']};
+                    border: none;
+                    border-top: 1px solid {COLORS['border']};
+                    border-radius: 0px;
+                }}
+                QLabel {{
+                    color: {COLORS['text_secondary']};
+                    font-size: 12px;
+                }}
+            """)
+        if hasattr(self, 'canvas') and hasattr(self.canvas, '_refresh_lock_button'):
+            self.canvas._refresh_lock_button()
+        if hasattr(self, 'canvas'):
+            self.canvas.update()
+        if hasattr(self, 'current_class_chip'):
+            self._update_current_class_chip()
 
     def _track_llm_worker(self, worker):
         """所有 LLM 线程都从这里登记生命周期。"""
@@ -5721,18 +5769,18 @@ class AnnotatePage(QWidget):
         if annotation:
             self.update_attribute_panel(annotation)
     
-    def on_annotation_modified(self, annotation_id: int, data: dict):
+    def on_annotation_modified(self, annotation_id: int, old_data: dict, new_data: dict):
         """标注修改事件（拖动或调整大小后）"""
         annotation = next((ann for ann in self.annotations if ann['id'] == annotation_id), None)
         if annotation:
-            # 更新数据库中的标注
-            db.update_annotation(annotation_id, data=data)
-            
-            # 更新属性面板
+            db.update_annotation(annotation_id, data=new_data)
+            annotation['data'] = new_data
+
             self.update_attribute_panel(annotation)
-            
-            # 添加到历史记录
-            self.add_history('modify', {'annotation_id': annotation_id, 'old_data': data.copy()})
+            self.add_history('modify', {
+                'annotation_id': annotation_id,
+                'old_data': copy.deepcopy(old_data),
+            })
     
     def on_annotation_deleted(self, annotation_id: int):
         """标注删除事件"""
@@ -6257,6 +6305,11 @@ class AnnotatePage(QWidget):
                 annotation_type=data['type'],
                 data=data['data']
             )
+        elif action == 'modify':
+            ann_id = data.get('annotation_id')
+            old_data = data.get('old_data')
+            if ann_id is not None and old_data is not None:
+                db.update_annotation(ann_id, data=old_data)
         
         self.history_index -= 1
         self.load_annotations()

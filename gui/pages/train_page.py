@@ -1247,7 +1247,11 @@ class TrainPage(QWidget):
         widget = QListWidget()
         widget.itemChanged.connect(self.on_group_selection_changed)
         widget.setMaximumHeight(110)
-        widget.setStyleSheet(f"""
+        widget.setStyleSheet(self._group_check_list_stylesheet())
+        return widget
+
+    def _group_check_list_stylesheet(self) -> str:
+        return f"""
             QListWidget {{
                 background-color: {COLORS['sidebar']};
                 border: 1px solid {COLORS['border']};
@@ -1257,8 +1261,7 @@ class TrainPage(QWidget):
                 color: {COLORS['text_primary']};
                 padding: 2px 4px;
             }}
-        """)
-        return widget
+        """
 
     def _on_split_mode_changed(self):
         use_groups = self.split_mode_groups.isChecked()
@@ -2382,3 +2385,52 @@ class TrainPage(QWidget):
                 QMessageBox.information(self, "保存成功", f"日志已保存到:\n{file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "保存失败", f"保存日志时出错:\n{str(e)}")
+
+    def _style_chart_axis(self, figure, axis, lines: dict):
+        """按当前主题刷新 matplotlib 图表外观。"""
+        figure.patch.set_facecolor(COLORS['sidebar'])
+        axis.set_facecolor(COLORS['sidebar'])
+        axis.title.set_color(COLORS['text_primary'])
+        axis.xaxis.label.set_color(COLORS['text_primary'])
+        axis.yaxis.label.set_color(COLORS['text_primary'])
+        axis.tick_params(colors=COLORS['text_primary'])
+        for spine in axis.spines.values():
+            spine.set_color(COLORS['border'])
+        axis.grid(True, alpha=0.3, color=COLORS['border'])
+        color_cycle = {
+            'box': COLORS['primary'],
+            'cls': COLORS['error_fill'],
+            'dfl': COLORS['success_fill'],
+            'map50': COLORS['primary'],
+            'map50_95': COLORS['error_fill'],
+        }
+        for key, line in lines.items():
+            if key in color_cycle:
+                line.set_color(color_cycle[key])
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.get_frame().set_facecolor(COLORS['sidebar'])
+            legend.get_frame().set_edgecolor(COLORS['border'])
+            for text in legend.get_texts():
+                text.set_color(COLORS['text_primary'])
+
+    def refresh_theme(self):
+        """主题切换后刷新训练曲线与内联样式。"""
+        if hasattr(self, 'loss_ax'):
+            self._style_chart_axis(self.loss_figure, self.loss_ax, self.loss_lines)
+            self.loss_canvas.draw_idle()
+        if hasattr(self, 'map_ax'):
+            self._style_chart_axis(self.map_figure, self.map_ax, self.map_lines)
+            self.map_canvas.draw_idle()
+        if hasattr(self, 'train_group_list'):
+            self.train_group_list.setStyleSheet(self._group_check_list_stylesheet())
+        if hasattr(self, 'val_group_list'):
+            self.val_group_list.setStyleSheet(self._group_check_list_stylesheet())
+        if hasattr(self, 'split_warning'):
+            self.split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
+        if hasattr(self, 'group_split_warning'):
+            self.group_split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
+        if hasattr(self, 'status_label'):
+            self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        if hasattr(self, 'prep_hint'):
+            self.prep_hint.setStyleSheet(f"color: {COLORS['warning']};")

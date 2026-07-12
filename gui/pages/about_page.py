@@ -17,6 +17,7 @@ UPDATED = "2026-03-05"
 AUTHOR = "xinchen"
 GITHUB = "https://github.com/lxinchenl"
 EMAIL = "liuxinchen0803@qq.com"
+EMAIL_MAC = "huyi@njust.edu.cn"
 
 INTRO = "EzYOLO 把 YOLO 的完整流程收进一条固定路线：导入图片 → 标注 → 训练 → 看结果 → 测试。"
 
@@ -150,6 +151,8 @@ class AboutPage(QWidget):
         grid.addWidget(self.create_selectable_label(GITHUB), 0, 1)
         grid.addWidget(QLabel("邮箱:"), 1, 0)
         grid.addWidget(self.create_selectable_label(EMAIL), 1, 1)
+        grid.addWidget(QLabel("邮箱（Mac 版本）:"), 2, 0)
+        grid.addWidget(self.create_selectable_label(EMAIL_MAC), 2, 1)
 
         layout.addLayout(grid)
 

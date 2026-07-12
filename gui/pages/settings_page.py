@@ -20,12 +20,12 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QGroupBox, QSpinBox, QCheckBox,
-    QScrollArea, QFrame, QFileDialog, QInputDialog,
+    QScrollArea, QFrame, QFileDialog, QInputDialog, QComboBox,
 )
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 
-from gui.styles import COLORS
+from gui.styles import COLORS, THEME_CHOICES, THEME_LIGHT, normalize_theme
 from gui.widgets.elided_label import ElidedLabel
 
 APP_ROOT = Path(__file__).parent.parent.parent
@@ -33,8 +33,8 @@ DEFAULT_PRETRAINED_PATH = APP_ROOT / "pretrained"
 SAM_CONFIG_FILE = APP_ROOT / "config" / "sam_config.json"
 LLM_CONFIG_FILE = APP_ROOT / "config" / "llm_config.json"
 
-# 应用当前固定用浅色主题，仍按原键写回 QSettings
-THEME_NAME = "浅色主题"
+# 设置键与界面显示名
+THEME_SETTING_KEY = 'theme'
 
 # (设置键, 显示名, 默认键位)
 SHORTCUTS = [
@@ -196,6 +196,18 @@ class SettingsPage(QWidget):
         grid.addWidget(self._caption("自动保存:"), 0, 0)
         grid.addWidget(self.auto_save_enabled, 0, 1, 1, 2)
 
+        self.theme_combo = QComboBox()
+        for theme_key, label in THEME_CHOICES:
+            self.theme_combo.addItem(label, theme_key)
+        saved_theme = normalize_theme(self.settings.value(THEME_SETTING_KEY, THEME_LIGHT))
+        index = self.theme_combo.findData(saved_theme)
+        self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.theme_combo.setMaximumWidth(260)
+        self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
+        grid.addWidget(self._caption("外观:"), 1, 0)
+        grid.addWidget(self.theme_combo, 1, 1, 1, 2,
+                       Qt.AlignmentFlag.AlignLeft)
+
         self.auto_save_interval = QSpinBox()
         self.auto_save_interval.setRange(1, 60)
         self.auto_save_interval.setSuffix(" 分钟")
@@ -203,8 +215,8 @@ class SettingsPage(QWidget):
         self.auto_save_interval.setEnabled(self.auto_save_enabled.isChecked())
         self.auto_save_interval.setMaximumWidth(260)
         self.auto_save_interval.valueChanged.connect(self.mark_dirty)
-        grid.addWidget(self._caption("保存间隔:"), 1, 0)
-        grid.addWidget(self.auto_save_interval, 1, 1, 1, 2,
+        grid.addWidget(self._caption("保存间隔:"), 2, 0)
+        grid.addWidget(self.auto_save_interval, 2, 1, 1, 2,
                        Qt.AlignmentFlag.AlignLeft)
 
         self._pretrained_path_value = str(
@@ -212,15 +224,15 @@ class SettingsPage(QWidget):
         )
         self.pretrained_path = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
         self._refresh_pretrained_path_display()
-        grid.addWidget(self._caption("预训练模型:"), 2, 0)
-        grid.addWidget(self.pretrained_path, 2, 1)
+        grid.addWidget(self._caption("预训练模型:"), 3, 0)
+        grid.addWidget(self.pretrained_path, 3, 1)
 
         btn_browse = QPushButton("浏览…")
         btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_browse.clicked.connect(
             lambda: self.browse_path("pretrained_path", "选择预训练模型目录")
         )
-        grid.addWidget(btn_browse, 2, 2)
+        grid.addWidget(btn_browse, 3, 2)
 
         return group
 
@@ -412,6 +424,20 @@ class SettingsPage(QWidget):
     def mark_dirty(self, *_args):
         self.set_status("有改动还没保存，点「保存设置」写入。", 'warning')
 
+    def on_theme_changed(self, _index: int = None):
+        """外观切换后立即生效并写入设置。"""
+        theme_key = self.theme_combo.currentData() or THEME_LIGHT
+        self.settings.setValue(THEME_SETTING_KEY, theme_key)
+        self.theme_changed.emit(theme_key)
+        self.set_status(
+            f"已切换到{'暗色' if theme_key == 'dark' else '浅色'}外观。",
+            'success',
+        )
+
+    def refresh_theme(self):
+        """主题切换后刷新本页内联样式。"""
+        self.refresh_ai_status()
+
     def on_auto_save_toggled(self, checked: bool):
         self.auto_save_interval.setEnabled(checked)
         self.mark_dirty()
@@ -460,9 +486,9 @@ class SettingsPage(QWidget):
 
     def save_settings(self):
         """保存设置"""
-        # 保存主题（固定浅色）
-        self.settings.setValue("theme", THEME_NAME)
-        self.theme_changed.emit('light')
+        theme_key = self.theme_combo.currentData() or THEME_LIGHT
+        self.settings.setValue(THEME_SETTING_KEY, theme_key)
+        self.theme_changed.emit(theme_key)
 
         # 保存路径
         self.settings.setValue("pretrained_path", self._pretrained_path_value)
@@ -485,6 +511,12 @@ class SettingsPage(QWidget):
             self.settings.setValue(setting_key, default)
             self.shortcut_buttons[setting_key].setText(default)
 
-        self.theme_changed.emit('light')
+        light_index = self.theme_combo.findData(THEME_LIGHT)
+        if light_index >= 0:
+            self.theme_combo.blockSignals(True)
+            self.theme_combo.setCurrentIndex(light_index)
+            self.theme_combo.blockSignals(False)
+        self.settings.setValue(THEME_SETTING_KEY, THEME_LIGHT)
+        self.theme_changed.emit(THEME_LIGHT)
 
         self.set_status("已恢复默认值，路径和自动保存点「保存设置」后写入。", 'warning')

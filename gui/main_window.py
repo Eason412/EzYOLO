@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSettings, QSize, QPoint
 
-from gui.styles import get_full_stylesheet
+from gui.styles import get_full_stylesheet, apply_theme_to_app, normalize_theme
 from gui.workflow import (
     WORKFLOW_STEPS, STEP_BY_INDEX, PAGE_SETTINGS, PAGE_ABOUT,
     STEP_IMPORT, STEP_ANNOTATE, STEP_TRAIN, STEP_RESULT, STEP_TEST,
@@ -27,7 +27,7 @@ from gui.pages.annotate_page import AnnotatePage
 from gui.pages.train_page import TrainPage
 from gui.pages.result_page import ResultPage
 from gui.pages.test_page import TestPage
-from gui.pages.settings_page import SettingsPage
+from gui.pages.settings_page import SettingsPage, THEME_SETTING_KEY
 from gui.pages.about_page import AboutPage
 from models.database import db
 
@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EzYOLO - 本地YOLO训练全流程")
         self.setMinimumSize(1100, 720)
 
+        saved_theme = normalize_theme(
+            QSettings("EzYOLO", "Settings").value(THEME_SETTING_KEY, 'light')
+        )
+        apply_theme_to_app(saved_theme)
         self.setStyleSheet(get_full_stylesheet())
 
         central_widget = QWidget()
@@ -396,9 +400,22 @@ class MainWindow(QMainWindow):
         self.settings.setValue("pos", self.pos())
         self.settings.setValue("windowState", self.saveState())
 
-    def on_theme_changed(self, _theme_key=None):
-        """主题变化（应用只有一套浅色外观，重新套一遍样式表即可）"""
+    def on_theme_changed(self, theme_key=None):
+        """主题变化：刷新全局样式表，并让各页面重套内联颜色。"""
+        apply_theme_to_app(theme_key)
         self.setStyleSheet(get_full_stylesheet())
+
+        for page in (
+            self.import_page,
+            self.annotate_page,
+            self.train_page,
+            self.result_page,
+            self.test_page,
+            self.settings_page,
+        ):
+            refresh = getattr(page, 'refresh_theme', None)
+            if callable(refresh):
+                refresh()
 
     def closeEvent(self, event):
         """关闭事件：后台线程先停干净，再让窗口销毁。

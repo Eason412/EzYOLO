@@ -544,7 +544,11 @@ class ImportPage(QWidget):
         self.image_list.itemSelectionChanged.connect(self.update_manage_action_state)
         # 注意：这里不写 item 的 background-color，
         # 让代码里 setBackground 设的「已标注」底色能显示出来
-        self.image_list.setStyleSheet(f"""
+        self.image_list.setStyleSheet(self._image_list_stylesheet())
+        return self.image_list
+
+    def _image_list_stylesheet(self) -> str:
+        return f"""
             QListWidget {{
                 background-color: {COLORS['background']};
                 border: 1px solid {COLORS['border']};
@@ -560,8 +564,18 @@ class ImportPage(QWidget):
             QListWidget::item:selected {{
                 border: 1px solid {COLORS['primary']};
             }}
-        """)
-        return self.image_list
+        """
+
+    def refresh_theme(self):
+        """主题切换后刷新列表与状态色。"""
+        if hasattr(self, 'image_list'):
+            self.image_list.setStyleSheet(self._image_list_stylesheet())
+        if hasattr(self, 'status_annotated'):
+            self.status_annotated.setStyleSheet(f"color: {COLORS['success']};")
+        if hasattr(self, 'status_pending'):
+            self.status_pending.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        if hasattr(self, 'image_list') and hasattr(self, 'images'):
+            self._refresh_item_labels()
 
     def _refresh_image_display_names(self):
         """整批算显示名：抽帧出来的图叫「帧 223」，重名的才补区分信息。

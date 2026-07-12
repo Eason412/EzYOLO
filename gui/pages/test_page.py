@@ -1458,6 +1458,7 @@ class TestPage(QWidget):
 
     def _set_status(self, text: str, kind: str = "normal"):
         """运行区那行状态：就绪 / 运行中 / 成功 / 失败，用颜色区分。"""
+        self._last_status_kind = kind
         color = {
             "normal": COLORS['text_secondary'],
             "running": COLORS['accent_text'],
@@ -1977,6 +1978,25 @@ class TestPage(QWidget):
         if thread is not None and thread.isRunning():
             thread.stop()
             thread.wait(5000)
+
+    def refresh_theme(self):
+        """主题切换后刷新预览区与状态色。"""
+        viewer = getattr(self, 'image_viewer', None)
+        if viewer is not None and hasattr(viewer, 'image_label'):
+            viewer.image_label.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {COLORS['sidebar']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 4px;
+                }}
+            """)
+            if hasattr(viewer, 'info_label'):
+                viewer.info_label.setStyleSheet(
+                    f"color: {COLORS['text_secondary']}; font-size: 12px;"
+                )
+        if hasattr(self, 'status_label'):
+            kind = getattr(self, '_last_status_kind', 'normal')
+            self._set_status(self.status_label.text(), kind)
 
     def on_progress_updated(self, current: int, total: int):
         """进度更新"""

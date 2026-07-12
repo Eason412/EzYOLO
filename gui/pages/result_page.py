@@ -448,6 +448,14 @@ class PreviewPane(QWidget):
         )
         layout.addWidget(self.image_label, 1)
 
+    def refresh_theme(self):
+        self.image_label.setStyleSheet(
+            f"background-color: {COLORS['inset']};"
+            f"border: 1px solid {COLORS['border']};"
+            f"border-radius: {RADIUS_SM}px;"
+            f"color: {COLORS['text_secondary']};"
+        )
+
     def set_images(self, images: List[Tuple[str, str]]):
         """images: [(显示名, 绝对路径)]，按调用方给的顺序显示。"""
         self._images = images
@@ -1054,6 +1062,7 @@ class ResultPage(QWidget):
             return str(path)
 
     def _set_export_status(self, text: str, state: str = 'idle'):
+        self._export_status_state = state
         color = {
             'idle': COLORS['text_secondary'],
             'busy': COLORS['text_secondary'],
@@ -1247,6 +1256,24 @@ class ResultPage(QWidget):
         except Exception as e:
             self._end_export(f"导出失败：{e}", 'error')
             QMessageBox.warning(self, "错误", f"导出出错: {str(e)}")
+
+    def refresh_theme(self):
+        """主题切换后刷新预览区与导出状态色。"""
+        for pane in (
+            getattr(self, 'chart_pane', None),
+            getattr(self, 'pred_pane', None),
+            getattr(self, 'other_pane', None),
+        ):
+            refresh = getattr(pane, 'refresh_theme', None)
+            if callable(refresh):
+                refresh()
+        if hasattr(self, 'export_status'):
+            state = getattr(self, '_export_status_state', 'idle')
+            self._set_export_status(self.export_status.text(), state)
+        if hasattr(self, 'model_info') and self.model_info.text().startswith("没有在"):
+            self.model_info.setStyleSheet(f"color: {COLORS['warning']};")
+        elif hasattr(self, 'model_info'):
+            self.model_info.setStyleSheet("")
 
 
 if __name__ == "__main__":

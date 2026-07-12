@@ -6,7 +6,7 @@ EzYOLO 样式定义
 页面通过 objectName 声明「这是什么」，样式在这里统一给出，
 避免每个页面各写一份内联 QSS。
 
-外观基调：浅色、克制、层级靠留白和字重拉开，而不是靠色块和粗边框。
+外观基调：浅色 / 暗色两套令牌，克制、层级靠留白和字重拉开，而不是靠色块和粗边框。
 表面只有三层——画布（background）、卡片（panel）、控件（inset）；
 彩色只留给「主操作」和「状态」。
 
@@ -24,15 +24,22 @@ EzYOLO 样式定义
 """
 
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 # ==================== 颜色令牌 ====================
+
+THEME_LIGHT = 'light'
+THEME_DARK = 'dark'
+THEME_CHOICES = (
+    (THEME_LIGHT, '浅色'),
+    (THEME_DARK, '暗色'),
+)
 
 # 语义色有「文字版」和「填充版」两套：
 # 同一个亮色在浅底上当填充好看，当小字就糊了（#34C759 在白底上对比度只有 2:1）。
 # 页面里 COLORS['success'] / ['error'] / ['warning'] 绝大多数是拿去当 color: 用的，
 # 所以这三个键给可读的深色版，亮色版另存 *_fill，只用在圆点、进度条这类填充上。
-COLORS = {
+LIGHT_COLORS: Dict[str, str] = {
     # 表面：画布 → 侧栏 → 卡片 → 控件
     'background': '#F5F5F7',   # 页面画布
     'sidebar': '#EFEFF2',      # 左侧导航，比画布再灰一点
@@ -69,6 +76,93 @@ COLORS = {
     'text_secondary': '#6E6E73',
     'text_disabled': '#AEAEB2',
 }
+
+DARK_COLORS: Dict[str, str] = {
+    # 表面：深灰分层，避免纯黑刺眼
+    'background': '#1C1C1E',
+    'sidebar': '#242426',
+    'panel': '#2C2C2E',
+    'inset': '#3A3A3C',
+    'track': '#48484A',
+    'hover': '#3A3A3C',
+    'selected': '#1A3A5C',
+
+    'border': '#3A3A3C',
+    'border_strong': '#545456',
+
+    'primary': '#0A84FF',
+    'primary_hover': '#409CFF',
+    'primary_pressed': '#0066CC',
+    'accent_text': '#64B5FF',
+    'secondary': '#98989D',
+
+    # 暗底上文字版语义色要更亮
+    'success': '#30D158',
+    'success_soft': '#1E3A28',
+    'warning': '#FFD60A',
+    'error': '#FF453A',
+
+    'success_fill': '#30D158',
+    'warning_fill': '#FF9F0A',
+    'error_fill': '#FF453A',
+
+    'text_primary': '#F5F5F7',
+    'text_secondary': '#98989D',
+    'text_disabled': '#636366',
+}
+
+# 当前生效的调色板；页面里 `from gui.styles import COLORS` 后读到的始终是这一套。
+COLORS: Dict[str, str] = dict(LIGHT_COLORS)
+_current_theme = THEME_LIGHT
+
+
+def normalize_theme(theme: str) -> str:
+    """把设置里存的值规范成 'light' 或 'dark'。"""
+    key = (theme or '').strip().lower()
+    if key in (THEME_DARK, 'dark', '暗色', '暗色主题', '深色', '深色主题'):
+        return THEME_DARK
+    return THEME_LIGHT
+
+
+def get_theme() -> str:
+    """返回当前主题键。"""
+    return _current_theme
+
+
+def set_theme(theme: str) -> str:
+    """切换活动调色板（原地更新 COLORS，已有引用自动跟上）。"""
+    global _current_theme
+    _current_theme = normalize_theme(theme)
+    palette = DARK_COLORS if _current_theme == THEME_DARK else LIGHT_COLORS
+    COLORS.clear()
+    COLORS.update(palette)
+    return _current_theme
+
+
+def get_full_stylesheet(theme: str = None) -> str:
+    """根据主题生成完整样式表。theme 省略时使用当前主题。"""
+    if theme is not None:
+        palette = DARK_COLORS if normalize_theme(theme) == THEME_DARK else LIGHT_COLORS
+        return generate_stylesheet(palette)
+    return generate_stylesheet(COLORS)
+
+
+def apply_theme_to_app(theme: str = None) -> str:
+    """切换主题并套到 QApplication（若已创建）。"""
+    if theme is not None:
+        set_theme(theme)
+    else:
+        set_theme(_current_theme)
+
+    try:
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(get_full_stylesheet())
+    except Exception:
+        pass
+    return _current_theme
 
 # ==================== 尺寸令牌 ====================
 
@@ -929,9 +1023,3 @@ QScrollBar::add-page, QScrollBar::sub-page {{
 """
 
 
-def get_full_stylesheet(theme: str = 'light') -> str:
-    """获取完整样式表。
-
-    应用只有一套浅色外观；theme 参数保留是为了兼容既有调用点。
-    """
-    return generate_stylesheet(COLORS)
