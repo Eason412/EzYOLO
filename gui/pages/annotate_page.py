@@ -2751,13 +2751,7 @@ class AnnotatePage(QWidget):
         self.task_combo.addItems(["detect", "segment", "pose", "classify"])
         self.task_combo.setFixedWidth(128)
         self.task_combo.setMinimumHeight(TOOLBAR_BUTTON_HEIGHT)
-        self.task_combo.setToolTip(
-            "决定用什么形状标注：\n"
-            "detect 检测 = 画矩形框\n"
-            "segment 分割 = 画多边形\n"
-            "pose 姿态 = 点关键点\n"
-            "classify 分类 = 整张图给一个类别"
-        )
+        self.task_combo.setToolTip("标注方式：决定画框/多边形/关键点/整图分类")
         self.task_combo.currentTextChanged.connect(self.on_task_changed)
 
         # 工具栏直接落在顶栏的值行，不再占画布上方的一整行。
@@ -3399,17 +3393,12 @@ class AnnotatePage(QWidget):
 
         if usage_mode == "memory" and sam_type in ("SAM2", "SAM3"):
             self.btn_sam.setText("SAM 记忆标注")
-            self.btn_sam.setToolTip(
-                "先教它认一次目标（更新记忆），之后就能自动标同类目标\n"
-                "菜单：更新记忆 / 清空记忆 / 单张推理 / 批量推理"
-            )
+            self.btn_sam.setToolTip("SAM 记忆标注：先教一次，之后自动标同类")
             self.btn_sam.setMenu(self.create_sam_memory_menu())
             set_menu_indicator(self.btn_sam, True)
         else:
             self.btn_sam.setText("SAM 交互分割")
-            self.btn_sam.setToolTip(
-                "在目标上点一下，SAM 自动分割出它的轮廓\n需要先在「用已有模型标注 → 设置」里配好 SAM 模型"
-            )
+            self.btn_sam.setToolTip("点目标自动分割轮廓")
             self.btn_sam.clicked.connect(self.start_sam_annotation)
         self.refresh_toolbar_button_layout()
 
@@ -3542,7 +3531,7 @@ class AnnotatePage(QWidget):
 
         # 已有 YOLO 权重 → 自动画框
         self.btn_auto_label = QPushButton("用已有模型标注")
-        self.btn_auto_label.setToolTip("用一个已经训练好的 .pt 模型自动标注\n菜单：设置 / 标注当前图片 / 批量标注…")
+        self.btn_auto_label.setToolTip("用已训练模型自动标注")
         self._attach_action_menu(self.btn_auto_label, self.create_auto_label_menu())
 
         # SAM：点一下就分割（文本和菜单由 apply_sam_button_mode 按设置决定）
@@ -3550,7 +3539,7 @@ class AnnotatePage(QWidget):
 
         # 多模态大模型
         self.btn_llm_label = QPushButton("大模型标注")
-        self.btn_llm_label.setToolTip("用多模态大模型识别图片里的目标\n菜单：设置 / 标注当前图片 / 批量标注…")
+        self.btn_llm_label.setToolTip("用多模态大模型识别目标")
         self._attach_action_menu(self.btn_llm_label, self.create_llm_menu())
 
         # 批处理不在这里：它不是「让模型帮你标」，是按像素点批量改图，
