@@ -2619,17 +2619,43 @@ class AnnotatePage(QWidget):
         self.init_ui()
 
     def shutdown(self):
-        """关窗前收工：正在跑的 LLM 线程先请它停，再等它退出。
+        """关窗前收工：先把两边的取消旗都插上，再挨个等线程退出。
 
-        QThread 对象在 run() 还没结束时被销毁会直接崩；等待给上限，
-        不让一个卡住的网络请求把整个退出流程拖死。
+        QThread 对象在 run() 还没结束时被销毁会直接崩。这里以前只管 LLM：
+        YOLO 批量推理跑着的时候关窗，BatchLabelingManager 跟着页面一起没了，
+        它手上那个还在跑的线程正好撞在这个崩点上。
+
+        先取消、后等待，是因为「取消」都是放个标志就返回，「等待」才真堵着：
+        两边的取消一起发出去，谁先退出都行；反过来先站在 LLM 那儿等满 5 秒，
+        YOLO 线程这 5 秒里还在一张张往下推图，白跑。
+
+        两种等待的性质不一样，各按各的来：LLM 是网络请求，可能吊死，所以等待
+        给 5 秒上限，不让它把退出流程拖住；YOLO 是本地推理，不会吊死，但停不到
+        半张图上——**当前这张必须先跑完，manager.cleanup() 会一直等到它返回**，
+        所以正在跑大图时关窗，可能要多等一张图的推理时间。
+
+        可以重复调用：没有 manager、线程已经退了，都走空路径。
         """
-        workers = [self.llm_batch_worker, self.llm_worker, *self._retired_llm_workers]
-        for worker in workers:
+        manager = getattr(self, 'batch_labeling_manager', None)
+        llm_workers = [self.llm_batch_worker, self.llm_worker, *self._retired_llm_workers]
+
+        # 第一步：只发取消，一个都不等
+        if manager is not None:
+            manager.request_cancel()
+        for worker in llm_workers:
             if worker is None or not worker.isRunning():
                 continue
             if hasattr(worker, 'cancel'):
                 worker.cancel()
+
+        # 第二步：等 YOLO 线程真的退出（cleanup 里 stop + wait），顺带卸掉模型
+        if manager is not None:
+            manager.cleanup()
+
+        # 第三步：等 LLM 线程退出
+        for worker in llm_workers:
+            if worker is None or not worker.isRunning():
+                continue
             worker.wait(5000)
 
     def refresh_theme(self):
