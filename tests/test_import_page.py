@@ -22,12 +22,14 @@ import sys
 import time
 import tempfile
 from pathlib import Path
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
-from PyQt6.QtGui import QImage, QColor
-from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtGui import QImage, QColor, QIcon
+from PyQt6.QtWidgets import QFileDialog, QLabel
 
+import models.database as database_module
 from gui.pages.import_page import ImportPage, short_task_label
 from gui.main_window import MainWindow
 from gui.workflow import PAGE_SETTINGS, STEP_IMPORT
@@ -689,6 +691,475 @@ def test_import_busy_blocks_destruction_but_still_allows_moving_selected_images(
 
     assert page.action_clear.isEnabled(), "导入结束后要恢复"
     assert page.action_delete_project.isEnabled()
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+# ==================== 缩略图上的标注框预览 ====================
+# 用户要的是：不进标注页，光看导入页就知道哪张图标了什么位置。
+# 下面盯四件事——框画出来了、开关立刻生效且不动数据、600 张不做 N+1、
+# 标注改了缩略图要跟着变（而且只变改过的那几张）。
+
+_RED = '#FF0000'
+_GREEN = '#00FF00'
+
+_BOX_CLASSES = [
+    {'id': 0, 'name': '人', 'color': _RED},
+    {'id': 1, 'name': '车', 'color': _GREEN},
+]
+
+
+def _make_box_project() -> int:
+    return _bootstrap.create_temp_project(
+        name="标注框预览项目", project_type="detect", classes=_BOX_CLASSES,
+    )
+
+
+def _seed_image_with_boxes(project_id, folder: Path, name: str,
+                           size=(40, 20), boxes=()) -> tuple:
+    """造一张真图片 + 若干 bbox，返回 (image_id, storage_path, [标注 id])。
+
+    尺寸默认用 40x20 的横图：非等比缩放到 160x160 时 x/y 比例不同，
+    框要是算错了，这种图最先露馅。
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    image = QImage(size[0], size[1], QImage.Format.Format_RGB888)
+    image.fill(QColor(250, 250, 250))
+    image.save(str(path))
+
+    image_id = db.add_image(
+        project_id, name, str(path), width=size[0], height=size[1],
+    )
+    annotation_ids = [
+        db.add_annotation(
+            image_id=image_id, project_id=project_id, class_id=class_id,
+            class_name=f"类{class_id}", annotation_type='bbox', data=box,
+        )
+        for class_id, box in boxes
+    ]
+    return image_id, str(path), annotation_ids
+
+
+def _loaded_page(project_id) -> ImportPage:
+    """建页面并等缩略图后台线程真的跑完。"""
+    page = ImportPage()
+    page.set_project(project_id)
+    assert _pump_until(lambda: page.load_worker is None), "缩略图加载没有在超时时间内结束"
+    return page
+
+
+def _icon_image(page: ImportPage, row: int = 0,
+                mode: QIcon.Mode = QIcon.Mode.Normal) -> QImage:
+    icon = page.image_list.item(row).icon()
+    return icon.pixmap(QSize(160, 160), mode, QIcon.State.Off).toImage()
+
+
+def _base_image(page: ImportPage, storage_path: str) -> QImage:
+    """缓存里那张「没有框」的底图。"""
+    return page.thumbnail_cache[storage_path].toImage()
+
+
+def _rows_by_image_id(page: ImportPage) -> dict:
+    return {
+        page.image_list.item(i).data(Qt.ItemDataRole.UserRole): i
+        for i in range(page.image_list.count())
+    }
+
+
+def _color_count(image: QImage, color: str) -> int:
+    target = QColor(color).rgb()
+    return sum(
+        1
+        for y in range(image.height())
+        for x in range(image.width())
+        if image.pixel(x, y) == target
+    )
+
+
+@contextmanager
+def _traced_sql(statements: list):
+    """把这段时间里真正执行过的 SQL 全部记下来，用来证明「没有 N+1」。"""
+    real_get_connection = database_module.Database.get_connection
+
+    @contextmanager
+    def traced(self):
+        with real_get_connection(self) as conn:
+            conn.set_trace_callback(statements.append)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+
+    with patch.object(database_module.Database, "get_connection", traced):
+        yield statements
+
+
+def test_thumbnails_draw_existing_boxes_by_default():
+    """默认就画框：缩略图跟底图不一样，而且用的是项目类别的颜色。"""
+    project_id = _make_box_project()
+    _image_id, path, _ = _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_default", "one_box.jpg",
+        size=(40, 20), boxes=[(0, {'x': 10, 'y': 5, 'width': 20, 'height': 10})],
+    )
+
+    page = _loaded_page(project_id)
+
+    assert page.chk_show_boxes.isChecked(), "「显示标注框」默认就该是开着的"
+
+    base = _base_image(page, path)
+    shown = _icon_image(page)
+
+    assert shown != base, "缩略图上没有画出标注框"
+    assert _color_count(base, _RED) == 0, "底图本身不该带框——那是缓存要复用的原图"
+    assert _color_count(shown, _RED) > 0, "框没有用项目类别配的红色"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_multiple_classes_keep_their_own_colours_on_one_thumbnail():
+    """一张图里两个类别：两种颜色，同类恒定同色。"""
+    project_id = _make_box_project()
+    _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_multi", "two_boxes.jpg",
+        size=(40, 20),
+        boxes=[
+            (0, {'x': 2, 'y': 2, 'width': 14, 'height': 8}),
+            (1, {'x': 22, 'y': 8, 'width': 14, 'height': 10}),
+        ],
+    )
+
+    page = _loaded_page(project_id)
+    shown = _icon_image(page)
+
+    assert _color_count(shown, _RED) > 0, "类别 0 的红框没画出来"
+    assert _color_count(shown, _GREEN) > 0, "类别 1 的绿框没画出来"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_unannotated_image_gets_no_empty_box():
+    """没标注的图不画空框——缩略图就该是原图本身。"""
+    project_id = _make_box_project()
+    paths = _make_images(_TMP_DIR / "boxes_none", 1)
+    db.add_image(project_id, Path(paths[0]).name, paths[0], width=32, height=32)
+
+    page = _loaded_page(project_id)
+
+    assert _icon_image(page) == _base_image(page, paths[0]), "没标注的图被画上了东西"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_toggle_switches_thumbnails_immediately_without_touching_annotations():
+    """开关立刻换图；不写数据库，也不再去读一次磁盘。"""
+    project_id = _make_box_project()
+    image_id, path, _ = _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_toggle", "toggle.jpg",
+        size=(40, 20), boxes=[(0, {'x': 10, 'y': 5, 'width': 20, 'height': 10})],
+    )
+
+    page = _loaded_page(project_id)
+
+    base = _base_image(page, path)
+    with_boxes = _icon_image(page)
+    assert with_boxes != base
+
+    annotations_before = db.get_image_annotations(image_id)
+    version_before = db.get_project_annotation_versions(project_id)
+
+    # 关掉：同一次调用里就要换成没框的图，不能等下一轮事件循环
+    with patch("gui.pages.import_page.cv2.imread") as imread:
+        page.chk_show_boxes.setChecked(False)
+
+        assert _icon_image(page) == base, "关掉开关后缩略图上还有框"
+        assert page.show_annotation_boxes is False
+
+        # 再开回来
+        page.chk_show_boxes.setChecked(True)
+        assert _icon_image(page) == with_boxes, "开回来之后框没有回来"
+
+        assert imread.call_count == 0, "切开关不该重新读磁盘——底图缓存里就有"
+
+    assert page.load_worker is None, "切开关不该起后台加载线程"
+
+    # 标注一个字节都不许动
+    assert db.get_image_annotations(image_id) == annotations_before, "开关改动了标注数据"
+    assert db.get_project_annotation_versions(project_id) == version_before
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_box_previews_are_read_in_one_batched_query():
+    """600 张图不能查 600 次库：整批一次查完。"""
+    project_id = _make_box_project()
+    folder = _TMP_DIR / "boxes_batch"
+    for i in range(5):
+        _seed_image_with_boxes(
+            project_id, folder, f"batch_{i}.jpg",
+            size=(40, 20), boxes=[(0, {'x': 4, 'y': 4, 'width': 10, 'height': 8})],
+        )
+
+    statements = []
+    with _traced_sql(statements):
+        previews = db.get_project_bbox_previews(project_id)
+
+    selects = [s for s in statements if s.strip().upper().startswith("SELECT")]
+    assert len(selects) == 1, f"读框应该只查一次，实际查了 {len(selects)} 次：{selects}"
+    assert len(previews) == 5, "5 张图的框都要按 image_id 分好组回来"
+    assert all(len(boxes) == 1 for boxes in previews.values())
+
+    statements.clear()
+    with _traced_sql(statements):
+        versions = db.get_project_annotation_versions(project_id)
+
+    selects = [s for s in statements if s.strip().upper().startswith("SELECT")]
+    assert len(selects) == 1, f"读版本号也只该查一次，实际 {len(selects)} 次"
+    assert len(versions) == 5
+
+    db.delete_project(project_id)
+
+
+def test_loading_the_page_does_not_query_annotations_once_per_image():
+    """页面加载时对 annotations 表的查询次数跟图片数量无关（N+1 回归防线）。"""
+    project_id = _make_box_project()
+    folder = _TMP_DIR / "boxes_no_n_plus_one"
+    for i in range(6):
+        _seed_image_with_boxes(
+            project_id, folder, f"n1_{i}.jpg",
+            size=(40, 20), boxes=[(0, {'x': 4, 'y': 4, 'width': 10, 'height': 8})],
+        )
+
+    page = ImportPage()
+
+    statements = []
+    with _traced_sql(statements):
+        page.set_project(project_id)
+
+    annotation_queries = [s for s in statements if 'FROM annotations' in s]
+    assert len(annotation_queries) == 2, (
+        f"6 张图应该只查 2 次 annotations（框 + 版本号），实际 {len(annotation_queries)} 次；"
+        "逐图查就是 N+1"
+    )
+
+    _pump_until(lambda: page.load_worker is None)
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_annotation_version_changes_when_a_box_moves_but_the_count_does_not():
+    """框数没变、框挪了位置：版本号必须变，否则缩略图会一直停在旧框上。"""
+    project_id = _make_box_project()
+    image_id, _path, annotation_ids = _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_version", "version.jpg",
+        size=(40, 20), boxes=[(0, {'x': 1, 'y': 1, 'width': 5, 'height': 5})],
+    )
+
+    before = db.get_project_annotation_versions(project_id)[image_id]
+
+    db.update_annotation(annotation_ids[0], data={'x': 20, 'y': 10, 'width': 15, 'height': 8})
+
+    after = db.get_project_annotation_versions(project_id)[image_id]
+
+    assert before[0] == after[0] == 1, "这次改动没有增减框，框数应该一样"
+    assert before != after, "框内容变了但版本号没变——缓存永远不会失效"
+
+    # 换类别（颜色会变）同样要能被看见
+    changed_class = db.get_project_annotation_versions(project_id)[image_id]
+    db.update_annotation(annotation_ids[0], class_id=1, class_name="车")
+    assert db.get_project_annotation_versions(project_id)[image_id] != changed_class
+
+    db.delete_project(project_id)
+
+
+def test_editing_one_box_refreshes_only_that_thumbnail():
+    """改一张图的标注：只有那一张重画，别的图连缓存都不碰，也不重新读盘。
+
+    这条同时钉死「变更签名不能只看 status」——两张图从头到尾都是 annotated，
+    只比 status 的话这里什么都不会刷新。
+    """
+    project_id = _make_box_project()
+    folder = _TMP_DIR / "boxes_partial_refresh"
+    image_a, _path_a, ann_a = _seed_image_with_boxes(
+        project_id, folder, "edit_me.jpg",
+        size=(40, 20), boxes=[(0, {'x': 2, 'y': 2, 'width': 10, 'height': 8})],
+    )
+    image_b, _path_b, _ann_b = _seed_image_with_boxes(
+        project_id, folder, "leave_me.jpg",
+        size=(40, 20), boxes=[(0, {'x': 2, 'y': 2, 'width': 10, 'height': 8})],
+    )
+
+    page = _loaded_page(project_id)
+
+    row_of = _rows_by_image_id(page)
+    a_before = _icon_image(page, row_of[image_a])
+    cached_a_before = page._overlay_cache[image_a][1]
+    cached_b_before = page._overlay_cache[image_b][1]
+
+    statuses_before = {img['id']: img['status'] for img in db.get_project_images(project_id)}
+
+    # 在标注页把 A 的框拖到别处——图片状态还是 annotated，只有框动了
+    db.update_annotation(ann_a[0], data={'x': 24, 'y': 9, 'width': 14, 'height': 10})
+
+    statuses_after = {img['id']: img['status'] for img in db.get_project_images(project_id)}
+    assert statuses_before == statuses_after == {image_a: 'annotated', image_b: 'annotated'}, \
+        "前提没成立：这次改动本来就不该改变图片状态"
+
+    # 主窗口从标注页切回导入页时调的就是这个
+    page.refresh_project_images()
+
+    assert page.load_worker is None, "重画框不该再去读一次磁盘"
+
+    row_of = _rows_by_image_id(page)
+    a_after = _icon_image(page, row_of[image_a])
+
+    assert a_after != a_before, "A 的框改了，缩略图却没跟着变"
+    assert page._overlay_cache[image_a][1] is not cached_a_before, "A 应该被重画"
+    assert page._overlay_cache[image_b][1] is cached_b_before, \
+        "B 的标注没动，不该被重画——标注变化只失效受影响的图片"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_recolouring_a_class_recolours_its_boxes():
+    """把类别的颜色改了：标注一个字节没动，但缩略图上的框得跟着换色。
+
+    「同一类别始终同色」是跨页面的约定——标注页看到红框，回到导入页不能还是旧颜色。
+    """
+    project_id = _make_box_project()
+    _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_recolour", "recolour.jpg",
+        size=(40, 20), boxes=[(0, {'x': 10, 'y': 5, 'width': 20, 'height': 10})],
+    )
+
+    page = _loaded_page(project_id)
+    assert _color_count(_icon_image(page), _RED) > 0, "前提：现在是红框"
+
+    # 在标注页把「人」从红改成绿；标注本身没动
+    db.update_project(project_id, classes=[
+        {'id': 0, 'name': '人', 'color': _GREEN},
+        {'id': 1, 'name': '车', 'color': _RED},
+    ])
+
+    page.refresh_project_images()
+
+    shown = _icon_image(page)
+    assert _color_count(shown, _GREEN) > 0, "类别改成绿色了，框却没换色"
+    assert _color_count(shown, _RED) == 0, "旧的红框还留在缩略图上"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_show_boxes_toggle_never_overlaps_the_filter_label():
+    """「显示标注框」不能压在「筛选」上。
+
+    这个 bug 只在**完整样式表**下出现：样式表把 QCheckBox::indicator 从 14px 撑到
+    17px，可样式是级联下来的，工具栏布局早在那之前就按「没上样式」的 88px 量好了
+    槽宽并定死了「筛选」的位置；勾选框随后在那个槽里居中撑开，右边溢出的部分正好
+    压到「筛选」上。所以这条测试必须先 setStyleSheet，否则什么都测不出来
+    ——之前就是漏了这一步才没拦住。
+
+    勾选框现在装在一个定宽的壳里，比较位置要换算到工具栏坐标系。
+    """
+    from gui.styles import get_full_stylesheet
+
+    project_id = _make_box_project()
+
+    for width, height in ((1280, 720), (1440, 900), (1920, 1080)):
+        page = ImportPage()
+        page.setStyleSheet(get_full_stylesheet('light'))  # 缺了这行等于没测
+        page.set_project(project_id)
+        page.resize(width, height)
+        page.show()
+        _app.processEvents()
+
+        chk = page.chk_show_boxes
+        filter_label = next(
+            w for w in page.toolbar.findChildren(QLabel) if w.text() == "筛选"
+        )
+
+        chk_rect = chk.rect().translated(
+            chk.mapTo(page.toolbar, chk.rect().topLeft())
+        )
+
+        assert chk_rect.right() < filter_label.geometry().left(), (
+            f"{width}x{height}: 「显示标注框」压到了「筛选」上 "
+            f"(右边 {chk_rect.right()} >= 筛选左边 {filter_label.geometry().left()})"
+        )
+
+        # 上面这条几何断言只有在真实平台（cocoa）上才抓得到——离屏平台的原生
+        # indicator 尺寸恰好和样式表一致，压根不会重叠。所以再钉一条与平台无关的：
+        # 勾选框必须待在一个定宽的壳里，而且壳要装得下它上完样式后的真实宽度。
+        # 壳一旦被拿掉（勾选框直接进工具栏布局），这条立刻翻。
+        holder = chk.parentWidget()
+        assert holder is not page.toolbar, \
+            "勾选框必须装在自己的定宽壳里，不能直接进工具栏布局"
+        assert holder.minimumWidth() == holder.maximumWidth(), \
+            "壳必须是定宽的：宽度不定死，布局就会拿样式级联之前的旧尺寸排位置"
+        assert holder.width() >= chk.sizeHint().width(), (
+            f"{width}x{height}: 壳 {holder.width()}px 装不下上完样式的勾选框 "
+            f"{chk.sizeHint().width()}px"
+        )
+
+        # 顺带守住：不能为了不重叠就把右边的控件挤出工具栏
+        toolbar_layout = page.toolbar.layout()
+        last = toolbar_layout.itemAt(toolbar_layout.count() - 1).widget()
+        inner_right = page.toolbar.width() - toolbar_layout.contentsMargins().right()
+        assert last.geometry().right() <= inner_right, (
+            f"{width}x{height}: 最右边的控件被挤出工具栏了"
+        )
+
+        page.stop_image_loading()
+        page.close()
+
+    db.delete_project(project_id)
+
+
+def test_selected_thumbnail_is_not_tinted_blue():
+    """选中态只用卡片边框，不给图片蒙一层蓝——那层蓝正好把框压得看不清。"""
+    project_id = _make_box_project()
+    _seed_image_with_boxes(
+        project_id, _TMP_DIR / "boxes_selected", "selected.jpg",
+        size=(40, 20), boxes=[(0, {'x': 10, 'y': 5, 'width': 20, 'height': 10})],
+    )
+
+    page = _loaded_page(project_id)
+
+    normal = _icon_image(page, 0, QIcon.Mode.Normal)
+    selected = _icon_image(page, 0, QIcon.Mode.Selected)
+    active = _icon_image(page, 0, QIcon.Mode.Active)
+
+    assert selected == normal, "选中态的缩略图被 QIcon 刷上了一层蓝"
+    assert active == normal, "hover 态也不该改变缩略图"
+
+    page.stop_image_loading()
+    db.delete_project(project_id)
+
+
+def test_importing_annotations_makes_boxes_appear_without_a_manual_refresh():
+    """标注是导进来的（YOLO/COCO/VOC）时，缩略图也要跟着出现框。"""
+    project_id = _make_box_project()
+    paths = _make_images(_TMP_DIR / "boxes_after_import", 1)
+    image_id = db.add_image(project_id, Path(paths[0]).name, paths[0], width=32, height=32)
+
+    page = _loaded_page(project_id)
+    assert _icon_image(page) == _base_image(page, paths[0]), "前提：现在还没有框"
+
+    db.add_annotation(
+        image_id=image_id, project_id=project_id, class_id=0, class_name="人",
+        annotation_type='bbox', data={'x': 4, 'y': 4, 'width': 20, 'height': 20},
+    )
+
+    page.refresh_project_images()
+
+    assert _color_count(_icon_image(page), _RED) > 0, "新导入的标注没有出现在缩略图上"
 
     page.stop_image_loading()
     db.delete_project(project_id)
