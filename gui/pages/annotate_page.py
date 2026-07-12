@@ -39,7 +39,9 @@ import random
 import sys
 
 from gui.styles import COLORS, RADIUS_SM, get_primary_font_family, set_menu_indicator
-from gui.display_names import display_name, display_names
+from gui.display_names import (
+    build_project_display_names, display_name, display_names, parse_display_name_rule,
+)
 from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.context_help import ContextHelp
 from models.database import db
@@ -4096,26 +4098,39 @@ class AnnotatePage(QWidget):
         pass
     
     def _refresh_image_display_names(self):
-        """整个列表一起算显示名：重名的（两段视频抽到同一个帧号）才需要补区分信息，
-        所以必须整批算，不能一张一张各算各的。"""
-        aliases = display_names([img.get('filename', '') for img in self.images])
+        """整个列表一起算显示名：按项目的显示名称规则来（默认等价于旧的「帧号化名」逻辑）。
+        重名/编号是否独一份只有看全列表才知道，所以必须整批算，不能一张一张各算各的。"""
+        project = db.get_project(self.current_project_id) if self.current_project_id else None
+        rule = parse_display_name_rule((project or {}).get('display_name_rule'))
+        project_name = (project or {}).get('name', '')
+        try:
+            aliases = build_project_display_names(rule, self.images, project_name)
+        except ValueError:
+            # 规则本该在保存前就校验过全量图片；万一还是生成失败，退回「保留原名」，
+            # 不能让整页刷不出来。
+            aliases = display_names([img.get('filename', '') for img in self.images])
         self._image_display_names = {
             img['id']: alias for img, alias in zip(self.images, aliases)
         }
 
     def _image_display_name(self, image: Dict) -> str:
-        """列表里显示的名字：抽帧名念成「帧 223」，普通文件名原样。"""
+        """列表里显示的名字：按项目规则来（默认抽帧名念成「帧 223」，普通文件名原样）。"""
         cached = getattr(self, '_image_display_names', {}).get(image['id'])
         return cached or display_name(image.get('filename', ''))
 
     def _image_tooltip(self, image: Dict) -> str:
-        """完整文件名和分辨率不丢，只是从列表挪进了提示里。"""
-        filename = image.get('filename', '')
-        width = image.get('width', 0)
-        height = image.get('height', 0)
-        if width and height:
-            return f"{filename}\n{width}x{height}"
-        return filename
+        """完整文件名、分辨率、来源路径不丢——显示名可能被规则改写得完全认不出，
+        这里必须永远留一个能找到真实文件的地方。某项元数据缺失时只把那一项换成
+        「未知/未记录」，不能整行消失，否则会被当成软件漏读了数据。"""
+        width = image.get('width')
+        height = image.get('height')
+        resolution = f"{width}x{height}" if width and height else "未知"
+        original_path = image.get('original_path') or "未记录"
+        return "\n".join([
+            image.get('filename', ''),
+            f"分辨率: {resolution}",
+            f"来源: {original_path}",
+        ])
 
     def update_image_list_display(self):
         """更新图片列表显示"""
@@ -4139,6 +4154,14 @@ class AnnotatePage(QWidget):
 
             # 图片的已标注状态变了，进度也要跟着变
             self.update_status_bar()
+
+    def on_display_name_rule_changed(self, project_id: int):
+        """导入页改了这个项目的显示名称规则：只重刷列表文字/tooltip 和顶部信息条，
+        不重新加载画布、不碰当前选中的图片和标注状态。"""
+        if project_id != self.current_project_id:
+            return
+        self.update_image_list_display()
+        self._update_context_bar()
 
     def update_class_list(self):
         """更新类别列表"""
