@@ -18,6 +18,7 @@ from typing import Iterable, Mapping, Sequence
 from remote_protocol.v1 import (
     REMOTE_PROTOCOL_VERSION,
     DatasetManifest,
+    JobSpec,
     ManifestEntry,
     ProtocolValidationError,
     validate_job_id,
@@ -32,6 +33,7 @@ FORBIDDEN_PAYLOAD_SUFFIXES = frozenset(
     {".bat", ".command", ".pkl", ".pt", ".pth", ".py", ".sh"}
 )
 MANIFEST_FILENAME = "manifest.json"
+JOB_SPEC_FILENAME = "job-spec.json"
 
 
 class SnapshotError(ValueError):
@@ -233,51 +235,57 @@ def verify_snapshot(snapshot_root: Path | str) -> DatasetManifest:
     root = Path(snapshot_root)
     if root.is_symlink() or not root.is_dir():
         raise SnapshotIntegrityError("快照根目录不存在或不是普通目录")
-    manifest_path = root / MANIFEST_FILENAME
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise SnapshotIntegrityError("快照缺少 manifest.json")
-    try:
-        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest = DatasetManifest.from_wire(raw_manifest)
-    except (OSError, json.JSONDecodeError, ProtocolValidationError) as exc:
-        raise SnapshotIntegrityError("快照 manifest 无法验证") from exc
-
-    expected_hash = compute_snapshot_hash(
-        job_id=manifest.job_id,
-        task_type=manifest.task_type,
-        class_names=manifest.class_names,
-        layout=manifest.layout,
-        entries=manifest.entries,
-        total_bytes=manifest.total_bytes,
-    )
-    if manifest.snapshot_hash != expected_hash:
-        raise SnapshotIntegrityError("snapshot_hash 不匹配")
-
-    expected_paths = {MANIFEST_FILENAME, *(entry.path for entry in manifest.entries)}
-    actual_paths = _list_snapshot_files(root)
-    if actual_paths != expected_paths:
-        missing = sorted(expected_paths - actual_paths)
-        extra = sorted(actual_paths - expected_paths)
-        detail = []
-        if missing:
-            detail.append("缺少 " + ", ".join(missing))
-        if extra:
-            detail.append("包含额外文件 " + ", ".join(extra))
-        raise SnapshotIntegrityError("快照文件清单不匹配：" + "；".join(detail))
-
-    for entry in manifest.entries:
-        file_path = root / entry.path
-        try:
-            file_stat = file_path.lstat()
-        except OSError as exc:
-            raise SnapshotIntegrityError("manifest 文件无法读取") from exc
-        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
-            raise SnapshotIntegrityError("manifest 文件不是普通文件")
-        if file_stat.st_size != entry.size:
-            raise SnapshotIntegrityError("manifest 文件大小不匹配")
-        if _hash_file(file_path) != entry.sha256:
-            raise SnapshotIntegrityError("manifest 文件哈希不匹配")
+    manifest = _read_manifest(root)
+    _verify_snapshot_contents(root, manifest, {MANIFEST_FILENAME})
     return manifest
+
+
+def write_job_spec(snapshot: DatasetSnapshot | Path | str, job_spec: JobSpec) -> Path:
+    """为已经校验的数据快照增加唯一、受控的 job-spec.json。"""
+    root = snapshot.root if isinstance(snapshot, DatasetSnapshot) else Path(snapshot)
+    manifest = verify_snapshot(root)
+    if (
+        job_spec.job_id != manifest.job_id
+        or job_spec.task_type != manifest.task_type
+        or job_spec.class_names != manifest.class_names
+        or job_spec.snapshot_hash != manifest.snapshot_hash
+    ):
+        raise SnapshotError("job spec 与数据快照不一致")
+    path = root / JOB_SPEC_FILENAME
+    if path.exists() or path.is_symlink():
+        raise SnapshotError("job spec 已存在，拒绝覆盖")
+    _write_json_private(path, job_spec.to_wire(), "job spec")
+    return path
+
+
+def verify_remote_payload(snapshot_root: Path | str) -> tuple[DatasetManifest, JobSpec]:
+    """验证准备上传给 runner 的完整 payload（数据 manifest + job spec）。"""
+    root = Path(snapshot_root)
+    if root.is_symlink() or not root.is_dir():
+        raise SnapshotIntegrityError("快照根目录不存在或不是普通目录")
+    manifest = _read_manifest(root)
+    job_spec_path = root / JOB_SPEC_FILENAME
+    if job_spec_path.is_symlink() or not job_spec_path.is_file():
+        raise SnapshotIntegrityError("快照缺少 job-spec.json")
+    try:
+        job_spec = JobSpec.from_wire(
+            json.loads(job_spec_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, json.JSONDecodeError, ProtocolValidationError) as exc:
+        raise SnapshotIntegrityError("快照 job spec 无法验证") from exc
+    if (
+        job_spec.job_id != manifest.job_id
+        or job_spec.task_type != manifest.task_type
+        or job_spec.class_names != manifest.class_names
+        or job_spec.snapshot_hash != manifest.snapshot_hash
+    ):
+        raise SnapshotIntegrityError("job spec 与数据快照不一致")
+    _verify_snapshot_contents(
+        root,
+        manifest,
+        {MANIFEST_FILENAME, JOB_SPEC_FILENAME},
+    )
+    return manifest, job_spec
 
 
 def _resolve_allowed_root(root: Path) -> Path:
@@ -354,19 +362,18 @@ def _hash_file(path: Path) -> str:
 
 
 def _write_manifest(path: Path, manifest: DatasetManifest) -> None:
-    serialized = json.dumps(
-        manifest.to_wire(),
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
+    _write_json_private(path, manifest.to_wire(), "快照 manifest")
+
+
+def _write_json_private(path: Path, value: Mapping[str, object], label: str) -> None:
+    serialized = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     try:
         with path.open("x", encoding="utf-8") as file_handle:
             file_handle.write(serialized)
             file_handle.write("\n")
         os.chmod(path, 0o600)
     except OSError as exc:
-        raise SnapshotError("无法写入快照 manifest") from exc
+        raise SnapshotError(f"无法写入{label}") from exc
 
 
 def _validate_payload_path(value: object) -> str:
@@ -436,6 +443,59 @@ def _list_snapshot_files(root: Path) -> set[str]:
                 raise SnapshotIntegrityError("快照不能包含符号链接或特殊文件")
             found.add(file_path.relative_to(root).as_posix())
     return found
+
+
+def _read_manifest(root: Path) -> DatasetManifest:
+    manifest_path = root / MANIFEST_FILENAME
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise SnapshotIntegrityError("快照缺少 manifest.json")
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return DatasetManifest.from_wire(raw_manifest)
+    except (OSError, json.JSONDecodeError, ProtocolValidationError) as exc:
+        raise SnapshotIntegrityError("快照 manifest 无法验证") from exc
+
+
+def _verify_snapshot_contents(
+    root: Path,
+    manifest: DatasetManifest,
+    metadata_paths: set[str],
+) -> None:
+    expected_hash = compute_snapshot_hash(
+        job_id=manifest.job_id,
+        task_type=manifest.task_type,
+        class_names=manifest.class_names,
+        layout=manifest.layout,
+        entries=manifest.entries,
+        total_bytes=manifest.total_bytes,
+    )
+    if manifest.snapshot_hash != expected_hash:
+        raise SnapshotIntegrityError("snapshot_hash 不匹配")
+
+    expected_paths = {*metadata_paths, *(entry.path for entry in manifest.entries)}
+    actual_paths = _list_snapshot_files(root)
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        extra = sorted(actual_paths - expected_paths)
+        detail = []
+        if missing:
+            detail.append("缺少 " + ", ".join(missing))
+        if extra:
+            detail.append("包含额外文件 " + ", ".join(extra))
+        raise SnapshotIntegrityError("快照文件清单不匹配：" + "；".join(detail))
+
+    for entry in manifest.entries:
+        file_path = root / entry.path
+        try:
+            file_stat = file_path.lstat()
+        except OSError as exc:
+            raise SnapshotIntegrityError("manifest 文件无法读取") from exc
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+            raise SnapshotIntegrityError("manifest 文件不是普通文件")
+        if file_stat.st_size != entry.size:
+            raise SnapshotIntegrityError("manifest 文件大小不匹配")
+        if _hash_file(file_path) != entry.sha256:
+            raise SnapshotIntegrityError("manifest 文件哈希不匹配")
 
 
 def _is_within(candidate: Path, root: Path) -> bool:

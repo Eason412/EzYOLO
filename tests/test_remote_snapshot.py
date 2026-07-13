@@ -14,7 +14,10 @@ from core.remote_training.snapshot import (  # noqa: E402
     SnapshotError,
     SnapshotIntegrityError,
     SnapshotSource,
+    verify_remote_payload,
+    write_job_spec,
 )
+from remote_protocol.v1 import JobSpec, REMOTE_PROTOCOL_VERSION  # noqa: E402
 
 
 JOB_ID = "1" * 32
@@ -166,6 +169,49 @@ def test_verify_detects_missing_hash_mismatch_and_extra_file():
     snapshot = build_snapshot(builder, source_root)
     (snapshot.root / "images/train/extra.jpg").write_bytes(b"extra")
     assert_rejected(builder.verify, snapshot, expected=SnapshotIntegrityError)
+
+
+def test_remote_payload_requires_matching_job_spec_and_rejects_extra_metadata():
+    source_root = make_source_tree()
+    builder = make_builder(source_root)
+    snapshot = build_snapshot(builder, source_root)
+    spec = JobSpec(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        job_id=JOB_ID,
+        task_type="detect",
+        model_symbol="yolov10n",
+        epochs=100,
+        batch=8,
+        imgsz=640,
+        class_names=("person",),
+        snapshot_hash=snapshot.manifest.snapshot_hash,
+    )
+    write_job_spec(snapshot, spec)
+    manifest, restored_spec = verify_remote_payload(snapshot.root)
+    assert manifest == snapshot.manifest
+    assert restored_spec == spec
+    assert_rejected(builder.verify, snapshot, expected=SnapshotIntegrityError)
+
+    (snapshot.root / "unexpected.json").write_text("{}", encoding="utf-8")
+    assert_rejected(verify_remote_payload, snapshot.root, expected=SnapshotIntegrityError)
+
+
+def test_job_spec_cannot_claim_a_different_snapshot():
+    source_root = make_source_tree()
+    builder = make_builder(source_root)
+    snapshot = build_snapshot(builder, source_root)
+    mismatched = JobSpec(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        job_id=JOB_ID,
+        task_type="detect",
+        model_symbol="yolov10n",
+        epochs=100,
+        batch=8,
+        imgsz=640,
+        class_names=("person",),
+        snapshot_hash="a" * 64,
+    )
+    assert_rejected(write_job_spec, snapshot, mismatched)
 
 
 def test_snapshot_module_does_not_depend_on_local_training_thread():
