@@ -941,12 +941,14 @@ class TestPage(QWidget):
         content_layout.setContentsMargins(0, 0, 4, 0)
         content_layout.setSpacing(12)
 
-        self.context_help = ContextHelp([
-            "点「用本项目训练的模型」或「选择模型文件…」，先定用哪个模型。",
-            "选图片、文件夹或视频作为输入，也可以直接加载项目里的一个分组。",
-            "调「识别门槛」后点「开始测试」，右边显示画好框的结果和耗时。",
-            "这里只是看模型效果，检测结果不会写回项目的标注。",
-        ])
+        self.context_help = ContextHelp(
+            [
+                "识别门槛越高，结果通常越少，但判断会更严格。",
+                "图片、文件夹和视频会使用同一套模型与门槛配置。",
+                "测试结果只用于查看，不会写回项目标注。",
+            ],
+            title="测试提示",
+        )
         content_layout.addWidget(self.context_help)
 
         content_layout.addWidget(self.create_model_card())

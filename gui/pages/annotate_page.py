@@ -2730,7 +2730,7 @@ class AnnotatePage(QWidget):
         self.context_bar = self.create_context_bar()
         self.main_layout.addWidget(self.context_bar)
 
-        # 使用说明：默认收起，跟顶栏左右对齐
+        # 轻量帮助：默认收起，跟顶栏左右对齐
         self.main_layout.addWidget(self.create_context_help_bar())
 
         # 创建分割器
@@ -2775,7 +2775,7 @@ class AnnotatePage(QWidget):
         super().showEvent(event)
 
     def create_context_help_bar(self) -> QWidget:
-        """使用说明那一条：主布局是零边距的，靠这层容器跟顶栏对齐。"""
+        """轻量帮助那一条：主布局是零边距的，靠这层容器跟顶栏对齐。"""
         bar = QWidget()
         layout = QVBoxLayout(bar)
         layout.setContentsMargins(16, 8, 16, 0)
@@ -2783,13 +2783,12 @@ class AnnotatePage(QWidget):
 
         self.context_help = ContextHelp(
             [
-                "在右侧「类别」里选中一个类别，接下来画的标注都算这个类别。",
-                "用工具栏的绘制工具在图片上按住拖出一个框，松手就生成一条标注。",
-                "点右侧「用已有模型标注」，先让模型标一遍，再手动改错的地方。",
-                "点画布右上角的锁，切换图片时保持当前的缩放和位置，方便逐张比对。",
-                "「批量标注…」按自动标注设置处理整批图片；那里勾了「覆盖原标签」的话，已有标注会被替换且无法撤销。",
+                "锁定视图后，切换图片会保留当前缩放和画面位置。",
+                "自动标注适合先生成结果，再逐张检查和修正。",
+                "批量覆盖会替换范围内的已有标注，开始前请确认处理范围。",
             ],
-            risk_steps=[5],
+            risk_steps=[3],
+            title="标注技巧",
         )
         layout.addWidget(self.context_help)
 

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""六个页面接上同一个「使用说明」，以及自动标注设置页的底部收口。
+"""六个页面接上同一个轻量帮助组件，以及自动标注设置页的底部收口。
 
 组件本身（展开/收起/键盘/长文换行）由 test_context_help.py 覆盖，这里只管接线：
-每个位置都真的有一个 ContextHelp、进页面时都是收起的；自动标注设置在 1280x720、
-150% 字号下，摘要不被按钮压住，取消和保存等高同基线。
+每个位置都有场景化标题、收起时不再是一张大卡片、只保留 2–3 条有用提示；
+自动标注设置在 1280x720、150% 字号下，摘要不被按钮压住，取消和保存等高同基线。
 
     python tests/test_context_help_pages.py
     python -m pytest tests/test_context_help_pages.py -q
@@ -43,22 +43,30 @@ def test_five_pages_and_the_dialog_each_have_a_collapsed_help():
     dialog = AutoLabelDialog(None)
 
     spots = [
-        ("数据导入", window.import_page),
-        ("数据标注", window.annotate_page),
-        ("模型训练", window.train_page),
-        ("结果分析", window.result_page),
-        ("模型测试", window.test_page),
-        ("自动标注设置", dialog),
+        ("数据导入", "导入提示", window.import_page),
+        ("数据标注", "标注技巧", window.annotate_page),
+        ("模型训练", "训练前检查", window.train_page),
+        ("结果分析", "指标怎么看", window.result_page),
+        ("模型测试", "测试提示", window.test_page),
+        ("自动标注设置", "配置提示", dialog),
     ]
 
-    for name, spot in spots:
+    for name, expected_title, spot in spots:
         help_widget = getattr(spot, "context_help", None)
-        assert isinstance(help_widget, ContextHelp), f"{name} 没有使用说明入口"
-        assert not help_widget.is_expanded(), f"{name} 的使用说明应该默认收起"
-        assert not help_widget.content.isVisible(), f"{name} 收起时不该显示步骤"
+        assert isinstance(help_widget, ContextHelp), f"{name} 没有帮助入口"
+        assert not help_widget.is_expanded(), f"{name} 的帮助应该默认收起"
+        assert not help_widget.content.isVisible(), f"{name} 收起时不该显示提示"
+        assert help_widget._label.text() == expected_title, (
+            f"{name} 应显示场景化标题 {expected_title!r}，实际 {help_widget._label.text()!r}"
+        )
+        assert help_widget._label.text() != "使用说明"
 
-        steps = help_widget.content.findChildren(type(help_widget._label))
-        assert 3 <= len(steps) <= 5, f"{name} 的说明应该是 3-5 步，现在是 {len(steps)} 步"
+        tips = [
+            label for label in help_widget.content.findChildren(type(help_widget._label))
+            if label.objectName() == "contextHelpTipText"
+        ]
+        assert 2 <= len(tips) <= 3, f"{name} 应只保留 2-3 条提示，现在是 {len(tips)} 条"
+        assert help_widget.toggle.sizePolicy().horizontalPolicy().name == "Maximum"
 
     dialog.close()
     window.close()

@@ -228,21 +228,20 @@ class AutoLabelDialog(QDialog):
         main_layout.setContentsMargins(20, 20, 20, 16)
         main_layout.setSpacing(12)
 
-        # 顶部只留一句话，细节全部收进「使用说明」
-        subtitle = QLabel("选一种标注方式，调好参数保存；标注页的自动标注就按这里执行。")
+        # 顶部只留一句结果说明，易错点收进轻量帮助
+        subtitle = QLabel("选择标注方式并保存，标注页会立即使用这里的配置。")
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
         main_layout.addWidget(subtitle)
 
         self.context_help = ContextHelp(
             [
-                "先选标注方式：YOLO 直接画框，SAM 按点或框分割轮廓，LLM 用视觉大模型按类别名字找目标。",
-                "在「模型来源」里选官方预训练模型（首次使用会自动下载）或本地的 .pt 文件。",
-                "调「置信度」：调高框更少更准，调低检出更多也更容易误检；IoU 决定重叠的框怎么合并。",
-                "保留「仅推理无标签数据」，模型只补还没标过的图片。",
-                "勾选「覆盖原标签」后，推理结果会替换图片上已有的标注，无法撤销。",
+                "YOLO 生成检测框，SAM 分割轮廓，LLM 根据文字描述识别目标。",
+                "置信度越高，结果通常越少；批量运行前请先确认模型和范围。",
+                "覆盖原标签会替换已有标注，且无法撤销。",
             ],
-            risk_steps=[5],
+            risk_steps=[3],
+            title="配置提示",
         )
         main_layout.addWidget(self.context_help)
 

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""ContextHelp：行内『使用说明』组件。
+"""ContextHelp：轻量行内帮助组件。
 
-默认收起、点开是编号步骤、风险步骤要有克制的橙色提示；展开收起不能在窗口里
-留空白，长中文在不同宽度和字号下也不能横向溢出或被裁切。
+默认收起时只显示右侧的小入口，展开后是无编号的短提示；风险信息单独成行。
+展开收起不能在窗口里留空白，长中文在不同宽度和字号下也不能溢出或被裁切。
 
     python tests/test_context_help.py
     python -m pytest tests/test_context_help.py -q
@@ -14,7 +14,7 @@ import sys
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QFrame, QLabel, QSizePolicy
 
 from gui.styles import COLORS
 from gui.widgets.context_help import ContextHelp
@@ -40,7 +40,14 @@ def _settle(rounds=3):
 def _step_labels(help_widget):
     return [
         label for label in help_widget.content.findChildren(QLabel)
-        if label.text().strip()
+        if label.objectName() == "contextHelpTipText"
+    ]
+
+
+def _tip_rows(help_widget):
+    return [
+        row for row in help_widget.content.findChildren(QFrame)
+        if row.objectName() in ("contextHelpTipRow", "contextHelpRiskRow")
     ]
 
 
@@ -127,31 +134,63 @@ def test_toggle_row_hit_area_is_at_least_32px_tall():
     help_widget.close()
 
 
+def test_collapsed_entry_is_compact_borderless_and_right_aligned():
+    help_widget = ContextHelp(STEPS, title="导入提示")
+    help_widget.resize(800, help_widget.sizeHint().height())
+    help_widget.show()
+    _settle()
+
+    assert help_widget.toggle.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Maximum
+    assert help_widget.toggle.width() < 180, (
+        f"收起入口不该像整行卡片一样宽，实际 {help_widget.toggle.width()}px"
+    )
+    assert help_widget.toggle.geometry().right() >= help_widget.header.width() - SLACK, (
+        "轻量帮助入口应该靠右，而不是占据页面左侧的主内容位置"
+    )
+    assert "background-color: transparent" in help_widget.styleSheet()
+    assert "border: none" in help_widget.styleSheet()
+
+    help_widget.close()
+
+
+def test_context_title_is_specific_not_a_global_tutorial_label():
+    help_widget = ContextHelp(STEPS, title="训练前检查")
+    assert help_widget._label.text() == "训练前检查"
+    assert help_widget._label.text() != "使用说明"
+    assert help_widget.toggle.accessibleName() == "训练前检查"
+    help_widget.close()
+
+
 def test_chevron_icon_is_16px_collapsed_and_expanded():
     help_widget = ContextHelp(STEPS)
     help_widget.show()
     _settle()
 
+    def logical_size(pixmap):
+        ratio = pixmap.devicePixelRatio() or 1.0
+        return round(pixmap.width() / ratio), round(pixmap.height() / ratio)
+
     collapsed_pixmap = help_widget._chevron.pixmap()
-    assert collapsed_pixmap.width() == 16 and collapsed_pixmap.height() == 16
+    assert logical_size(collapsed_pixmap) == (16, 16)
 
     QTest.mouseClick(help_widget.toggle, Qt.MouseButton.LeftButton)
     _settle()
     expanded_pixmap = help_widget._chevron.pixmap()
-    assert expanded_pixmap.width() == 16 and expanded_pixmap.height() == 16
+    assert logical_size(expanded_pixmap) == (16, 16)
 
     help_widget.close()
 
 
-def test_steps_are_numbered_in_order():
+def test_tips_keep_their_text_without_tutorial_numbers():
     help_widget = ContextHelp(STEPS)
     help_widget.set_expanded(True)
     _settle()
 
     labels = _step_labels(help_widget)
     assert len(labels) == len(STEPS)
-    for index, (label, text) in enumerate(zip(labels, STEPS), start=1):
-        assert label.text() == f"{index}. {text}"
+    for label, text in zip(labels, STEPS):
+        assert label.text() == text
+        assert not label.text()[0].isdigit(), "帮助内容不该再像 1、2、3 的新手教程"
 
     help_widget.close()
 
@@ -163,9 +202,28 @@ def test_risk_steps_get_warning_style_others_do_not():
 
     labels = _step_labels(help_widget)
     risky, safe = labels[1], labels[0]
+    rows = _tip_rows(help_widget)
 
     assert COLORS['warning'] in risky.styleSheet(), "风险步骤应该用警示色文字"
     assert COLORS['warning'] not in safe.styleSheet(), "非风险步骤不该套警示样式"
+    assert rows[1].objectName() == "contextHelpRiskRow", "风险提示应该单独成行"
+    assert rows[0].objectName() == "contextHelpTipRow", "普通提示不该整行套警告底色"
+    assert "background-color: transparent" in rows[0].styleSheet(), (
+        "普通提示行必须显式透明，否则会继承全局 QFrame 的白色卡片样式"
+    )
+    assert "border: none" in rows[0].styleSheet()
+
+    help_widget.close()
+
+
+def test_keyboard_focus_does_not_turn_collapsed_entry_into_a_filled_card():
+    help_widget = ContextHelp(STEPS, title="导入提示")
+    focus_rule = help_widget.toggle.styleSheet().split(
+        "QPushButton#contextHelpToggle:focus", 1
+    )[1].split("}", 1)[0]
+
+    assert "background-color: transparent" in focus_rule
+    assert "border-color:" in focus_rule, "键盘焦点仍需有清楚但克制的描边"
 
     help_widget.close()
 
@@ -182,8 +240,8 @@ def test_set_steps_replaces_content_without_leftovers():
 
     labels = _step_labels(help_widget)
     assert len(labels) == len(new_steps)
-    assert labels[0].text() == "1. 新的第一步"
-    assert labels[1].text() == "2. 新的第二步"
+    assert labels[0].text() == "新的第一步"
+    assert labels[1].text() == "新的第二步"
 
     help_widget.close()
 
