@@ -79,7 +79,7 @@ EzYOLO 的“测试连接/预检”只验证已存在的环境。它不会自动
   "port": 22,
   "username": "ezyolo",
   "remote_root": "/home/ezyolo/ezyolo-remote",
-  "expected_host_fingerprint": "SHA256:..."
+  "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
 }
 ```
 
@@ -93,7 +93,7 @@ EzYOLO 的“测试连接/预检”只验证已存在的环境。它不会自动
 | `port` | 1–65535 的整数。 |
 | `username` | 普通 Linux 用户名；必须匹配 `[a-z_][a-z0-9_-]{0,31}`，并明确拒绝 `root`。 |
 | `remote_root` | 绝对、规范的 POSIX 路径；只允许 `[A-Za-z0-9._/-]`，不允许空白、`~`、`..`、重复语义段、控制字符或以 `-` 开头的路径段。 |
-| `expected_host_fingerprint` | 可选的 SHA256 OpenSSH 指纹。对管理员已知的服务器应优先填写，用于首次连接前的带外校验。 |
+| `host_public_key` | 管理员带外提供的完整 OpenSSH 主机公钥（如 `ssh-ed25519 AAAA...`）；非秘密，但首次真实连接前必须存在。界面可从它派生 SHA256 指纹供人核对，不能只保存指纹。 |
 
 档案保存在单独、版本化的 `QSettings` key：
 
@@ -103,7 +103,9 @@ remote_training_profiles_v1
 
 `QSettings` 不是秘密仓库，所以 profile schema 和序列化函数必须拒绝 `password`、`private_key`、`private_key_content`、`passphrase`、`token`、`api_key` 及其他未允许字段。恢复默认设置不得删除远程服务器档案，避免用户误失去非敏感连接配置。
 
-设置页可以提供一个次级操作“测试连接”，它只执行 SSH 预检，不上传数据、不创建目录、不安装软件。首次连接时，若没有带外预设指纹，界面展示 SHA256 指纹并要求用户显式确认；确认后写入应用私有 `known_hosts`。以后指纹不一致一律阻止连接，只有用户在设置页明确执行“重置信任”才能替换，不能自动更新。
+设置页可以提供一个次级操作“测试连接”，它只执行 SSH 预检，不上传数据、不创建目录、不安装软件。服务器管理员必须在带外渠道给出完整主机公钥；EzYOLO 用 profile id 生成固定 `HostKeyAlias`，将 `HostKeyAlias + host_public_key` 写入权限为 `0600` 的应用私有 `known_hosts`，再以 `StrictHostKeyChecking=yes` 连接。这样即使用户填写的是 OpenSSH alias 或经跳板连接，实际服务器主机公钥仍固定由 profile 的公钥 pin 校验。
+
+首版不做 TOFU：不使用 `accept-new`，不调用 `ssh-keyscan` 自动信任，也不能只凭 SHA256 指纹生成 `known_hosts` 条目。主机键不匹配一律阻止连接；“重置信任”要求用户粘贴管理员带外提供的新完整主机公钥，不能自动更新。
 
 ### 3.2 训练页：只选择训练位置
 
@@ -137,6 +139,7 @@ remote_training_profiles_v1
 | `remote_training_profiles` | profile schema、校验、序列化和拒绝秘密字段 | 连接服务器、执行训练 |
 | `RemoteTrainingProfileStore` | 通过唯一 QSettings key 读写 profile | 直接操作页面控件 |
 | `TrainingLaunchController` | 将“本机/远程目标 + 已校验训练配置”解析为启动计划 | 直接调用 ssh、rsync 或 YOLO |
+| `remote_protocol/v1` | client 与 runner 共享的版本、job spec、manifest、状态和 failure code wire contract | PyQt、QSettings、数据库、Ultralytics、SSH 或服务器配置 |
 | `RemoteTrainingBackend` | 统一远程协议接口 | 管理 PyQt 页面布局 |
 | `SshRsyncBackend` | v1 的 OpenSSH、rsync、runner 交互 | 复用本机 `TrainingThread` |
 | `RemoteTrainingThread` | 在后台执行远程状态机并通过信号更新 UI | 在主线程阻塞网络 I/O |
@@ -168,6 +171,8 @@ TrainingLaunchController.resolve(...)
       └─ RemoteLaunchPlan → RemoteTrainingThread + SshRsyncBackend
 ```
 
+`remote_protocol/v1` 必须是独立的纯 Python 包：client 和 runner 都可以使用它，但它不得 import `core.*`、`gui.*`、PyQt、QSettings、数据库或 Ultralytics。手动部署 runner 时，runner 与同版本的 `remote_protocol` 一起部署；runner 不得通过 import 桌面应用来取得协议定义。共享 contract 的版本、字段名和状态集合必须有自动测试锁定。
+
 ## 5. SSH、rsync 与远程命令安全规则
 
 ### 5.1 固定的 SSH 行为
@@ -183,12 +188,16 @@ ForwardAgent=no
 ClearAllForwardings=yes
 StrictHostKeyChecking=yes
 UserKnownHostsFile=<应用私有 known_hosts>
+GlobalKnownHostsFile=<os.devnull>
+HostKeyAlias=ezyolo-<profile-id>
 ConnectTimeout=<固定短超时>
 ServerAliveInterval=<固定值>
 ServerAliveCountMax=<固定值>
 ```
 
-应用私有 `known_hosts` 位于系统应用配置目录，创建权限为 `0600`。连接失败时不得弹出隐藏密码提示或在后台无限等待。
+应用私有 `known_hosts` 位于系统应用配置目录中 profile 专属的路径，创建权限为 `0600`。每次 SSH 或 rsync 调用前，应用都从该 profile 的 `host_public_key` 重写唯一的 `HostKeyAlias + key` 条目；不追加历史条目，也不写用户 `~/.ssh/known_hosts`。`GlobalKnownHostsFile` 使用 Python `os.devnull` 的平台空设备（macOS/Linux 为 `/dev/null`，Windows 为 `NUL`），防止系统全局记录覆盖 profile pin。认证使用用户已经在本机 OpenSSH config / SSH agent 中准备好的凭据；`ForwardAgent=no` 只禁止把 agent 转发给服务器，并不阻止本机 ssh 使用 agent。连接失败时不得弹出隐藏密码提示或在后台无限等待。
+
+客户端预检还必须用受控 command resolver 查找系统 `ssh` 与 `rsync`。macOS/Linux 与 Windows 都只能使用 PATH 中明确可执行的系统工具；Windows 需要用户或管理员预先安装 OpenSSH 与 rsync 并让它们可被发现。EzYOLO 不自动安装、下载、调用 WSL 或选择来源不明的替代工具。任何一个工具缺失时，远程 target 显示 `CLIENT_TRANSPORT_UNAVAILABLE` 并保持本机训练可用。
 
 本机 `subprocess` 使用参数列表且永不使用 `shell=True`，但这还不够：`ssh host command` 和 `rsync host:path` 最终仍会经过远程端解析。因此下列规则同时强制执行：
 
@@ -239,7 +248,7 @@ manifest 校验必须同时发现三类问题：缺文件、哈希/大小不匹�
 .pt  .pth  .pkl  .py  .sh  .bat  .command  可执行文件  自定义下载脚本
 ```
 
-`data.yaml` 由 `DatasetSnapshotBuilder` 生成，并由 runner 二次校验。它不得包含：
+客户端不上传可直接执行的 `data.yaml`。它只上传经校验的 manifest、任务类型、类别表和相对数据布局；runner 在 manifest 验证通过后，**自行构造**最终的 `data.yaml`。runner 用安全 YAML dumper 输出，并校验类别名和路径成分不含控制字符或越界语义；不得消费客户端原样 YAML，并且构造后的 YAML 不得包含：
 
 - `download:`；
 - 绝对路径；
@@ -247,7 +256,7 @@ manifest 校验必须同时发现三类问题：缺文件、哈希/大小不匹�
 - 服务器外路径；
 - 任意脚本、URL 下载或动态 Python 入口。
 
-训练模型以**符号模型名**而不是本机权重路径提交。例如客户端可表达“YOLOv10 nano”，runner 再把它映射到服务器管理员预先登记、已安装且允许使用的模型资产。runner 不下载模型，也不加载 payload 中的 checkpoint。
+训练模型以**符号模型名**而不是本机权重路径提交。例如客户端可表达“YOLOv10 nano”，runner 再把它映射到服务器管理员预先登记的、存在且为普通文件的**绝对本地权重路径**。runner 只能把该绝对路径交给 Ultralytics；不得把符号名或客户端模型路径直接传给会触发解析/下载的 API。模型不存在即失败，不能自动下载模型，也不加载 payload 中的 checkpoint。
 
 服务端 runner 配置维护 allowlist：可用任务类型、模型符号名、Ultralytics 版本、可用设备策略、batch/imgsz 上限、任务目录上限。客户端和 runner 都校验一次；服务端校验是最终权威。
 
@@ -267,7 +276,7 @@ $HOME/.config/ezyolo-remote/server.json
   logs/
 ```
 
-`server.json` 由服务器管理员维护，至少包括：协议版本、规范 remote root、允许的模型资产、虚拟环境解释器、设备/资源上限和单任务策略。它不由桌面应用写入。
+`server.json` 由服务器管理员维护，至少包括：协议版本、规范 remote root、允许的模型资产及其绝对路径、虚拟环境解释器、设备/资源上限、最大 epoch、最大运行时长、incoming/jobs 最大字节数、结果最大字节数和单任务策略。它不由桌面应用写入。超过资源上限时 runner 拒绝新任务；运行中超过最大时长、任务目录字节上限或最小可用磁盘空间时，runner 仅终止已核验的本 job 进程组并写入明确 failure code。首版不自动清理旧任务，管理员清理必须另行执行。
 
 桌面端启动前调用固定 runner 的 `preflight`。返回至少包含：
 
@@ -302,19 +311,22 @@ $HOME/.config/ezyolo-remote/server.json
 
 ### 7.3 服务器端锁、GPU 与停止
 
-“同一服务器一次一个 EzYOLO 任务”必须在服务器端用原子机制实施，不能只由桌面端预先检查。runner 用 `mkdir` 锁目录或 `flock` 获得锁，锁中记录 job id、PID、进程组 ID 和启动时间。
+“同一服务器一次一个 EzYOLO 任务”必须在服务器端用原子机制实施，不能只由桌面端预先检查。runner 用 `mkdir` 锁目录或 `flock` 获得锁，锁中记录 job id、PID、进程组 ID、boot id 与进程启动标识。
 
-锁只在下列条件下回收：锁记录的进程组已经通过服务器现场检查确认不存在。不能仅凭时间戳删除锁。
+锁只在下列条件下回收：记录的 boot id 已改变，或同一 boot id 下 PID 已不存在，或 PID 的启动标识与记录不一致。不能仅凭时间戳删除锁；无法证明进程已死时保留锁并要求管理员核验。
 
 训练进程必须单独创建自己的进程组。取消规则：
 
 1. 客户端发出取消请求后，状态为 `CANCEL_REQUESTED`；
-2. runner 只向该 job 的进程组发送停止信号；
-3. 超时后可按固定策略向**同一进程组**升级信号；
-4. 只有进程组已退出、状态文件已原子更新后，才显示 `CANCELLED`；
-5. 严禁 `pkill -f`、按名字匹配杀进程、GPU reset，或杀死不属于当前 job 的 PID。
+2. runner 先核对 boot id、PID、进程组 ID 和进程启动标识，再只向该 job 的进程组发送停止信号；
+3. 超时后可按固定策略向**同一已核验进程组**升级信号；
+4. job 已结束、状态未知或进程身份无法核验时，取消是安全 no-op，不能扩大为按名称杀进程；
+5. 只有进程组已退出、状态文件已原子更新后，才显示 `CANCELLED`；
+6. 严禁 `pkill -f`、按名字匹配杀进程、GPU reset，或杀死不属于当前 job 的 PID。
 
 GPU 准入检查只是保护，不是抢占承诺。服务器端根据自己的 device policy 与当下可用显存决定是否可启动；忙或资源不足时首版直接拒绝，不排队。runner 强制 batch/imgsz 上限或其它自我内存上限；CUDA OOM 是带原因码的终态失败，不会自动重试，也不会影响其他 GPU 进程。
+
+runner 在训练期间以固定间隔检查 wall-clock 时长、任务目录字节数、结果目录字节数和可用磁盘空间。超过 `server.json` 规定的硬上限时，runner 按已核验的当前 job 取消规则停止自己的进程组，记录 `MAX_RUNTIME`、`JOB_DISK_LIMIT` 或 `LOW_DISK_SPACE`，并释放锁；它不删除文件、不清理其他 job，也不触碰其他进程。
 
 ### 7.4 原子状态与结果
 
@@ -371,13 +383,14 @@ runs/train/exp_<project-id>_remote_<job-id-prefix>
 
 | 测试文件/范围 | 必须覆盖 |
 | --- | --- |
-| `test_remote_training_profiles.py` | profile 校验、稳定 ID、拒绝 root、拒绝秘密字段、拒绝危险 host/path、损坏 JSON 安全降级。 |
+| `test_remote_training_profiles.py` | profile 校验、稳定 ID、拒绝 root/秘密字段、完整主机公钥格式、危险 host/path、损坏 JSON 安全降级。 |
 | `test_remote_training_profile_store.py` | 独立 QSettings key、不会碰训练模板或 SAM 配置、删除 profile 后安全回退、测试用临时 QSettings。 |
 | `test_training_launch_controller.py` | local/remote plan 分叉、失效 profile、无 SSH 副作用、现有本机路径不变。 |
 | `test_remote_command_builder.py` | 精确 argv；对 `; $(...)`、反引号、换行、Unicode、`..`、绝对路径、软链接、前导 `-` 等输入明确拒绝。 |
-| `test_remote_snapshot.py` | 只读快照、不越过数据根目录、完整 manifest、禁止载荷类型和 `data.yaml` 危险字段。 |
+| `test_remote_training_boundaries.py` | 机械断言旧 `TrainingThread` 与 `prepare_data_yaml()` 中没有远程 backend、SSH、rsync、runner 或 remote snapshot 逻辑。 |
+| `test_remote_snapshot.py` | 只读快照、不越过数据根目录、完整 manifest、禁止载荷类型；runner 重建 data YAML 的输入契约。 |
 | `test_remote_state_machine.py` | UNKNOWN 只能由远程事实解决、取消确认、远程崩溃、收集失败、成功定义。 |
-| `test_remote_runner_protocol.py` | 协议不匹配、allowlist、原子锁、状态原子写、进程组取消和路径/manifest 校验；不需要 GPU。 |
+| `test_remote_runner_protocol.py` | 协议不匹配、共享 wire contract、allowlist、runner 重建 data YAML、原子锁、状态原子写、进程组身份核验、路径/manifest 校验；不需要 GPU。 |
 | UI focused tests | 设置页 profile 保存/展示、训练页目标下拉、删除回退、360px 左栏无横向滚动、中文文字不裁切。 |
 
 所有纯函数和 fake transport 测试禁止真实连接 SSH、上传数据、运行 rsync 或启动训练。runner 的非训练逻辑应可在无 GPU 环境下被单独测试，真实 YOLO 调用只有一个可注入 seam。
@@ -386,7 +399,7 @@ runs/train/exp_<project-id>_remote_<job-id-prefix>
 
 实现完成后，至少验证：
 
-1. macOS 真机：新增普通账号 profile、指纹确认、无密码提示、启动本机训练仍正常；
+1. macOS 真机：新增普通账号 profile、带外主机公钥 pin、无密码提示、启动本机训练仍正常；
 2. 自动 UI：不同窗口宽度/DPI 下设置卡片、训练位置下拉、长服务器名和错误提示无文字裁切或横向滚动；
 3. fake SSH/rsync：路径和参数严格按预期构造，无法命令注入；
 4. 经授权的真实服务器 preflight：普通账号、runner、协议、环境、模型 allowlist、空间和 GPU 准入均可读取；
@@ -421,6 +434,6 @@ Windows 与不同 DPI 的自动化测试通过不等于完成 Windows 服务器�
 
 ## 12. 审核结论
 
-本说明已经把以下安全边界写成实现前提：非 root 多用户隔离、系统 SSH agent 认证、无秘密存储、无任意远程命令、数据-only payload、服务器模型 allowlist、服务器端原子锁、路径/软链接/空间保护、版本握手、不可猜测的远程状态和原子结果落地。
+本说明已经把以下安全边界写成实现前提：非 root 多用户隔离、系统 SSH agent 认证、带外主机公钥 pin、无秘密存储、无任意远程命令、数据-only payload、runner 重建 data YAML、服务器模型 allowlist、服务器端原子锁与进程身份核验、路径/软链接/空间保护、版本握手、不可猜测的远程状态和原子结果落地。
 
 只有在这些边界全部以代码和测试实现后，EzYOLO 才能把远程训练标为可用；在此之前，qh-server 的 root 管理连接和任何没有普通账号/runner 的服务器都只能显示为“尚未满足远程训练前置条件”。
