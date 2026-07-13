@@ -118,6 +118,8 @@ def _validate_remote_root(value: Any) -> str:
     value = _validate_text("remote_root", value)
     if _REMOTE_ROOT_RE.fullmatch(value) is None or value == "/":
         raise _invalid("remote_root")
+    if value == "/root" or value.startswith("/root/"):
+        raise _invalid("remote_root")
 
     segments = value.split("/")
     if segments[0] != "" or any(not segment for segment in segments[1:]):

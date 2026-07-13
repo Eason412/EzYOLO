@@ -155,6 +155,8 @@ def test_remote_root_uses_posix_rules_and_rejects_noncanonical_segments():
         "/srv/project name",
         "/srv/project\n",
         "/srv\\project",
+        "/root",
+        "/root/ezyolo",
     ):
         _assert_rejected(remote_root=root)
 

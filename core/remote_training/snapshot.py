@@ -53,6 +53,14 @@ class SnapshotSource:
 
 
 @dataclass(frozen=True)
+class GeneratedSnapshotSource:
+    """由本机受控逻辑生成的标签文本；绝不来自客户端任意脚本或 YAML。"""
+
+    payload_path: str
+    content: bytes
+
+
+@dataclass(frozen=True)
 class SnapshotEstimate:
     file_count: int
     total_bytes: int
@@ -85,7 +93,7 @@ class DatasetSnapshotBuilder:
         checked = self._checked_sources(sources)
         return SnapshotEstimate(
             file_count=len(checked),
-            total_bytes=sum(item.source_stat.st_size for item in checked),
+            total_bytes=sum(_checked_source_size(item) for item in checked),
         )
 
     def build(
@@ -119,11 +127,19 @@ class DatasetSnapshotBuilder:
             for item in checked:
                 destination = snapshot_root / item.payload_path
                 destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                size, digest = _copy_checked_source(
-                    item.source_path,
-                    item.source_stat,
-                    destination,
-                )
+                if item.generated_content is not None:
+                    size, digest = _write_generated_source(
+                        destination,
+                        item.generated_content,
+                    )
+                else:
+                    if item.source_path is None or item.source_stat is None:
+                        raise SnapshotError("普通数据源缺少文件信息")
+                    size, digest = _copy_checked_source(
+                        item.source_path,
+                        item.source_stat,
+                        destination,
+                    )
                 entries.append(
                     ManifestEntry(
                         path=item.payload_path,
@@ -177,19 +193,29 @@ class DatasetSnapshotBuilder:
         checked = []
         seen_paths: set[str] = set()
         for source in sources:
-            if not isinstance(source, SnapshotSource):
-                raise SnapshotError("sources 必须由 SnapshotSource 组成")
-            payload_path = _validate_payload_path(source.payload_path)
+            if isinstance(source, SnapshotSource):
+                payload_path = _validate_payload_path(source.payload_path)
+                source_path = Path(source.source_path)
+                source_stat = _check_source_file(source_path, self._allowed_roots)
+                generated_content = None
+            elif isinstance(source, GeneratedSnapshotSource):
+                payload_path = _validate_generated_payload_path(source.payload_path)
+                if not isinstance(source.content, bytes):
+                    raise SnapshotError("生成的标签内容必须是 bytes")
+                source_path = None
+                source_stat = None
+                generated_content = source.content
+            else:
+                raise SnapshotError("sources 必须由受控数据源组成")
             if payload_path in seen_paths:
                 raise SnapshotError("同一个 payload 路径只能出现一次")
             seen_paths.add(payload_path)
-            path = Path(source.source_path)
-            source_stat = _check_source_file(path, self._allowed_roots)
             checked.append(
                 _CheckedSource(
-                    source_path=path,
+                    source_path=source_path,
                     payload_path=payload_path,
                     source_stat=source_stat,
+                    generated_content=generated_content,
                 )
             )
         return checked
@@ -197,9 +223,10 @@ class DatasetSnapshotBuilder:
 
 @dataclass(frozen=True)
 class _CheckedSource:
-    source_path: Path
+    source_path: Path | None
     payload_path: str
-    source_stat: os.stat_result
+    source_stat: os.stat_result | None
+    generated_content: bytes | None
 
 
 def compute_snapshot_hash(
@@ -353,6 +380,17 @@ def _copy_checked_source(
             os.close(descriptor)
 
 
+def _write_generated_source(destination: Path, content: bytes) -> tuple[int, str]:
+    """将受控生成的标签写入新 staging 文件，不触碰任何用户源数据。"""
+    digest = hashlib.sha256(content).hexdigest()
+    try:
+        with destination.open("xb") as destination_file:
+            destination_file.write(content)
+    except OSError as exc:
+        raise SnapshotError("无法写入生成的标签文件") from exc
+    return len(content), digest
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file_handle:
@@ -398,6 +436,13 @@ def _validate_payload_path(value: object) -> str:
     if parts[0] == "labels" and suffix in LABEL_SUFFIXES:
         return pure_path.as_posix()
     raise SnapshotError("payload 仅允许 images 下的图片或 labels 下的 txt")
+
+
+def _validate_generated_payload_path(value: object) -> str:
+    path = _validate_payload_path(value)
+    if not path.startswith("labels/"):
+        raise SnapshotError("只有 labels 下的 txt 可以由本机受控逻辑生成")
+    return path
 
 
 def _normalise_layout(layout: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
@@ -504,3 +549,11 @@ def _is_within(candidate: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _checked_source_size(source: _CheckedSource) -> int:
+    if source.generated_content is not None:
+        return len(source.generated_content)
+    if source.source_stat is None:
+        raise SnapshotError("普通数据源缺少文件信息")
+    return source.source_stat.st_size

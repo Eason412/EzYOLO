@@ -14,6 +14,7 @@ import os
 import json
 import shutil
 from html import escape
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from gui.styles import COLORS, mono_font_family_css, set_menu_indicator
@@ -24,6 +25,27 @@ from gui.workflow import (
     STEP_IMPORT, STEP_ANNOTATE, STEP_RESULT,
     get_project_snapshot,
 )
+from gui.remote_training_runtime import (
+    RemoteTrainingRuntimeError,
+    build_system_remote_backend,
+    current_remote_training_runtime_paths,
+)
+from gui.remote_training_thread import RemoteTrainingRequest, RemoteTrainingThread
+from core.remote_training.dataset_sources import (
+    RemoteDatasetPlanner,
+    RemoteDatasetPlanningError,
+)
+from core.remote_training.jobs import RemoteTrainingJobStore, ResultStager
+from core.remote_training.launch import (
+    LocalLaunchPlan,
+    RemoteLaunchPlan,
+    TrainingLaunchController,
+    TrainingLaunchError,
+)
+from core.remote_training.profile_store import RemoteTrainingProfileStore
+from core.remote_training.results import verify_result_bundle
+from core.remote_training.snapshot import DatasetSnapshotBuilder, SnapshotError
+from core.remote_training.transport import ClientTransportUnavailable, RemoteTransportError
 from models.database import db
 
 UNGROUPED_GROUP_ID = 0
@@ -110,6 +132,7 @@ SIZE_NAMES = {
 }
 
 NO_TEMPLATE_OPTION = "不使用模板"
+APP_ROOT = Path(__file__).resolve().parents[2]
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -730,6 +753,12 @@ class TrainPage(QWidget):
         self.training_history = []
         self.settings = QSettings("EzYOLO", "Settings")
         self.training_templates = {}
+        self.remote_profile_store = RemoteTrainingProfileStore(self.settings)
+        self.remote_job_store = RemoteTrainingJobStore(self.settings)
+        self._remote_target_notice = ""
+        self._active_training_is_remote = False
+        self._last_remote_result_dir = None
+        self._last_remote_job_record = None
 
         # 当前项目的进度事实 + 「为什么还不能训练」
         self.snapshot = get_project_snapshot(None)
@@ -780,6 +809,29 @@ class TrainPage(QWidget):
 
     def is_training_active(self) -> bool:
         return self.training_thread is not None and self.training_thread.isRunning()
+
+    def request_close(self) -> bool:
+        """请求当前训练安全收尾，返回是否已经可以销毁窗口。
+
+        Qt 的 QThread 仍在运行时销毁其 owner 会直接终止进程。这里不等待网络或
+        训练线程：远程任务只发一次取消请求，本机任务沿用已有的 stop 标记；窗口
+        层据此拒绝本次关闭，等 ``training_finished`` 后用户可再次关闭。
+        """
+        if not self.is_training_active():
+            return True
+
+        self.stop_requested = True
+        if self._active_training_is_remote:
+            self.training_thread.request_cancel()
+            self.btn_stop.setEnabled(False)
+            self.set_status("正在等待服务器确认停止，暂时不能关闭窗口…", COLORS['warning'])
+            self.log_message("关闭窗口前已请求远程 runner 停止，等待明确确认…")
+        else:
+            self.training_thread.stop()
+            self.btn_stop.setEnabled(False)
+            self.set_status("正在停止本机训练，暂时不能关闭窗口…", COLORS['warning'])
+            self.log_message("关闭窗口前已请求停止本机训练，等待当前线程结束…")
+        return False
 
     def goto_step(self, index: int):
         """跳到主流程的某一步（主窗口负责真正的切换）。"""
@@ -923,6 +975,18 @@ class TrainPage(QWidget):
         # 都比下面的表单窄一截，六行控件的左边缘对不上一条线
         form.addRow("训练模板:", self.create_template_row())
 
+        self.training_target = NoWheelComboBox()
+        self.training_target.setObjectName("training_target_combo")
+        self.training_target.setToolTip(
+            "本地训练使用这台电脑；远程训练只会显示已在「设置」中保存的服务器。"
+        )
+        form.addRow("训练位置:", self.training_target)
+
+        self.remote_target_hint = QLabel("")
+        self.remote_target_hint.setObjectName("caption")
+        self.remote_target_hint.setWordWrap(True)
+        form.addRow("", self.remote_target_hint)
+
         self.model_version = NoWheelComboBox()
         self.model_version.addItems(sorted(ULTRALYTICS_MODELS.keys()))
         self.model_version.setToolTip("YOLO 的版本。不清楚选哪个就用默认的。")
@@ -950,10 +1014,89 @@ class TrainPage(QWidget):
         self.device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
         self.device.setToolTip("自动选择：有 NVIDIA 显卡就用显卡，没有就用 CPU（会慢很多）。")
         form.addRow("计算设备:", self.device)
+        self.refresh_remote_targets()
 
         layout.addLayout(form)
 
         return card
+
+    def refresh_remote_targets(self) -> None:
+        """刷新本地/远程训练位置；被删掉的远程档案要明确回到本地，不能静默开远程。"""
+        if not hasattr(self, "training_target"):
+            return
+        previous_target = self.training_target.currentData()
+        self.training_target.blockSignals(True)
+        self.training_target.clear()
+        self.training_target.addItem("本地训练", "local")
+        try:
+            profiles = self.remote_profile_store.list()
+        except Exception:
+            profiles = []
+            self._remote_target_notice = (
+                "远程服务器档案无法安全读取，已只保留本地训练。请到「设置」检查档案。"
+            )
+        else:
+            if isinstance(previous_target, str) and previous_target.startswith("remote:"):
+                expected_id = previous_target.removeprefix("remote:")
+                if not any(profile.id == expected_id for profile in profiles):
+                    self._remote_target_notice = (
+                        "刚才选择的远程服务器已不存在，已明确切回本地训练。"
+                    )
+            for profile in profiles:
+                self.training_target.addItem(f"远程 · {profile.name}", f"remote:{profile.id}")
+
+        selected_index = self.training_target.findData(previous_target)
+        self.training_target.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self.training_target.blockSignals(False)
+        self._update_training_target_ui()
+        self.update_summary()
+
+    def selected_remote_target_profile(self):
+        target = self.training_target.currentData()
+        if not isinstance(target, str) or not target.startswith("remote:"):
+            return None
+        profile_id = target.removeprefix("remote:")
+        try:
+            profiles = self.remote_profile_store.list()
+        except Exception:
+            return None
+        return next((profile for profile in profiles if profile.id == profile_id), None)
+
+    def on_training_target_changed(self, _index: int = -1) -> None:
+        self._remote_target_notice = ""
+        self._update_training_target_ui()
+        self.update_summary()
+
+    def _update_training_target_ui(self) -> None:
+        """远程时不再让本机 GPU 下拉造成误解；服务器自己的政策决定设备。"""
+        if not hasattr(self, "device") or not hasattr(self, "remote_target_hint"):
+            return
+        profile = self.selected_remote_target_profile()
+        if profile is not None:
+            self.device.setEnabled(False)
+            self.device.setToolTip("远程训练由服务器管理员策略选择设备；本机设备设置不会上传。")
+            task = self.task_type.currentData() if hasattr(self, "task_type") else None
+            if task not in {"detect", "segment"}:
+                self.remote_target_hint.setText(
+                    "远程训练首版只支持目标检测和实例分割；请改选任务类型或切回本地训练。"
+                )
+                self.remote_target_hint.setStyleSheet(f"color: {COLORS['warning']};")
+            else:
+                self.remote_target_hint.setText(
+                    f"服务器：{profile.username}@{profile.host}:{profile.port} · {profile.remote_root}\n"
+                    "服务器按自己的策略选择设备；开始前会先显示上传数据的确认信息。"
+                )
+                self.remote_target_hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            return
+
+        self.device.setEnabled(True)
+        self.device.setToolTip("自动选择：有 NVIDIA 显卡就用显卡，没有就用 CPU（会慢很多）。")
+        if self._remote_target_notice:
+            self.remote_target_hint.setText(self._remote_target_notice)
+            self.remote_target_hint.setStyleSheet(f"color: {COLORS['warning']};")
+        else:
+            self.remote_target_hint.setText("使用这台电脑训练；可在下方「计算设备」一行选择。")
+            self.remote_target_hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
 
     def create_template_row(self) -> QWidget:
         """训练模板：一行「选择 + 套用」，增删改收进菜单，不在页面上堆四个同级按钮。"""
@@ -1436,13 +1579,25 @@ class TrainPage(QWidget):
             self._summary_unit("加载线程 ") + self._summary_value(escape(str(self.workers.value()))),
         ])
 
+        remote_profile = self.selected_remote_target_profile()
+        if remote_profile is not None:
+            location_html = self._summary_value(
+                escape(f"远程 · {remote_profile.name}"),
+                accent=True,
+            )
+            device_html = self._summary_value("由服务器策略选择")
+        else:
+            location_html = self._summary_value("本地训练")
+            device_html = self._summary_value(escape(self.device.currentText()))
+
         rows = [
             self._summary_row("模型", model_html),
+            self._summary_row("训练位置", location_html),
             self._summary_row(
                 "训练轮数",
                 self._summary_value(escape(str(self.epochs.value()))) + self._summary_unit(" 轮"),
             ),
-            self._summary_row("计算设备", self._summary_value(escape(self.device.currentText()))),
+            self._summary_row("计算设备", device_html),
             self._summary_row("数据划分", self._summary_value(escape(split_text))),
             self._summary_row(
                 "数据增强",
@@ -1468,6 +1623,8 @@ class TrainPage(QWidget):
         for check in (self.mosaic, self.mixup, self.flip, self.rotate, self.hsv):
             check.toggled.connect(self.update_summary)
         self.hsv_strength.valueChanged.connect(self.update_summary)
+        self.training_target.currentIndexChanged.connect(self.on_training_target_changed)
+        self.task_type.currentIndexChanged.connect(lambda _index: self._update_training_target_ui())
 
     def create_run_panel(self) -> QFrame:
         """⑤ 开始 / 停止 / 完成后去哪。固定在左栏底部，永远看得见。"""
@@ -1535,13 +1692,15 @@ class TrainPage(QWidget):
 
     def show_done_panel(self):
         """训练完成：说清楚产出在哪、下一步该去哪。"""
-        weights = self.snapshot.get('weights')
+        remote_result = self._last_remote_result_dir if self._active_training_is_remote else None
+        weights = remote_result or self.snapshot.get('weights')
         lines = ["✓ 训练完成。"]
         if weights:
             # 绝对路径可能很长，省略中段显示，完整路径放进 tooltip，避免硬换行截断
             metrics = self.done_label.fontMetrics()
             elided = metrics.elidedText(str(weights), Qt.TextElideMode.ElideMiddle, 320)
-            lines.append(f"模型权重（best.pt）：{elided}")
+            label = "远程训练结果" if remote_result else "模型权重（best.pt）"
+            lines.append(f"{label}：{elided}")
             self.done_label.setToolTip(str(weights))
         else:
             self.done_label.setToolTip("")
@@ -2092,7 +2251,7 @@ class TrainPage(QWidget):
         return tab
     
     def start_training(self):
-        """开始训练"""
+        """解析一次明确的本地/远程启动计划；远程绝不自动降级成本地。"""
         # 前置条件：项目、图片、标注、类别，缺一样就说清楚缺什么
         self.refresh_readiness()
         if self.blocker:
@@ -2122,6 +2281,28 @@ class TrainPage(QWidget):
             QMessageBox.warning(self, "错误", "请选择有效的模型版本和型号")
             return
 
+        target = self.training_target.currentData() or "local"
+        controller = TrainingLaunchController(
+            self.remote_profile_store,
+            remote_executor_registered=True,
+        )
+        try:
+            launch_plan = controller.resolve_for_execution(
+                project_id=self.current_project_id,
+                runtime_config=config,
+                target=target,
+            )
+        except TrainingLaunchError as exc:
+            QMessageBox.warning(self, "训练位置不可用", str(exc))
+            return
+
+        if isinstance(launch_plan, RemoteLaunchPlan):
+            self._start_remote_training(launch_plan)
+            return
+        self._start_local_training(launch_plan.runtime_config)
+
+    def _start_local_training(self, config: dict) -> None:
+        """保持原有本机 TrainingThread 流程，不让远程逻辑进入它。"""
         version = config['version']
         model_size = config['model_size']
         task = config['task']
@@ -2142,21 +2323,7 @@ class TrainPage(QWidget):
         self.training_thread.log_message.connect(self.on_log_message)
         self.training_thread.metrics_updated.connect(self.on_metrics_updated)
 
-        # 更新UI状态：开始让位给停止，配置区锁住（改了也不会生效，别让人误会）
-        self.stop_requested = False
-        self.total_epochs = config['epochs']
-        self.hide_done_panel()
-        self.scroll_content.setEnabled(False)
-        self.btn_start.hide()
-        self.btn_stop.setEnabled(True)
-        self.btn_stop.show()
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(config['epochs'])
-        self.progress_bar.setValue(0)
-        self.set_status(
-            "正在准备数据、加载模型…第一轮开始前要复制图片，可能要等一会。",
-            COLORS['accent_text'],
-        )
+        self._begin_training_ui(config, remote=False)
 
         # 曲线要等第一轮跑完才有数据，先让用户看到日志在动
         self.monitor_tabs.setCurrentIndex(self.log_tab_index)
@@ -2170,18 +2337,157 @@ class TrainPage(QWidget):
         self.log_message(f"Epochs: {config['epochs']}, Batch: {config['batch_size']}")
         self.log_message("=" * 50)
 
+    def _start_remote_training(self, plan: RemoteLaunchPlan) -> None:
+        """确认后才启动远程后台状态机；此方法本身不拼 SSH 命令。"""
+        try:
+            selection = RemoteDatasetPlanner(db).build(
+                project_id=plan.project_id,
+                task_type=plan.task_type,
+                runtime_config=plan.runtime_config,
+            )
+            runtime_paths = current_remote_training_runtime_paths(APP_ROOT)
+            snapshot_builder = DatasetSnapshotBuilder(
+                runtime_paths.snapshot_parent,
+                allowed_roots=selection.allowed_roots,
+            )
+            estimate = snapshot_builder.estimate(selection.sources)
+        except (
+            RemoteDatasetPlanningError,
+            SnapshotError,
+            RemoteTrainingRuntimeError,
+        ) as exc:
+            QMessageBox.warning(self, "无法准备远程训练", str(exc))
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认远程训练",
+            "确认后，EzYOLO 会创建当前项目的只读数据快照，并通过系统 OpenSSH + rsync "
+            "上传到以下已固定主机公钥的服务器。不会保存密码、私钥或口令。\n\n"
+            f"服务器：{plan.profile.name}（{plan.profile.username}@{plan.profile.host}:{plan.profile.port}）\n"
+            f"服务器目录：{plan.profile.remote_root}\n"
+            f"训练：{plan.task_type} · {plan.model_symbol} · {plan.runtime_config['epochs']} 轮\n"
+            f"预计上传：{estimate.file_count} 个文件，{self._format_bytes(estimate.total_bytes)}\n\n"
+            "服务器仍会在上传前做只读预检；预检失败时不会上传数据，也不会自动改成本地训练。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            backend = build_system_remote_backend(runtime_paths)
+        except (ClientTransportUnavailable, RemoteTransportError) as exc:
+            QMessageBox.warning(self, "本机远程工具不可用", str(exc))
+            return
+
+        request = RemoteTrainingRequest(
+            launch_plan=plan,
+            class_names=selection.class_names,
+            layout=selection.layout,
+            sources=selection.sources,
+        )
+        self.training_history = []
+        self.clear_plots()
+        self._last_remote_result_dir = None
+        self.training_thread = RemoteTrainingThread(
+            request=request,
+            backend=backend,
+            job_store=self.remote_job_store,
+            snapshot_builder=snapshot_builder,
+            result_stager=ResultStager(
+                runtime_paths.result_staging_parent,
+                runtime_paths.runs_train_root,
+            ),
+            result_verifier=verify_result_bundle,
+        )
+        self.training_thread.state_changed.connect(self.on_remote_training_state_changed)
+        self.training_thread.job_updated.connect(self.on_remote_job_updated)
+        self.training_thread.training_finished.connect(self.on_training_finished)
+        self.training_thread.log_message.connect(self.on_log_message)
+
+        self._begin_training_ui(dict(plan.runtime_config), remote=True)
+        self.monitor_tabs.setCurrentIndex(self.log_tab_index)
+        self.training_thread.start()
+        self.log_message("=" * 50)
+        self.log_message("远程训练已确认，正在进行服务器预检。")
+        self.log_message(f"服务器: {plan.profile.name} · 目录: {plan.profile.remote_root}")
+        self.log_message(
+            f"预计上传: {estimate.file_count} 个文件，{self._format_bytes(estimate.total_bytes)}"
+        )
+        self.log_message("=" * 50)
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        if value < 1024:
+            return f"{value} B"
+        units = ("KB", "MB", "GB", "TB")
+        size = float(value)
+        for unit in units:
+            size /= 1024
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.1f} {unit}"
+        return f"{value} B"
+
+    def _begin_training_ui(self, config, *, remote: bool) -> None:
+        """本机和远程共用的界面锁定，不把远程生命周期塞进本机线程。"""
+        self._active_training_is_remote = remote
+        self.stop_requested = False
+        self.total_epochs = config['epochs']
+        self.hide_done_panel()
+        self.scroll_content.setEnabled(False)
+        self.btn_start.hide()
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.show()
+        self.progress_bar.setVisible(True)
+        if remote:
+            self.progress_bar.setRange(0, 0)
+            self.set_status("正在核验服务器与训练能力…", COLORS['accent_text'])
+        else:
+            self.progress_bar.setRange(0, config['epochs'])
+            self.progress_bar.setValue(0)
+            self.set_status(
+                "正在准备数据、加载模型…第一轮开始前要复制图片，可能要等一会。",
+                COLORS['accent_text'],
+            )
+
+    def on_remote_training_state_changed(self, status: str) -> None:
+        """只显示已持久化/runner 确认的状态，不猜测远程训练是否成功。"""
+        if status == "RUNNING":
+            self.set_status("远程服务器正在训练…", COLORS['accent_text'])
+        elif status == "CANCEL_REQUESTED":
+            self.set_status("正在等待服务器确认停止…", COLORS['warning'])
+        elif status == "REMOTE_SUCCEEDED_PENDING_COLLECTION":
+            self.set_status("服务器训练完成，正在准备回传结果…", COLORS['accent_text'])
+        elif status == "COLLECTING":
+            self.set_status("正在回传并校验训练结果…", COLORS['accent_text'])
+        elif status == "UNKNOWN":
+            self.set_status("连接中断，远程任务状态未知。", COLORS['warning'])
+
+    def on_remote_job_updated(self, record) -> None:
+        self._last_remote_job_record = record
+        if getattr(record, "local_result_dir", None):
+            self._last_remote_result_dir = record.local_result_dir
+
     def stop_training(self):
         """停止训练：只发请求，不阻塞界面。"""
         if not self.is_training_active():
             self.reset_ui_state()
             return
 
+        body = (
+            "确定要请求停止这次远程训练吗？\n\n"
+            "EzYOLO 会向服务器发送停止请求，并等待服务器明确确认。"
+            "在服务器确认前，不能把任务显示为已停止。"
+            if self._active_training_is_remote
+            else "确定要停止这次训练吗？\n\n"
+            "会在当前这一轮跑完后停下（可能还要等几分钟）。\n"
+            "已经跑完的轮次会保留在 runs 目录里，但这次训练不会再继续。"
+        )
         reply = QMessageBox.question(
             self,
             "停止训练",
-            "确定要停止这次训练吗？\n\n"
-            "会在当前这一轮跑完后停下（可能还要等几分钟）。\n"
-            "已经跑完的轮次会保留在 runs 目录里，但这次训练不会再继续。",
+            body,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2189,10 +2495,17 @@ class TrainPage(QWidget):
             return
 
         self.stop_requested = True
-        self.training_thread.stop()
+        if self._active_training_is_remote:
+            self.training_thread.request_cancel()
+        else:
+            self.training_thread.stop()
         self.btn_stop.setEnabled(False)
-        self.set_status("正在停止…当前这一轮跑完就会停下。", COLORS['warning'])
-        self.log_message("已请求停止训练，等待当前轮次结束…")
+        if self._active_training_is_remote:
+            self.set_status("已请求服务器停止，正在等待确认…", COLORS['warning'])
+            self.log_message("已请求服务器停止，等待远程 runner 明确确认…")
+        else:
+            self.set_status("正在停止…当前这一轮跑完就会停下。", COLORS['warning'])
+            self.log_message("已请求停止训练，等待当前轮次结束…")
 
     def reset_ui_state(self):
         """回到「可以开始训练」的样子。"""
@@ -2301,6 +2614,12 @@ class TrainPage(QWidget):
     
     def on_training_finished(self, success: bool, message: str):
         """训练结束：完成、被停止、或者失败。"""
+        was_remote = self._active_training_is_remote
+        remote_terminal_status = getattr(
+            getattr(self, "_last_remote_job_record", None),
+            "last_status",
+            None,
+        )
         self.btn_stop.hide()
         self.progress_bar.setVisible(False)
         self.scroll_content.setEnabled(True)
@@ -2315,18 +2634,25 @@ class TrainPage(QWidget):
 
         self.reset_ui_state()
 
-        if self.stop_requested:
+        if self.stop_requested and (
+            not was_remote or getattr(remote_terminal_status, "value", None) == "CANCELLED"
+        ):
             self.set_status("已停止训练", COLORS['warning'])
             QMessageBox.information(
                 self, "已停止训练",
                 "训练已停止。已经跑完的轮次结果保留在 runs 目录里，随时可以重新开始一次训练。"
             )
         else:
-            self.set_status("训练失败，看右边的训练日志找原因", COLORS['error'])
+            failure_text = (
+                "远程训练未能完成，看右边的训练日志找原因"
+                if was_remote else "训练失败，看右边的训练日志找原因"
+            )
+            self.set_status(failure_text, COLORS['error'])
             QMessageBox.warning(
                 self, "训练没能完成",
                 f"{message}\n\n右边「训练日志」里有完整报错，可以保存下来再排查。"
             )
+        self._active_training_is_remote = False
     
     def on_log_message(self, message: str):
         """日志消息"""

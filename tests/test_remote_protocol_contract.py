@@ -17,7 +17,9 @@ from remote_protocol.v1 import (  # noqa: E402
     JOB_SPEC_FIELDS,
     MANIFEST_ENTRY_FIELDS,
     MANIFEST_FIELDS,
+    RESULT_MANIFEST_FIELDS,
     RESULT_RECEIPT_FIELDS,
+    RUNNER_FAILURE_FIELDS,
     STATUS_FIELDS,
     REMOTE_PROTOCOL_VERSION,
     DatasetManifest,
@@ -28,6 +30,8 @@ from remote_protocol.v1 import (  # noqa: E402
     ProtocolStateError,
     ProtocolValidationError,
     RemoteStatus,
+    RunnerFailureEnvelope,
+    ResultManifest,
     ResultReceipt,
     ServerCapabilities,
     advance_local_status,
@@ -92,6 +96,16 @@ def sample_manifest():
     )
 
 
+def sample_result_manifest():
+    entry = ManifestEntry(path="weights/best.pt", size=99, sha256=SHA256)
+    return ResultManifest(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        job_id=JOB_ID,
+        entries=(entry,),
+        total_bytes=99,
+    )
+
+
 def test_wire_field_names_are_stable():
     assert CAPABILITIES_FIELDS == (
         "protocol_version", "canonical_remote_root", "supported_tasks", "model_symbols",
@@ -112,6 +126,12 @@ def test_wire_field_names_are_stable():
     assert RESULT_RECEIPT_FIELDS == (
         "protocol_version", "job_id", "result_manifest_hash", "result_count", "result_bytes",
     )
+    assert RESULT_MANIFEST_FIELDS == (
+        "protocol_version", "job_id", "entries", "total_bytes",
+    )
+    assert RUNNER_FAILURE_FIELDS == (
+        "protocol_version", "ok", "failure_code", "message",
+    )
 
 
 def test_contract_types_round_trip_strictly():
@@ -123,6 +143,9 @@ def test_contract_types_round_trip_strictly():
 
     manifest = sample_manifest()
     assert DatasetManifest.from_wire(manifest.to_wire()) == manifest
+
+    result_manifest = sample_result_manifest()
+    assert ResultManifest.from_wire(result_manifest.to_wire()) == result_manifest
 
     status = RemoteStatus(
         protocol_version=REMOTE_PROTOCOL_VERSION,
@@ -150,6 +173,14 @@ def test_contract_types_round_trip_strictly():
     )
     assert ResultReceipt.from_wire(receipt.to_wire()) == receipt
 
+    runner_failure = RunnerFailureEnvelope(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        ok=False,
+        failure_code=FailureCode.PRECHECK_FAILED,
+        message="服务器拒绝请求",
+    )
+    assert RunnerFailureEnvelope.from_wire(runner_failure.to_wire()) == runner_failure
+
 
 def test_contract_rejects_version_and_unknown_fields():
     payload = sample_spec().to_wire()
@@ -164,6 +195,39 @@ def test_contract_rejects_version_and_unknown_fields():
     payload["entries"][0]["extra"] = True
     assert_rejected(DatasetManifest.from_wire, payload)
 
+    payload = sample_result_manifest().to_wire()
+    payload["unexpected"] = True
+    assert_rejected(ResultManifest.from_wire, payload)
+
+    payload = RunnerFailureEnvelope(
+        REMOTE_PROTOCOL_VERSION,
+        False,
+        FailureCode.PRECHECK_FAILED,
+        "服务器拒绝请求",
+    ).to_wire()
+    payload["debug"] = "not-allowed"
+    assert_rejected(RunnerFailureEnvelope.from_wire, payload)
+    payload = RunnerFailureEnvelope(
+        REMOTE_PROTOCOL_VERSION,
+        False,
+        FailureCode.PRECHECK_FAILED,
+        "服务器拒绝请求",
+    ).to_wire()
+    payload["ok"] = True
+    assert_rejected(RunnerFailureEnvelope.from_wire, payload)
+
+    assert_rejected(
+        ServerCapabilities,
+        REMOTE_PROTOCOL_VERSION,
+        "/root/ezyolo",
+        ("detect",),
+        ("yolov10n",),
+        1,
+        1,
+        1,
+        1,
+    )
+
 
 def test_job_and_payload_validation_rejects_escape_values():
     assert validate_job_id(JOB_ID) == JOB_ID
@@ -175,6 +239,7 @@ def test_job_and_payload_validation_rejects_escape_values():
     assert_rejected(ManifestEntry, "images/-unsafe.jpg", 1, SHA256)
     assert_rejected(ManifestEntry, "images/line\\n.jpg", 1, SHA256)
     assert_rejected(ManifestEntry, "images/a.jpg", -1, SHA256)
+    assert_rejected(ResultManifest, REMOTE_PROTOCOL_VERSION, JOB_ID, (), 0)
 
 
 def test_failed_status_requires_known_failure_code():

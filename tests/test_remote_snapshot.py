@@ -11,6 +11,7 @@ import tempfile
 
 from core.remote_training.snapshot import (  # noqa: E402
     DatasetSnapshotBuilder,
+    GeneratedSnapshotSource,
     SnapshotError,
     SnapshotIntegrityError,
     SnapshotSource,
@@ -127,6 +128,30 @@ def test_snapshot_rejects_forbidden_payload_and_duplicate_destination():
         )
     )
     assert_rejected(builder.estimate, duplicate)
+
+
+def test_snapshot_allows_only_controlled_generated_label_text():
+    source_root = make_source_tree()
+    builder = make_builder(source_root)
+    sources = build_sources(source_root)
+    sources[1] = GeneratedSnapshotSource(
+        "labels/train/train-1.txt",
+        b"0 0.5 0.5 0.3 0.3\n",
+    )
+    snapshot = builder.build(
+        job_id=JOB_ID,
+        task_type="detect",
+        class_names=("person",),
+        layout={"train": "images/train", "val": "images/val"},
+        sources=sources,
+    )
+    assert (
+        snapshot.root / "labels/train/train-1.txt"
+    ).read_text(encoding="utf-8") == "0 0.5 0.5 0.3 0.3\n"
+    assert_rejected(
+        builder.estimate,
+        [GeneratedSnapshotSource("images/train/not-allowed.jpg", b"image")],
+    )
 
 
 def test_snapshot_rejects_missing_split_and_never_overwrites_job_directory():

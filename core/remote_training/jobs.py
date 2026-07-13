@@ -21,6 +21,7 @@ from remote_protocol.v1 import (
     ResultReceipt,
     advance_local_status,
     complete_collection,
+    mark_unknown as protocol_mark_unknown,
     resolve_runner_status,
     validate_job_id,
     validate_sha256,
@@ -198,6 +199,49 @@ class RemoteTrainingJobRecord:
             self,
             last_status=next_status,
             failure_code=remote_status.failure_code,
+            updated_at=_timestamp(now),
+        )
+
+    def advance_local(
+        self,
+        target: JobStatus,
+        *,
+        now: datetime | None = None,
+    ) -> "RemoteTrainingJobRecord":
+        """推进非终态的本机步骤；FAILED 必须改用 fail() 并带明确原因。"""
+        if target == JobStatus.FAILED:
+            raise RemoteTrainingJobError("FAILED 必须带明确 failure_code")
+        return _replace_local_status(self, target, now=now)
+
+    def fail(
+        self,
+        failure_code: FailureCode,
+        *,
+        now: datetime | None = None,
+    ) -> "RemoteTrainingJobRecord":
+        """把可失败的本机阶段原子更新为 FAILED + 可解释原因。"""
+        try:
+            failed = advance_local_status(self.last_status, JobStatus.FAILED)
+            code = FailureCode(failure_code)
+        except (ProtocolStateError, TypeError, ValueError) as exc:
+            raise RemoteTrainingJobError("job record 不允许该失败状态变化") from exc
+        return replace(
+            self,
+            last_status=failed,
+            failure_code=code,
+            updated_at=_timestamp(now),
+        )
+
+    def mark_unknown(self, *, now: datetime | None = None) -> "RemoteTrainingJobRecord":
+        """网络中断后持久化 UNKNOWN；下次只能由 runner 事实状态恢复。"""
+        try:
+            unknown = protocol_mark_unknown(self.last_status)
+        except ProtocolStateError as exc:
+            raise RemoteTrainingJobError("终态任务不能被标记为 UNKNOWN") from exc
+        return replace(
+            self,
+            last_status=unknown,
+            failure_code=None,
             updated_at=_timestamp(now),
         )
 
@@ -399,6 +443,8 @@ def _ensure_unique_job_ids(records: Sequence[RemoteTrainingJobRecord]) -> None:
 def _validate_canonical_remote_root(value: object) -> None:
     if not isinstance(value, str) or value == "/" or not value.startswith("/"):
         raise RemoteTrainingJobError("canonical_remote_root 必须是非根绝对路径")
+    if value == "/root" or value.startswith("/root/"):
+        raise RemoteTrainingJobError("canonical_remote_root 不能位于 /root")
     if any(ord(char) < 32 for char in value) or "//" in value:
         raise RemoteTrainingJobError("canonical_remote_root 不规范")
     parts = value.split("/")[1:]

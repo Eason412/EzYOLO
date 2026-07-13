@@ -81,6 +81,12 @@ def test_malformed_store_fails_closed():
     assert_rejected(RemoteTrainingJobStore(settings).list)
 
 
+def test_job_record_rejects_root_owned_remote_root_even_if_settings_are_hand_edited():
+    payload = make_record().to_dict()
+    payload["canonical_remote_root"] = "/root/ezyolo"
+    assert_rejected(RemoteTrainingJobRecord.from_dict, payload)
+
+
 def test_runner_status_unknown_remote_crash_cancel_and_collection_failure():
     record = make_record()
     running = record.with_runner_status(
@@ -134,6 +140,21 @@ def test_runner_status_unknown_remote_crash_cancel_and_collection_failure():
     collection_failed = collecting.fail_collection(now=NOW)
     assert collection_failed.last_status == JobStatus.FAILED
     assert collection_failed.failure_code == FailureCode.COLLECTION_FAILED
+
+
+def test_job_record_local_progress_failure_and_unknown_are_persistable():
+    record = make_record()
+    snapshotting = record.advance_local(JobStatus.SNAPSHOTTING, now=NOW)
+    uploading = snapshotting.advance_local(JobStatus.UPLOADING, now=NOW)
+    assert uploading.last_status == JobStatus.UPLOADING
+    unknown = uploading.mark_unknown(now=NOW)
+    assert unknown.last_status == JobStatus.UNKNOWN
+    assert_rejected(unknown.advance_local, JobStatus.UPLOADING)
+
+    failed = uploading.fail(FailureCode.UPLOAD_INTEGRITY, now=NOW)
+    assert failed.last_status == JobStatus.FAILED
+    assert failed.failure_code == FailureCode.UPLOAD_INTEGRITY
+    assert_rejected(uploading.advance_local, JobStatus.FAILED)
 
 
 def test_result_promote_is_same_filesystem_atomic_and_never_deserializes_weights():

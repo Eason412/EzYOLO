@@ -130,6 +130,18 @@ RESULT_RECEIPT_FIELDS = (
     "result_count",
     "result_bytes",
 )
+RESULT_MANIFEST_FIELDS = (
+    "protocol_version",
+    "job_id",
+    "entries",
+    "total_bytes",
+)
+RUNNER_FAILURE_FIELDS = (
+    "protocol_version",
+    "ok",
+    "failure_code",
+    "message",
+)
 
 
 def validate_job_id(value: object) -> str:
@@ -237,7 +249,7 @@ _LOCAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
         {JobStatus.VERIFYING_UPLOAD, JobStatus.FAILED}
     ),
     JobStatus.VERIFYING_UPLOAD: frozenset(
-        {JobStatus.STARTING, JobStatus.FAILED}
+        {JobStatus.STARTING, JobStatus.CANCEL_REQUESTED, JobStatus.FAILED}
     ),
     JobStatus.STARTING: frozenset(
         {
@@ -531,6 +543,98 @@ class ResultReceipt:
         )
 
 
+@dataclass(frozen=True)
+class RunnerFailureEnvelope:
+    """runner CLI 失败时唯一允许返回的受控 wire envelope。
+
+    失败 envelope 不携带 traceback、命令行、路径或认证材料。桌面端只使用其中
+    的枚举错误码推进本机任务状态，界面不会直接回显 ``message``。
+    """
+
+    protocol_version: int
+    ok: bool
+    failure_code: FailureCode
+    message: str
+
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        if self.ok is not False:
+            raise ProtocolValidationError("runner failure envelope 的 ok 必须为 false")
+        try:
+            code = FailureCode(self.failure_code)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolValidationError("未知 runner failure_code") from exc
+        object.__setattr__(self, "failure_code", code)
+        _validate_message(self.message)
+        if not self.message.strip():
+            raise ProtocolValidationError("runner failure message 不能为空")
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "protocol_version": self.protocol_version,
+            "ok": False,
+            "failure_code": self.failure_code.value,
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> "RunnerFailureEnvelope":
+        data = _require_exact_fields(payload, RUNNER_FAILURE_FIELDS, "runner failure")
+        return cls(
+            protocol_version=data["protocol_version"],
+            ok=data["ok"],
+            failure_code=data["failure_code"],
+            message=data["message"],
+        )
+
+
+@dataclass(frozen=True)
+class ResultManifest:
+    """服务器回传结果的受控文件清单。
+
+    ``manifest.json`` 本身不在 ``entries`` 里，避免把它自己的哈希递归进清单。
+    ``ResultReceipt.result_manifest_hash`` 是该控制文件原始 UTF-8 字节的 SHA-256，
+    而 ``result_count`` / ``result_bytes`` 只统计 entries 中的实际结果文件。
+    """
+
+    protocol_version: int
+    job_id: str
+    entries: tuple[ManifestEntry, ...]
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        validate_job_id(self.job_id)
+        if not self.entries:
+            raise ProtocolValidationError("结果 manifest 必须至少包含一个文件")
+        if len({entry.path for entry in self.entries}) != len(self.entries):
+            raise ProtocolValidationError("结果 manifest 不能包含重复路径")
+        _validate_nonnegative_int(self.total_bytes, "result total_bytes")
+        if self.total_bytes != sum(entry.size for entry in self.entries):
+            raise ProtocolValidationError("结果 manifest total_bytes 与文件大小不一致")
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "protocol_version": self.protocol_version,
+            "job_id": self.job_id,
+            "entries": [entry.to_wire() for entry in self.entries],
+            "total_bytes": self.total_bytes,
+        }
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> "ResultManifest":
+        data = _require_exact_fields(payload, RESULT_MANIFEST_FIELDS, "result manifest")
+        raw_entries = data["entries"]
+        if not isinstance(raw_entries, list):
+            raise ProtocolValidationError("结果 entries 必须是列表")
+        return cls(
+            protocol_version=data["protocol_version"],
+            job_id=data["job_id"],
+            entries=tuple(ManifestEntry.from_wire(entry) for entry in raw_entries),
+            total_bytes=data["total_bytes"],
+        )
+
+
 def _require_exact_fields(
     payload: Mapping[str, Any], expected: tuple[str, ...], label: str
 ) -> Mapping[str, Any]:
@@ -578,6 +682,8 @@ def _validate_model_symbol(value: object) -> None:
 def _validate_remote_root(value: object) -> None:
     if not isinstance(value, str) or not value.startswith("/") or value == "/":
         raise ProtocolValidationError("canonical_remote_root 必须是非根绝对路径")
+    if value == "/root" or value.startswith("/root/"):
+        raise ProtocolValidationError("canonical_remote_root 不能位于 /root")
     if any(ord(char) < 32 for char in value) or "//" in value:
         raise ProtocolValidationError("canonical_remote_root 不规范")
     parts = value.split("/")[1:]
