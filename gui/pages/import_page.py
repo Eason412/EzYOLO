@@ -347,15 +347,15 @@ class ImportPage(QWidget):
         self.toolbar = self.create_toolbar()
         main_layout.addWidget(self.toolbar)
 
-        # 使用说明：默认收起，紧跟在工具栏下面
+        # 轻量帮助：收起时只在右侧留一个小入口
         self.context_help = ContextHelp(
             [
-                "用工具栏的「导入图片 / 导入文件夹 / 导入视频 / 导入标注」选一种方式，数据就进到当前项目里。",
-                "在「筛选」里选已标注或未标注，缩略图只留下你这次要处理的那一批。",
-                "勾上「显示标注框」，缩略图会直接画出已有标注；取消勾选就只看原图。",
-                "「管理」里的「清空全部图片」和「删除项目」会连标注一起删掉，删了不能撤销。",
+                "“显示标注框”只改变缩略图预览，不会修改任何标注。",
+                "导入标注前先确认格式与图片能够一一对应。",
+                "清空图片或删除项目会连同标注一起删除，且不可撤销。",
             ],
-            risk_steps=[4],
+            risk_steps=[3],
+            title="导入提示",
         )
         main_layout.addWidget(self.context_help)
 

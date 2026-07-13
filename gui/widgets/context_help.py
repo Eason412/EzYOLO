@@ -1,20 +1,43 @@
 # -*- coding: utf-8 -*-
-"""行内『使用说明』：默认收起，进入页面不占地方；点开才看到编号步骤。
+"""轻量的行内帮助入口。
 
-跟 collapsible_section.py 一样不记状态——每次打开页面都从收起开始。
+收起时只在右侧显示一个场景化的小入口；展开后才出现少量提示。组件不记状态——
+每次打开页面都从收起开始。
 """
 
 from pathlib import Path
 
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+from gui.styles import COLORS, RADIUS_SM
 
 _TOGGLE_KEYS = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space)
 
 
 class _ToggleButton(QPushButton):
     """QPushButton 默认只有 Space 会触发点击；Enter 要显式接管。"""
+
+    def sizeHint(self):
+        """按钮里是图标 + 文字 + 箭头，尺寸提示必须把子布局算进去。"""
+        hint = super().sizeHint()
+        if self.layout() is not None:
+            content = self.layout().sizeHint()
+            hint.setWidth(max(hint.width(), content.width() + 16))
+            hint.setHeight(max(32, content.height() + 10))
+        return hint
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
 
     def keyPressEvent(self, event):
         if event.key() in _TOGGLE_KEYS:
@@ -23,7 +46,6 @@ class _ToggleButton(QPushButton):
             return
         super().keyPressEvent(event)
 
-from gui.styles import COLORS, RADIUS_SM
 
 _ASSETS_DIR = Path(__file__).parent.parent / "assets"
 
@@ -49,43 +71,55 @@ def _warning_soft_background() -> str:
 
 
 class ContextHelp(QFrame):
-    """可复用的行内使用说明：整行可点/可聚焦，展开后是编号步骤。"""
+    """可复用的轻量帮助：小入口可点/可聚焦，展开后是 2–3 条提示。"""
 
-    def __init__(self, steps, parent=None, risk_steps=None):
+    def __init__(self, steps, parent=None, risk_steps=None, title="查看提示"):
         super().__init__(parent)
         self.setObjectName("contextHelp")
         self.setStyleSheet(f"""
             QFrame#contextHelp {{
-                background-color: {COLORS['panel']};
-                border: 1px solid {COLORS['border']};
-                border-radius: {RADIUS_SM}px;
+                background-color: transparent;
+                border: none;
             }}
         """)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setSpacing(6)
 
-        self.toggle = _ToggleButton(self)
+        self.header = QWidget(self)
+        header_layout = QHBoxLayout(self.header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(0)
+        header_layout.addStretch(1)
+
+        self.toggle = _ToggleButton(self.header)
         self.toggle.setObjectName("contextHelpToggle")
         self.toggle.setCheckable(True)
         self.toggle.setAutoDefault(False)
         self.toggle.setDefault(False)
         self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.toggle.setAccessibleName(title)
         self.toggle.setStyleSheet(f"""
             QPushButton#contextHelpToggle {{
                 background-color: transparent;
-                border: none;
+                color: {COLORS['accent_text']};
+                border: 1px solid transparent;
                 border-radius: {RADIUS_SM}px;
                 text-align: left;
-                padding: 9px 10px;
+                padding: 5px 8px;
             }}
             QPushButton#contextHelpToggle:hover {{
-                background-color: {COLORS['hover']};
+                background-color: {COLORS['selected']};
             }}
             QPushButton#contextHelpToggle:focus {{
-                background-color: {COLORS['hover']};
+                background-color: transparent;
+                border-color: rgba(0, 122, 255, 0.28);
+            }}
+            QPushButton#contextHelpToggle:checked {{
+                background-color: {COLORS['selected']};
             }}
         """)
 
@@ -93,10 +127,11 @@ class ContextHelp(QFrame):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
 
-        row.addWidget(_icon_label("book.svg", 16))
+        row.addWidget(_icon_label("book.svg", 14))
 
-        self._label = QLabel("使用说明")
-        self._label.setStyleSheet(f"color: {COLORS['text_primary']}; font-weight: 600; border: none;")
+        self._label = QLabel(title)
+        self._label.setObjectName("contextHelpTitle")
+        self._label.setStyleSheet(f"color: {COLORS['accent_text']}; font-weight: 600; border: none;")
         self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         row.addWidget(self._label)
 
@@ -105,13 +140,22 @@ class ContextHelp(QFrame):
         self._chevron = _icon_label("chevron_down.svg", 16)
         row.addWidget(self._chevron)
 
-        outer.addWidget(self.toggle)
+        header_layout.addWidget(self.toggle)
+        outer.addWidget(self.header)
 
-        self.content = QWidget(self)
+        self.content = QFrame(self)
+        self.content.setObjectName("contextHelpContent")
+        self.content.setStyleSheet("""
+            QFrame#contextHelpContent {
+                background-color: rgba(0, 122, 255, 0.055);
+                border: 1px solid rgba(0, 122, 255, 0.14);
+                border-radius: 8px;
+            }
+        """)
         self.content.setVisible(False)
         content_layout = QVBoxLayout(self.content)
-        content_layout.setContentsMargins(10, 0, 10, 8)
-        content_layout.setSpacing(4)
+        content_layout.setContentsMargins(12, 10, 12, 10)
+        content_layout.setSpacing(6)
         outer.addWidget(self.content)
 
         self._content_layout = content_layout
@@ -126,7 +170,7 @@ class ContextHelp(QFrame):
         )
 
     def set_steps(self, steps, risk_steps=None):
-        """替换步骤内容；risk_steps 是需要高风险提示的步骤序号（从 1 开始）。"""
+        """替换提示；risk_steps 是需要单独警示的提示序号（从 1 开始）。"""
         risk_indices = set(risk_steps or [])
 
         while self._content_layout.count():
@@ -139,16 +183,49 @@ class ContextHelp(QFrame):
                 widget.deleteLater()
 
         for index, text in enumerate(steps, start=1):
-            label = QLabel(f"{index}. {text}")
+            row = QFrame(self.content)
+            row.setObjectName("contextHelpRiskRow" if index in risk_indices else "contextHelpTipRow")
+            if index not in risk_indices:
+                # 全局 QFrame 是白底卡片；普通提示行必须显式清掉，否则会变成
+                # 「浅蓝帮助面板里再套三张白卡片」。
+                row.setStyleSheet(
+                    "QFrame#contextHelpTipRow { background-color: transparent; border: none; }"
+                )
+            row_layout = QHBoxLayout(row)
+            row_margin_x = 6 if index in risk_indices else 0
+            row_margin_y = 4 if index in risk_indices else 0
+            row_layout.setContentsMargins(
+                row_margin_x, row_margin_y, row_margin_x, row_margin_y
+            )
+            row_layout.setSpacing(7)
+
+            marker = QLabel("!" if index in risk_indices else "•")
+            marker.setObjectName("contextHelpMarker")
+            marker.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            marker.setFixedWidth(14)
+            marker.setStyleSheet(
+                f"color: {COLORS['warning'] if index in risk_indices else COLORS['primary']}; "
+                "font-weight: 700; border: none; background: transparent;"
+            )
+            row_layout.addWidget(marker)
+
+            label = QLabel(text)
+            label.setObjectName("contextHelpTipText")
             label.setWordWrap(True)
             if index in risk_indices:
+                row.setStyleSheet(
+                    f"QFrame#contextHelpRiskRow {{ background-color: {_warning_soft_background()}; "
+                    f"border: 1px solid rgba(255, 149, 0, 0.18); border-radius: {RADIUS_SM}px; }}"
+                )
                 label.setStyleSheet(
-                    f"color: {COLORS['warning']}; border: none; border-radius: {RADIUS_SM}px; "
-                    f"padding: 2px 6px; background-color: {_warning_soft_background()};"
+                    f"color: {COLORS['warning']}; border: none; background: transparent;"
                 )
             else:
-                label.setStyleSheet(f"color: {COLORS['text_secondary']}; border: none;")
-            self._content_layout.addWidget(label)
+                label.setStyleSheet(
+                    f"color: {COLORS['text_secondary']}; border: none; background: transparent;"
+                )
+            row_layout.addWidget(label, 1)
+            self._content_layout.addWidget(row)
 
     def is_expanded(self) -> bool:
         return self.toggle.isChecked()

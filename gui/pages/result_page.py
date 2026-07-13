@@ -578,12 +578,14 @@ class ResultPage(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        self.context_help = ContextHelp([
-            "先看最上面的结论卡，一句话判断这次训练出来的模型能不能用。",
-            "看「关键指标」里的 mAP50：越接近 1 越准；mAP50-95 比它低很多是常态。",
-            "翻「训练过程与预测示例」里的曲线和预测图：损失应该一路下降并趋平，框的位置和类别要对得上。",
-            "点「导出模型」拿到 ONNX / TensorRT 文件，导出的是这次训练的最佳权重。",
-        ])
+        self.context_help = ContextHelp(
+            [
+                "优先看 mAP50 和预测示例，曲线用于辅助判断。",
+                "损失下降并趋稳，通常表示训练正在收敛。",
+                "导出使用最佳权重，不会修改原来的训练结果。",
+            ],
+            title="指标怎么看",
+        )
         layout.addWidget(self.context_help)
 
         layout.addWidget(self.create_verdict_card())
