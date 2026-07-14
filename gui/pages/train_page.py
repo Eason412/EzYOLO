@@ -7,9 +7,10 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSlider, QProgressBar, QTextEdit,
     QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame,
     QInputDialog, QRadioButton, QListWidget, QListWidgetItem, QButtonGroup,
-    QMenu,
+    QMenu, QToolButton, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings, QSize
+from PyQt6.QtGui import QIcon
 import os
 import json
 import shutil
@@ -133,6 +134,8 @@ SIZE_NAMES = {
 
 NO_TEMPLATE_OPTION = "不使用模板"
 APP_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PANEL_EXPANDED_WIDTH = 360
+CONFIG_PANEL_COLLAPSED_WIDTH = 220
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -759,6 +762,8 @@ class TrainPage(QWidget):
         self._active_training_is_remote = False
         self._last_remote_result_dir = None
         self._last_remote_job_record = None
+        self._config_collapsed = False
+        self._training_auto_collapsed = False
 
         # 当前项目的进度事实 + 「为什么还不能训练」
         self.snapshot = get_project_snapshot(None)
@@ -797,7 +802,7 @@ class TrainPage(QWidget):
         main_layout.setSpacing(16)
 
         self.config_panel = self.create_config_panel()
-        self.config_panel.setFixedWidth(360)
+        self._set_config_collapsed(False)
         main_layout.addWidget(self.config_panel)
 
         self.monitor_panel = self.create_monitor_panel()
@@ -886,11 +891,41 @@ class TrainPage(QWidget):
                 self.task_type.addItem(display_name, task)
     
     def create_config_panel(self) -> QWidget:
-        """左栏：① 确认数据 → ② 基础配置 → ③ 高级参数（可选）→ ④ 摘要，⑤ 开始/停止固定在底部。"""
+        """左栏：展开时编辑配置；收起时保留运行摘要和主操作。"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
+        self.config_layout = layout
+
+        header = QWidget()
+        header.setFixedHeight(28)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
+
+        self.config_title = QLabel("训练配置")
+        self.config_title.setObjectName("title")
+        header_layout.addWidget(self.config_title)
+        header_layout.addStretch(1)
+
+        self.btn_collapse_config = self._config_ghost_button(
+            "chevron-left.svg", "收起配置栏"
+        )
+        self.btn_collapse_config.clicked.connect(
+            lambda: self._set_config_collapsed(True)
+        )
+        header_layout.addWidget(self.btn_collapse_config)
+
+        self.btn_expand_config = self._config_ghost_button(
+            "chevron-right.svg", "展开配置栏"
+        )
+        self.btn_expand_config.clicked.connect(
+            lambda: self._set_config_collapsed(False)
+        )
+        self.btn_expand_config.hide()
+        header_layout.addWidget(self.btn_expand_config)
+        layout.addWidget(header)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -924,10 +959,63 @@ class TrainPage(QWidget):
         scroll.setWidget(self.scroll_content)
         layout.addWidget(scroll, 1)
 
-        # 开始 / 停止不放进滚动区：窗口再小也不会被滚没
-        layout.addWidget(self.create_run_panel())
+        # 开始 / 停止不放进滚动区：窗口再小也不会被滚没。
+        self.run_panel = self.create_run_panel()
+        self.run_panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        layout.addWidget(self.run_panel)
+
+        # 收起后把多余高度留在运行摘要的下面；否则 Qt 会把 header 和运行
+        # 区域一起拉高，视觉上变成「一大片空白后才看到停止按钮」。
+        self.config_bottom_spacer = QWidget()
+        self.config_bottom_spacer.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
+        self.config_bottom_spacer.hide()
+        layout.addWidget(self.config_bottom_spacer)
 
         return panel
+
+    def _config_ghost_button(self, icon_name: str, tooltip: str) -> QToolButton:
+        """训练栏本地的收起 / 展开图标按钮，外观和标注页保持一致。"""
+        button = QToolButton()
+        button.setIcon(QIcon(str(APP_ROOT / "gui" / "assets" / icon_name)))
+        button.setIconSize(QSize(12, 12))
+        button.setFixedSize(24, 24)
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setStyleSheet(f"""
+            QToolButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+            }}
+            QToolButton:hover {{
+                background-color: {COLORS['hover']};
+            }}
+        """)
+        return button
+
+    def _set_config_collapsed(self, collapsed: bool) -> None:
+        """只切换训练配置内容；运行摘要和操作始终留在左栏。"""
+        self._config_collapsed = collapsed
+        self.config_panel.setFixedWidth(
+            CONFIG_PANEL_COLLAPSED_WIDTH if collapsed else CONFIG_PANEL_EXPANDED_WIDTH
+        )
+        self.config_title.setVisible(not collapsed)
+        self.btn_collapse_config.setVisible(not collapsed)
+        self.btn_expand_config.setVisible(collapsed)
+        self.config_scroll.setVisible(not collapsed)
+        self.config_bottom_spacer.setVisible(collapsed)
+        # 展开时让可滚动的配置把「开始训练」推到左栏底部；收起时撤掉这
+        # 份 stretch，并由尾部 spacer 吃掉多余高度，让运行摘要紧跟在箭头下面。
+        self.config_layout.setStretchFactor(self.config_scroll, 0 if collapsed else 1)
+        self.config_layout.setStretchFactor(self.config_bottom_spacer, 1 if collapsed else 0)
+        self._update_runtime_summary()
+        self._refresh_run_panel_visibility()
 
     def create_prep_card(self) -> QFrame:
         """① 数据准备情况：图片、标注、类别齐了没有，缺什么、去哪补。"""
@@ -1609,6 +1697,7 @@ class TrainPage(QWidget):
         self.summary_label.setText(
             f'<table cellspacing="0" cellpadding="3">{"".join(rows)}</table>'
         )
+        self._update_runtime_summary()
 
     def connect_config_signals(self):
         """任何配置改动都要反映到摘要里，否则摘要就是骗人的。"""
@@ -1626,13 +1715,24 @@ class TrainPage(QWidget):
         self.training_target.currentIndexChanged.connect(self.on_training_target_changed)
         self.task_type.currentIndexChanged.connect(lambda _index: self._update_training_target_ui())
 
-    def create_run_panel(self) -> QFrame:
-        """⑤ 开始 / 停止 / 完成后去哪。固定在左栏底部，永远看得见。"""
-        card, layout = self.make_card("开始训练")
+    def create_run_panel(self) -> QWidget:
+        """固定在左栏底部的运行摘要和唯一主操作，不再重复放「开始训练」标题。"""
+        panel = QWidget()
+        panel.setObjectName("train_run_panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.runtime_summary_label = QLabel("")
+        self.runtime_summary_label.setObjectName("caption")
+        self.runtime_summary_label.setWordWrap(True)
+        self.runtime_summary_label.hide()
+        layout.addWidget(self.runtime_summary_label)
 
         self.status_label = QLabel("准备就绪")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.status_label.hide()
         layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
@@ -1647,8 +1747,8 @@ class TrainPage(QWidget):
         self.btn_start.clicked.connect(self.start_training)
         layout.addWidget(self.btn_start)
 
-        # 训练中才出现，和「开始」互斥，不和别的按钮挤在一排
-        self.btn_stop = QPushButton("停止")
+        # 训练中才出现，和「开始」互斥，不和别的按钮挤在一排。
+        self.btn_stop = QPushButton("停止训练")
         self.btn_stop.setObjectName("danger")
         self.btn_stop.setMinimumHeight(40)
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1663,32 +1763,53 @@ class TrainPage(QWidget):
         self.done_label.hide()
         layout.addWidget(self.done_label)
 
-        done_row = QHBoxLayout()
-        done_row.setContentsMargins(0, 0, 0, 0)
-        done_row.setSpacing(8)
-
         self.btn_goto_result = QPushButton("查看训练结果")
         self.btn_goto_result.setObjectName("primary")
-        self.btn_goto_result.setMinimumHeight(36)
+        self.btn_goto_result.setMinimumHeight(40)
         self.btn_goto_result.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_goto_result.clicked.connect(lambda: self.goto_step(STEP_RESULT))
         self.btn_goto_result.hide()
-        done_row.addWidget(self.btn_goto_result, 1)
+        layout.addWidget(self.btn_goto_result)
 
         self.btn_train_again = QPushButton("再训练一次")
         self.btn_train_again.setMinimumHeight(36)
         self.btn_train_again.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_train_again.clicked.connect(self.reset_ui_state)
         self.btn_train_again.hide()
-        done_row.addWidget(self.btn_train_again)
+        layout.addWidget(self.btn_train_again)
 
-        layout.addLayout(done_row)
+        return panel
 
-        return card
+    def _update_runtime_summary(self) -> None:
+        """收起栏只保留本次运行最需要确认的四个配置事实。"""
+        if not hasattr(self, "runtime_summary_label"):
+            return
+        target = (
+            self.training_target.currentText()
+            if hasattr(self, "training_target")
+            else "本地训练"
+        )
+        model = self.model_version.currentText() if hasattr(self, "model_version") else "-"
+        size = self.model_size.currentText() if hasattr(self, "model_size") else "-"
+        epochs = self.epochs.value() if hasattr(self, "epochs") else 0
+        self.runtime_summary_label.setText(
+            f"模型：{model} · {size}\n训练：{epochs} 轮 · {target}"
+        )
+
+    def _refresh_run_panel_visibility(self) -> None:
+        """展开态让表单和一个主操作优先；收起/运行态才显示运行摘要。"""
+        if not hasattr(self, "runtime_summary_label"):
+            return
+        active = self.is_training_active()
+        complete = self.btn_goto_result.isVisible()
+        show_runtime_details = self._config_collapsed or active or complete
+        self.runtime_summary_label.setVisible(show_runtime_details)
+        self.status_label.setVisible(show_runtime_details)
 
     def set_status(self, text: str, color: str = None):
         self.status_label.setText(text)
         self.status_label.setStyleSheet(f"color: {color or COLORS['text_secondary']};")
+        self._refresh_run_panel_visibility()
 
     def show_done_panel(self):
         """训练完成：说清楚产出在哪、下一步该去哪。"""
@@ -1698,7 +1819,10 @@ class TrainPage(QWidget):
         if weights:
             # 绝对路径可能很长，省略中段显示，完整路径放进 tooltip，避免硬换行截断
             metrics = self.done_label.fontMetrics()
-            elided = metrics.elidedText(str(weights), Qt.TextElideMode.ElideMiddle, 320)
+            available_width = max(1, self.done_label.contentsRect().width())
+            elided = metrics.elidedText(
+                str(weights), Qt.TextElideMode.ElideMiddle, available_width
+            )
             label = "远程训练结果" if remote_result else "模型权重（best.pt）"
             lines.append(f"{label}：{elided}")
             self.done_label.setToolTip(str(weights))
@@ -1712,11 +1836,13 @@ class TrainPage(QWidget):
         self.done_label.show()
         self.btn_goto_result.show()
         self.btn_train_again.show()
+        self._refresh_run_panel_visibility()
 
     def hide_done_panel(self):
         self.done_label.hide()
         self.btn_goto_result.hide()
         self.btn_train_again.hide()
+        self._refresh_run_panel_visibility()
 
     def refresh_readiness(self):
         """重新读项目事实，回答「现在能不能训练」，不能就说清缺什么、去哪补。"""
@@ -1809,8 +1935,14 @@ class TrainPage(QWidget):
             self.btn_start.setToolTip(
                 self.blocker['reason'] if self.blocker else "用上面的配置开始训练"
             )
+            if not self.btn_goto_result.isVisible():
+                self.set_status(
+                    self.blocker['reason'] if self.blocker else "准备就绪",
+                    COLORS['error'] if self.blocker else COLORS['text_secondary'],
+                )
 
         self.update_summary()
+        self._refresh_run_panel_visibility()
 
     def set_prep_row(self, key: str, text: str, color: str, tooltip: str = ""):
         label = self.prep_labels[key]
@@ -2451,6 +2583,13 @@ class TrainPage(QWidget):
                 COLORS['accent_text'],
             )
 
+        # 每次真实开始只自动收起一次。之后的 epoch/指标信号只更新内容，
+        # 用户手动展开后不会被再次收起。
+        if not self._training_auto_collapsed:
+            self._training_auto_collapsed = True
+            self._set_config_collapsed(True)
+        self._refresh_run_panel_visibility()
+
     def on_remote_training_state_changed(self, status: str) -> None:
         """只显示已持久化/runner 确认的状态，不猜测远程训练是否成功。"""
         if status == "RUNNING":
@@ -2509,13 +2648,16 @@ class TrainPage(QWidget):
 
     def reset_ui_state(self):
         """回到「可以开始训练」的样子。"""
+        self._training_auto_collapsed = False
         self.hide_done_panel()
         self.btn_stop.hide()
         self.btn_start.show()
         self.btn_start.setEnabled(self.blocker is None)
         self.progress_bar.setVisible(False)
         self.scroll_content.setEnabled(True)
+        self._set_config_collapsed(False)
         self.set_status("准备就绪")
+        self._refresh_run_panel_visibility()
 
     def on_epoch_started(self, epoch: int, total: int):
         """Epoch开始"""
