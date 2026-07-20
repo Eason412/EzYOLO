@@ -7,6 +7,7 @@ data/
 
 # 开发和临时文件
 .git/
+.claude/worktrees/
 __pycache__/
 *.pyc
 *.log
