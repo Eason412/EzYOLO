@@ -614,6 +614,203 @@ def test_legacy_v1_recovery_rejects_unknown_target_record():
         assert not state_file.with_name("switch-receipt.json").exists()
 
 
+def test_v2_recovery_rejects_unknown_record_already_at_target():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        receipt = _verified_result_receipt(old_result, "a" * 32)
+        record = SimpleNamespace(
+            job_id="a" * 32,
+            local_result_dir=str(old_result),
+            last_status=JobStatus.SUCCEEDED,
+            result_receipt=receipt,
+        )
+
+        class StatefulStore:
+            def list(self):
+                return [record]
+
+            def relocate_verified_result(
+                self, job_id, *, expected_local_result_dir, new_local_result_dir
+            ):
+                record.local_result_dir = str(new_local_result_dir)
+
+        store = StatefulStore()
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        record.last_status = JobStatus.UNKNOWN
+        record.result_receipt = None
+
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("v2 恢复不能只凭目标路径接受 UNKNOWN 任务")
+        assert record.last_status == JobStatus.UNKNOWN
+        state_root = root / "app-state" / "workspace-migrations" / plan.migration_id
+        assert not (state_root / "switch-receipt.json").exists()
+
+
+def test_intermediate_v1_list_schema_upgrades_to_v2():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        intermediate_state = json.loads(state_file.read_text(encoding="utf-8"))
+        intermediate_state["version"] = 1
+        _write_json(state_file, intermediate_state)
+
+        result = execute_workspace_migration(
+            plan,
+            state_root=root / "app-state",
+            database_backups_root=root / "db-backups",
+        )
+        upgraded = json.loads(state_file.read_text(encoding="utf-8"))
+        assert upgraded["version"] == 2
+        assert result.receipt_file.is_file()
+
+
+def test_legacy_v1_rejects_replaced_valid_sqlite_backup():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        current_state = json.loads(state_file.read_text(encoding="utf-8"))
+        _write_json(
+            state_file,
+            {
+                "version": 1,
+                "migration_id": current_state["migration_id"],
+                "phase": current_state["phase"],
+                "database_backup": current_state["database_backup"],
+                "copied_files": current_state["copied_files"],
+                "reused_files": current_state["reused_files"],
+                "relocated_remote_results": 0,
+            },
+        )
+        backup_file = Path(current_state["database_backup"])
+        replacement = root / "replacement.db"
+        replacement_connection = sqlite3.connect(replacement)
+        try:
+            replacement_connection.execute("CREATE TABLE unrelated (id INTEGER)")
+            replacement_connection.commit()
+        finally:
+            replacement_connection.close()
+        backup_file.write_bytes(replacement.read_bytes())
+
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("旧版无哈希状态不能接受被替换的合法 SQLite")
+        assert not state_file.with_name("switch-receipt.json").exists()
+
+
+def test_recovery_rejects_impossible_copy_counters():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["copied_files"] = plan.file_count + 1
+        _write_json(state_file, state)
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("不可能的复制计数不能进入完成回执")
+
+
 def test_remote_relocation_waits_for_durable_state_and_count_survives_retry():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)

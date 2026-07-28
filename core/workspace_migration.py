@@ -611,9 +611,14 @@ def _switch_database_paths(plan: WorkspaceMigrationPlan) -> None:
         connection.close()
 
 
-def _database_path_state(plan: WorkspaceMigrationPlan) -> str:
+def _database_path_state(
+    plan: WorkspaceMigrationPlan,
+    *,
+    database_file: Path | None = None,
+) -> str:
     """返回 old/new/mixed；mixed 必须人工核查，不能猜测或继续写入。"""
-    connection = sqlite3.connect(f"file:{plan.database_file}?mode=ro", uri=True)
+    inspected_database = database_file or plan.database_file
+    connection = sqlite3.connect(f"file:{inspected_database}?mode=ro", uri=True)
     try:
         old_matches = True
         new_matches = True
@@ -836,6 +841,22 @@ def _apply_remote_result_relocations(
         old_result = Path(relocation["old_result_dir"])
         new_result = Path(relocation["new_result_dir"])
         if current == new_result:
+            receipt = getattr(record, "result_receipt", None)
+            if (
+                getattr(record, "last_status", None) != JobStatus.SUCCEEDED
+                or receipt is None
+            ):
+                raise WorkspaceMigrationError(
+                    "已迁移的远程结果记录不再是带回执的成功任务"
+                )
+            from core.remote_training.results import verify_result_bundle
+
+            try:
+                verify_result_bundle(new_result, receipt)
+            except ValueError as exc:
+                raise WorkspaceMigrationError(
+                    "已迁移的远程成功结果未通过回执核验"
+                ) from exc
             continue
         if current != old_result:
             raise WorkspaceMigrationError("远程成功任务结果路径已变化")
@@ -945,17 +966,51 @@ def execute_workspace_migration(
                 backup_file = Path(raw_backup)
                 copied = raw_copied
                 reused = raw_reused
+                if copied + reused != plan.file_count:
+                    raise ValueError
                 if recovery_state["version"] == 1:
-                    _verify_existing_safe_directory(backups, backup_file.parent)
-                    info = backup_file.lstat()
-                    if not stat.S_ISREG(info.st_mode):
-                        raise ValueError
-                    backup_sha256 = _sha256(backup_file)
-                    remote_relocations = _recover_v1_remote_result_relocations(
-                        plan,
-                        remote_job_store,
-                        recovery_state["relocated_remote_results"],
+                    has_count_schema = (
+                        "relocated_remote_results" in recovery_state
+                        and "database_backup_sha256" not in recovery_state
+                        and "remote_result_relocations" not in recovery_state
                     )
+                    has_list_schema = (
+                        "relocated_remote_results" not in recovery_state
+                        and "database_backup_sha256" in recovery_state
+                        and "remote_result_relocations" in recovery_state
+                    )
+                    if has_count_schema:
+                        _verify_existing_safe_directory(backups, backup_file.parent)
+                        info = backup_file.lstat()
+                        if not stat.S_ISREG(info.st_mode):
+                            raise ValueError
+                        backup_sha256 = _sha256(backup_file)
+                        expected_backup_name = (
+                            f"workspace-migration-{plan.migration_id}-"
+                            f"{backup_sha256[:16]}.db"
+                        )
+                        if backup_file.name != expected_backup_name:
+                            raise ValueError
+                        if _database_path_state(
+                            plan,
+                            database_file=backup_file,
+                        ) != "old":
+                            raise ValueError
+                        remote_relocations = _recover_v1_remote_result_relocations(
+                            plan,
+                            remote_job_store,
+                            recovery_state["relocated_remote_results"],
+                        )
+                    elif has_list_schema:
+                        backup_sha256 = recovery_state["database_backup_sha256"]
+                        if not isinstance(backup_sha256, str):
+                            raise ValueError
+                        remote_relocations = _validate_remote_result_relocations(
+                            plan,
+                            recovery_state["remote_result_relocations"],
+                        )
+                    else:
+                        raise ValueError
                     recovery_state = {
                         "version": 2,
                         "migration_id": plan.migration_id,
