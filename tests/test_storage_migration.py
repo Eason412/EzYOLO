@@ -115,6 +115,65 @@ def test_symlink_source_is_rejected():
             raise AssertionError("数据库迁移不得跟随来源符号链接")
 
 
+def test_target_created_during_publish_is_not_overwritten():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        legacy = root / "legacy.db"
+        target = root / "target" / "EzYOLO.db"
+        _create_database(legacy, "legacy")
+
+        def competing_publish(source, destination):
+            if destination == target:
+                destination.write_bytes(b"other process")
+            import os
+            os.link(source, destination)
+
+        try:
+            prepare_database(
+                legacy_database=legacy,
+                target_database=target,
+                backup_root=root / "backups",
+                publish_file=competing_publish,
+            )
+        except StorageMigrationError:
+            pass
+        else:
+            raise AssertionError("并发目标必须阻止迁移")
+        assert target.read_bytes() == b"other process"
+
+
+def test_conflicting_backup_created_during_publish_is_not_overwritten():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        legacy = root / "legacy.db"
+        target = root / "target" / "EzYOLO.db"
+        backup_root = root / "backups"
+        _create_database(legacy, "legacy")
+        competing_content = b"manual backup"
+
+        def competing_publish(source, destination):
+            if destination.parent == backup_root:
+                destination.write_bytes(competing_content)
+            import os
+            os.link(source, destination)
+
+        try:
+            prepare_database(
+                legacy_database=legacy,
+                target_database=target,
+                backup_root=backup_root,
+                publish_file=competing_publish,
+            )
+        except StorageMigrationError:
+            pass
+        else:
+            raise AssertionError("冲突备份必须阻止迁移")
+        backups = list(backup_root.glob("legacy-EzYOLO-*.db"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == competing_content
+        assert not target.exists()
+
+
 def test_application_lease_blocks_second_instance_and_releases():
     with tempfile.TemporaryDirectory() as temporary:
         lock_file = Path(temporary) / "app.lock"

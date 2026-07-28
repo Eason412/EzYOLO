@@ -68,6 +68,12 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
         source_connection.close()
 
 
+def _publish_no_replace(temporary: Path, destination: Path) -> None:
+    """同目录原子发布普通文件；目标已存在时绝不覆盖。"""
+    os.link(temporary, destination)
+    temporary.unlink()
+
+
 def prepare_database(
     *,
     legacy_database: str | Path,
@@ -75,6 +81,7 @@ def prepare_database(
     backup_root: str | Path,
     backup_api: Callable[[Path, Path], None] = _sqlite_backup,
     copy_file: Callable[[Path, Path], object] = shutil.copy2,
+    publish_file: Callable[[Path, Path], None] = _publish_no_replace,
 ) -> DatabasePreparation:
     """选择或复制数据库；永不覆盖目标，也永不修改/删除旧库。"""
     legacy = Path(legacy_database).expanduser()
@@ -119,8 +126,15 @@ def prepare_database(
             backup_temp.unlink()
             backup_temp = None
         else:
-            os.replace(backup_temp, backup_file)
-            backup_temp = None
+            try:
+                publish_file(backup_temp, backup_file)
+                backup_temp = None
+            except FileExistsError:
+                _regular_file(backup_file, "并发创建的迁移备份")
+                if _sha256(backup_file) != backup_hash:
+                    raise StorageMigrationError("迁移备份被并发创建且内容冲突")
+                backup_temp.unlink()
+                backup_temp = None
 
         file_descriptor, raw_target_temp = tempfile.mkstemp(
             prefix=".EzYOLO-", suffix=".db", dir=target.parent
@@ -131,10 +145,13 @@ def prepare_database(
         if _sha256(target_temp) != backup_hash:
             raise StorageMigrationError("数据库复制后的哈希不一致")
         _integrity_check(target_temp)
-        if target.exists() or target.is_symlink():
-            raise StorageMigrationError("迁移期间目标数据库被其他实例创建")
-        os.replace(target_temp, target)
-        target_temp = None
+        try:
+            publish_file(target_temp, target)
+            target_temp = None
+        except FileExistsError as exc:
+            raise StorageMigrationError(
+                "迁移期间目标数据库被其他进程创建；没有覆盖该文件"
+            ) from exc
 
         manifest_file = backup_file.with_suffix(".json")
         if not manifest_file.exists():
@@ -153,7 +170,24 @@ def prepare_database(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            os.replace(temporary_manifest, manifest_file)
+            try:
+                publish_file(temporary_manifest, manifest_file)
+            except FileExistsError as exc:
+                temporary_manifest.unlink(missing_ok=True)
+                try:
+                    existing_manifest = json.loads(
+                        manifest_file.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as read_exc:
+                    raise StorageMigrationError(
+                        "迁移清单被并发创建且无法核验"
+                    ) from read_exc
+                expected_fields = ("source", "backup", "sha256", "size", "target")
+                if any(
+                    existing_manifest.get(field) != manifest.get(field)
+                    for field in expected_fields
+                ):
+                    raise StorageMigrationError("迁移清单被并发创建且内容冲突") from exc
         return DatabasePreparation(target, "migrated", backup_file, manifest_file)
     except (OSError, sqlite3.Error, StorageMigrationError) as exc:
         if isinstance(exc, StorageMigrationError):
