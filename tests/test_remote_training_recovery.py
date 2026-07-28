@@ -341,14 +341,18 @@ def test_concurrent_update_refreshes_ui_without_claiming_training_failed():
     assert page._active_remote_operation is None
 
 
-def test_recovery_lease_blocks_second_window_without_backend_or_store_changes():
+def test_recovery_lease_blocks_same_job_across_different_workspaces():
     root = Path(tempfile.mkdtemp(prefix="ezyolo-recovery-lease-"))
-    stager = ResultStager(root / "staging", root / "runs" / "train")
-    stager.staging_parent.mkdir(parents=True)
-    lease = QLockFile(str(stager.staging_parent / f".recovery-{JOB_ID}.lock"))
+    stager = ResultStager(
+        root / "workspace-b" / "staging",
+        root / "workspace-b" / "runs" / "train",
+    )
+    recovery_lock_parent = root / "app-data" / "remote-training-v1" / "recovery-locks"
+    recovery_lock_parent.mkdir(parents=True)
+    lease = QLockFile(str(recovery_lock_parent / f".recovery-{JOB_ID}.lock"))
     assert lease.tryLock(0)
     try:
-        store = MemoryJobStore(_record())
+        store = MemoryJobStore(_record(status=JobStatus.COLLECTING))
         backend = RecoveryBackend()
         thread = RemoteTrainingRecoveryThread(
             profile=_profile(),
@@ -357,6 +361,7 @@ def test_recovery_lease_blocks_second_window_without_backend_or_store_changes():
             job_store=store,
             result_stager=stager,
             result_verifier=verify_result_bundle,
+            recovery_lock_parent=recovery_lock_parent,
             poll_interval_seconds=0,
         )
         finished = []
@@ -367,7 +372,8 @@ def test_recovery_lease_blocks_second_window_without_backend_or_store_changes():
         thread.run()
 
         assert backend.calls == []
-        assert store.record.last_status == JobStatus.UNKNOWN
+        assert store.record.last_status == JobStatus.COLLECTING
+        assert not stager.staging_parent.exists()
         assert "另一个 EzYOLO 窗口" in finished[-1][1]
     finally:
         lease.unlock()

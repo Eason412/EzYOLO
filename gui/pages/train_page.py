@@ -2025,6 +2025,7 @@ class TrainPage(QWidget):
                     runtime_paths.runs_train_root,
                 ),
                 result_verifier=verify_result_bundle,
+                recovery_lock_parent=runtime_paths.recovery_lock_parent,
             )
         except (
             ClientTransportUnavailable,

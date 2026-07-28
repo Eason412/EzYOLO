@@ -493,6 +493,7 @@ class RemoteTrainingRecoveryThread(QThread):
         job_store: JobStoreLike,
         result_stager: ResultStager,
         result_verifier: ResultVerifier,
+        recovery_lock_parent: Path | str | None = None,
         poll_interval_seconds: float = 2.0,
         cancel_timeout_seconds: float = 60.0,
         sleep: SleepFunction = time.sleep,
@@ -532,9 +533,12 @@ class RemoteTrainingRecoveryThread(QThread):
         self._cancel_sent = False
         self._cancel_started_at: float | None = None
         self._detach_requested = threading.Event()
+        self._recovery_lock_parent = Path(
+            recovery_lock_parent or self._result_stager.staging_parent
+        )
         self._lease = QLockFile(
             str(
-                self._result_stager.staging_parent
+                self._recovery_lock_parent
                 / f".recovery-{self._record.job_id}.lock"
             )
         )
@@ -548,7 +552,7 @@ class RemoteTrainingRecoveryThread(QThread):
         self._detach_requested.set()
 
     def run(self) -> None:
-        self._result_stager.staging_parent.mkdir(
+        self._recovery_lock_parent.mkdir(
             mode=0o700,
             parents=True,
             exist_ok=True,
@@ -561,6 +565,11 @@ class RemoteTrainingRecoveryThread(QThread):
             )
             return
         try:
+            self._result_stager.staging_parent.mkdir(
+                mode=0o700,
+                parents=True,
+                exist_ok=True,
+            )
             if self._detach_requested.is_set():
                 self._finish(
                     False,

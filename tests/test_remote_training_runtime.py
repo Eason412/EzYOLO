@@ -37,9 +37,18 @@ def test_runtime_paths_are_private_and_result_staging_shares_runs_parent():
         )
         assert paths.known_hosts_dir == root / "app-data" / "remote-training-v1" / "known-hosts"
         assert paths.snapshot_parent == root / "app-data" / "remote-training-v1" / "snapshots"
+        assert paths.recovery_lock_parent == (
+            root / "app-data" / "remote-training-v1" / "recovery-locks"
+        )
         assert paths.result_staging_parent.parent == paths.runs_train_root.parent
         assert not paths.known_hosts_dir.exists()
         assert not paths.snapshot_parent.exists()
+
+        other_workspace = resolve_remote_training_runtime_paths(
+            app_data_location=str(root / "app-data"),
+            workspace_root=root / "other-workspace",
+        )
+        assert other_workspace.recovery_lock_parent == paths.recovery_lock_parent
 
 
 def test_runtime_rejects_empty_or_relative_location_and_only_builds_backend():

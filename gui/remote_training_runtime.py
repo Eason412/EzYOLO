@@ -27,6 +27,7 @@ class RemoteTrainingRuntimeError(ValueError):
 class RemoteTrainingRuntimePaths:
     known_hosts_dir: Path
     snapshot_parent: Path
+    recovery_lock_parent: Path
     result_staging_parent: Path
     runs_train_root: Path
 
@@ -48,6 +49,7 @@ def resolve_remote_training_runtime_paths(
     return RemoteTrainingRuntimePaths(
         known_hosts_dir=client_root / "known-hosts",
         snapshot_parent=client_root / "snapshots",
+        recovery_lock_parent=client_root / "recovery-locks",
         result_staging_parent=runs_root / ".remote-staging",
         runs_train_root=runs_root / "train",
     )
