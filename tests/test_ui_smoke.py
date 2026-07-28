@@ -26,7 +26,11 @@ db = _bootstrap.db
 
 def make_window() -> MainWindow:
     from gui import main_window as mw
+    from gui import workflow
     mw.db = db
+    # 临时数据库的 project id 可能与真实 runs/ 中的项目号相同；界面冒烟不能
+    # 因此把用户已有模型误算成当前临时项目的训练结果。
+    workflow.APP_ROOT = _bootstrap.TEMP_PROJECTS_DIR
     return MainWindow()
 
 
@@ -88,6 +92,22 @@ def test_project_with_images_opens_annotate_but_blocks_train():
     window.switch_page(STEP_IMPORT)
     assert window.header._next_index == STEP_ANNOTATE
 
+    db.delete_project(project_id)
+
+
+def test_reopening_window_restores_the_last_selected_project():
+    project_id = _bootstrap.create_temp_project(
+        name="重开恢复项目",
+        project_type="detect",
+        classes=[],
+    )
+    first = make_window()
+    first.load_projects(select_id=project_id)
+
+    reopened = make_window()
+
+    assert reopened.current_project_id == project_id
+    assert reopened.project_combo.currentData() == project_id
     db.delete_project(project_id)
 
 

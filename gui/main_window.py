@@ -59,7 +59,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = QSettings("EzYOLO", "MainWindow")
-        self.current_project_id = None
+        self.current_project_id = self._saved_project_id()
         self.current_index = STEP_IMPORT
         self.snapshot = get_project_snapshot(None)
         self.step_states = compute_step_states(self.snapshot)
@@ -244,6 +244,14 @@ class MainWindow(QMainWindow):
 
     # ==================== 项目 ====================
 
+    def _saved_project_id(self):
+        value = self.settings.value("current_project_id")
+        try:
+            project_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return project_id if project_id > 0 else None
+
     def load_projects(self, select_id: int = None):
         """把项目列表灌进侧边栏下拉框。"""
         self.project_combo.blockSignals(True)
@@ -276,6 +284,10 @@ class MainWindow(QMainWindow):
     def set_active_project(self, project_id):
         """切换当前项目：导入页立刻跟着换，其余页面在进入时同步。"""
         self.current_project_id = project_id
+        if project_id:
+            self.settings.setValue("current_project_id", project_id)
+        else:
+            self.settings.remove("current_project_id")
         self._bypassed_steps.clear()
         self.import_page.set_project(project_id)
         self.refresh_workflow()
