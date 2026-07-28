@@ -15,7 +15,7 @@
 
 import json
 from pathlib import Path
-from core.app_paths import get_runtime_paths
+from core.app_paths import WORKSPACE_SETTING_KEY, get_runtime_paths
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -36,7 +36,7 @@ from core.remote_training.profile_store import (
 )
 
 APP_ROOT = Path(__file__).parent.parent.parent
-DEFAULT_PRETRAINED_PATH = APP_ROOT / "pretrained"
+DEFAULT_PRETRAINED_PATH = get_runtime_paths().app.cache_root / "models"
 SAM_CONFIG_FILE = get_runtime_paths().app.config_root / "sam_config.json"
 LLM_CONFIG_FILE = get_runtime_paths().app.config_root / "llm_config.json"
 
@@ -249,6 +249,18 @@ class SettingsPage(QWidget):
         )
         grid.addWidget(btn_browse, 3, 2)
 
+        self._workspace_path_value = str(get_runtime_paths().workspace.root)
+        self._original_workspace_path = self._workspace_path_value
+        self.workspace_path = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
+        self._refresh_workspace_path_display()
+        grid.addWidget(self._caption("工作区:"), 4, 0)
+        grid.addWidget(self.workspace_path, 4, 1)
+
+        btn_workspace = QPushButton("更改…")
+        btn_workspace.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_workspace.clicked.connect(self.browse_workspace)
+        grid.addWidget(btn_workspace, 4, 2)
+
         return group
 
     def _refresh_pretrained_path_display(self):
@@ -257,6 +269,61 @@ class SettingsPage(QWidget):
         self.pretrained_path.setToolTip(
             f"{self._pretrained_path_value}\n训练时从这个目录读取 YOLO 预训练权重（.pt 文件）。"
         )
+
+    def _refresh_workspace_path_display(self):
+        self.workspace_path.setText(self._workspace_path_value)
+        self.workspace_path.setToolTip(
+            f"{self._workspace_path_value}\n"
+            "新项目、训练结果和测试输出保存在这里。更改后需重启 EzYOLO。"
+        )
+
+    @staticmethod
+    def _workspace_has_durable_data(root: Path) -> bool:
+        for relative in ("projects", "runs", "outputs"):
+            candidate = root / relative
+            try:
+                if candidate.is_dir() and next(candidate.iterdir(), None) is not None:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    def browse_workspace(self):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择 EzYOLO 工作区",
+            self._workspace_path_value,
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not selected:
+            return
+        candidate = Path(selected).expanduser()
+        if candidate.is_symlink():
+            QMessageBox.warning(self, "无法使用此目录", "工作区不能是符号链接。")
+            return
+        try:
+            candidate.resolve(strict=False).relative_to(APP_ROOT.resolve(strict=False))
+        except ValueError:
+            pass
+        else:
+            QMessageBox.warning(
+                self,
+                "无法使用此目录",
+                "工作区不能放在 EzYOLO 源码或安装目录中。",
+            )
+            return
+        current = Path(self._original_workspace_path)
+        if candidate != current and self._workspace_has_durable_data(current):
+            QMessageBox.warning(
+                self,
+                "暂未更改工作区",
+                "当前工作区已有项目或训练结果。为避免模型突然消失，EzYOLO "
+                "不会直接切换；请先使用后续的“迁移工作区”功能核验并复制数据。",
+            )
+            return
+        self._workspace_path_value = str(candidate)
+        self._refresh_workspace_path_display()
+        self.mark_dirty()
 
     def create_remote_training_group(self) -> QGroupBox:
         """远程训练服务器：只管理公开连接档案，绝不在设置中保存认证秘密。"""
@@ -716,12 +783,16 @@ class SettingsPage(QWidget):
 
         # 保存路径
         self.settings.setValue("pretrained_path", self._pretrained_path_value)
+        self.settings.setValue(WORKSPACE_SETTING_KEY, self._workspace_path_value)
 
         # 保存自动保存设置
         self.settings.setValue("auto_save_interval", self.auto_save_interval.value())
         self.settings.setValue("auto_save_enabled", self.auto_save_enabled.isChecked())
 
-        self.set_status("设置已保存。", 'success')
+        if self._workspace_path_value != self._original_workspace_path:
+            self.set_status("设置已保存；重启 EzYOLO 后使用新工作区。", 'success')
+        else:
+            self.set_status("设置已保存。", 'success')
 
     def reset_settings(self):
         """恢复默认设置"""

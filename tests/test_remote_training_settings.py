@@ -4,11 +4,14 @@
 import _bootstrap  # noqa: F401
 
 import sys
+from pathlib import Path
+import tempfile
 
 from PyQt6.QtWidgets import QLabel  # noqa: E402
 
 from core.remote_training.profiles import RemoteTrainingProfile  # noqa: E402
 from gui.pages.settings_page import SettingsPage  # noqa: E402
+from core.app_paths import WORKSPACE_SETTING_KEY
 from test_remote_training_profiles import _ed25519_key  # noqa: E402
 
 
@@ -78,6 +81,26 @@ def test_profile_switch_does_not_reenable_connection_test_while_preflight_is_run
     assert not page.btn_test_remote_profile.isEnabled()
     page.set_remote_profile_test_status("预检完成", success=True)
     assert page.btn_test_remote_profile.isEnabled()
+
+
+def test_workspace_change_is_saved_for_restart_only_when_current_root_is_empty():
+    page = SettingsPage()
+    with tempfile.TemporaryDirectory() as temporary:
+        selected = Path(temporary) / "new-workspace"
+        page._workspace_path_value = str(selected)
+        page.save_settings()
+        assert page.settings.value(WORKSPACE_SETTING_KEY) == str(selected)
+        assert "重启" in page.status_label.text()
+
+
+def test_nonempty_workspace_is_detected_before_switching():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        assert not SettingsPage._workspace_has_durable_data(root)
+        evidence = root / "runs" / "train" / "exp_1" / "weights" / "best.pt"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_bytes(b"model")
+        assert SettingsPage._workspace_has_durable_data(root)
 
 
 if __name__ == "__main__":
