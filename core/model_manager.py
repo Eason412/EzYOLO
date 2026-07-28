@@ -141,29 +141,14 @@ class ModelManager:
                 model = YOLO(str(model_path))
             else:
                 # 本地不存在，尝试在线下载
-                # 任务类型到后缀的映射
-                task_suffix_map = {
-                    "segment": "seg",
-                    "classify": "cls",
-                    "pose": "pose",
-                    "obb": "obb",
-                    "world": "world"
-                }
-                
-                # 构建模型名称
-                if task == "detect":
-                    model_name = f"{version.lower()}{size}"
-                else:
-                    suffix = task_suffix_map.get(task, task)
-                    model_name = f"{version.lower()}{size}-{suffix}"
-                
                 # 设置环境变量，指定模型下载路径
                 import os
                 original_hub_dir = os.environ.get('YOLO_HUB_DIR')
                 os.environ['YOLO_HUB_DIR'] = str(self.pretrained_dir)
-                
+
                 try:
-                    model = YOLO(model_name)
+                    self.pretrained_dir.mkdir(parents=True, exist_ok=True)
+                    model = YOLO(str(model_path))
                 finally:
                     # 恢复原始环境变量
                     if original_hub_dir:

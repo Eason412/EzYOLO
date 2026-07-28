@@ -4,6 +4,7 @@ import _bootstrap  # noqa: F401
 
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 from models.database import Database, DatabaseProxy
 import models.database as database_module
@@ -65,6 +66,25 @@ def test_model_manager_uses_injected_cache_without_import_side_effect():
         manager = ModelManager(pretrained_dir=models_root)
         assert manager.pretrained_dir == models_root
         assert models_root.is_dir()
+
+
+def test_missing_pretrained_model_is_requested_by_absolute_cache_path():
+    with tempfile.TemporaryDirectory() as temporary:
+        models_root = Path(temporary) / "cache" / "models"
+        requested = []
+
+        def fake_yolo(path):
+            requested.append(path)
+            return object()
+
+        manager = ModelManager(pretrained_dir=models_root)
+        with (
+            patch("core.model_manager.YOLO_AVAILABLE", True),
+            patch("core.model_manager.YOLO", side_effect=fake_yolo),
+        ):
+            assert manager.load_model("YOLOv8", "n") is not None
+        assert requested == [str(models_root / "yolov8n.pt")]
+        assert Path(requested[0]).is_absolute()
 
 
 if __name__ == "__main__":

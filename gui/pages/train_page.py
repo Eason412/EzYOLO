@@ -297,8 +297,10 @@ class TrainingThread(QThread):
             load_path = model_path
         else:
             self.log_message.emit(f"本地模型不存在: {model_path}")
-            self.log_message.emit(f"尝试在线下载: {model_name}")
-            load_path = model_name
+            self.log_message.emit(f"尝试下载到用户模型目录: {model_path}")
+            pretrained_dir.mkdir(parents=True, exist_ok=True)
+            # 传绝对目标，避免 Ultralytics 按进程 cwd 把 .pt 下载到源码仓库。
+            load_path = str(model_path)
         
         # 加载预训练模型
         try:
