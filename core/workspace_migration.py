@@ -20,6 +20,7 @@ import tempfile
 from typing import Callable, Iterable, Protocol
 
 from PyQt6.QtCore import QLockFile
+from remote_protocol.v1 import JobStatus
 
 
 class WorkspaceMigrationError(RuntimeError):
@@ -769,10 +770,17 @@ def _recover_v1_remote_result_relocations(
         for item in plan.files
         if item.category == "runs"
     }
+    from core.remote_training.results import verify_result_bundle
+
     relocations = []
     for record in remote_job_store.list():
         local_result = getattr(record, "local_result_dir", None)
-        if not local_result:
+        receipt = getattr(record, "result_receipt", None)
+        if (
+            not local_result
+            or getattr(record, "last_status", None) != JobStatus.SUCCEEDED
+            or receipt is None
+        ):
             continue
         new_result = Path(local_result)
         if not _inside(new_result, target_runs):
@@ -787,6 +795,12 @@ def _recover_v1_remote_result_relocations(
             for destination in planned_destinations
         ):
             continue
+        try:
+            verify_result_bundle(new_result, receipt)
+        except ValueError as exc:
+            raise WorkspaceMigrationError(
+                "旧版迁移状态中的成功结果未通过回执核验"
+            ) from exc
         relocations.append(
             {
                 "job_id": record.job_id,

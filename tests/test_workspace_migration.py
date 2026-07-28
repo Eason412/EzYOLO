@@ -15,6 +15,13 @@ from core.workspace_migration import (
     execute_workspace_migration,
     inventory_legacy_workspace,
 )
+from remote_protocol.v1 import (
+    REMOTE_PROTOCOL_VERSION,
+    JobStatus,
+    ManifestEntry,
+    ResultManifest,
+    ResultReceipt,
+)
 
 
 def _database(path: Path, project_root: Path, image_path: Path) -> None:
@@ -64,6 +71,39 @@ def _fixture(root: Path):
     database = root / "state" / "EzYOLO.db"
     _database(database, project, image)
     return source, target, database, image, run_best, partial
+
+
+def _verified_result_receipt(result_root: Path, job_id: str) -> ResultReceipt:
+    result_bytes = (result_root / "weights" / "best.pt").read_bytes()
+    manifest = ResultManifest(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        job_id=job_id,
+        entries=(
+            ManifestEntry(
+                path="weights/best.pt",
+                size=len(result_bytes),
+                sha256=hashlib.sha256(result_bytes).hexdigest(),
+            ),
+        ),
+        total_bytes=len(result_bytes),
+    )
+    manifest_bytes = (
+        json.dumps(
+            manifest.to_wire(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    (result_root / "manifest.json").write_bytes(manifest_bytes)
+    return ResultReceipt(
+        protocol_version=REMOTE_PROTOCOL_VERSION,
+        job_id=job_id,
+        result_manifest_hash=hashlib.sha256(manifest_bytes).hexdigest(),
+        result_count=1,
+        result_bytes=len(result_bytes),
+    )
 
 
 def _db_paths(database: Path):
@@ -431,9 +471,12 @@ def test_legacy_v1_recovery_state_is_upgraded_without_losing_remote_count():
         root = Path(temporary)
         source, target, database, _image, _run_best, _partial = _fixture(root)
         old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        receipt = _verified_result_receipt(old_result, "a" * 32)
         succeeded = SimpleNamespace(
-            job_id="s" * 32,
+            job_id="a" * 32,
             local_result_dir=str(old_result),
+            last_status=JobStatus.SUCCEEDED,
+            result_receipt=receipt,
         )
 
         class StatefulStore:
@@ -493,6 +536,82 @@ def test_legacy_v1_recovery_state_is_upgraded_without_losing_remote_count():
         assert upgraded_state["version"] == 2
         assert receipt["relocated_remote_results"] == 1
         assert Path(succeeded.local_result_dir).is_relative_to(target / "runs")
+
+
+def test_legacy_v1_recovery_rejects_unknown_target_record():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        receipt = _verified_result_receipt(old_result, "a" * 32)
+        record = SimpleNamespace(
+            job_id="a" * 32,
+            local_result_dir=str(old_result),
+            last_status=JobStatus.SUCCEEDED,
+            result_receipt=receipt,
+        )
+
+        class StatefulStore:
+            def list(self):
+                return [record]
+
+            def relocate_verified_result(
+                self, job_id, *, expected_local_result_dir, new_local_result_dir
+            ):
+                record.local_result_dir = str(new_local_result_dir)
+
+        store = StatefulStore()
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        current_state = json.loads(state_file.read_text(encoding="utf-8"))
+        _write_json(
+            state_file,
+            {
+                "version": 1,
+                "migration_id": current_state["migration_id"],
+                "phase": current_state["phase"],
+                "database_backup": current_state["database_backup"],
+                "copied_files": current_state["copied_files"],
+                "reused_files": current_state["reused_files"],
+                "relocated_remote_results": 1,
+            },
+        )
+        record.last_status = JobStatus.UNKNOWN
+        record.result_receipt = None
+
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("UNKNOWN 任务不能被旧版状态适配器计为已迁移成功")
+        assert record.last_status == JobStatus.UNKNOWN
+        assert not state_file.with_name("switch-receipt.json").exists()
 
 
 def test_remote_relocation_waits_for_durable_state_and_count_survives_retry():
