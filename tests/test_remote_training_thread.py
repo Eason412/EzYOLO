@@ -54,9 +54,11 @@ class MemoryJobStore:
             raise AssertionError("duplicate job")
         self.records[record.job_id] = record
 
-    def replace(self, record):
+    def replace(self, record, *, expected=None):
         if record.job_id not in self.records:
             raise AssertionError("missing job")
+        if expected is not None:
+            assert self.records[record.job_id] == expected
         self.records[record.job_id] = record
 
 
@@ -384,10 +386,21 @@ def test_cancel_timeout_stops_local_wait_without_claiming_remote_was_stopped():
     thread.run()
 
     record = store.records[JOB_ID]
-    assert record.last_status == JobStatus.FAILED
-    assert record.failure_code == FailureCode.CANCEL_TIMEOUT
+    assert record.last_status == JobStatus.UNKNOWN
+    assert record.failure_code is None
     assert backend.calls.count("cancel") == 1
     assert "poll" not in backend.calls
+
+
+def test_detach_before_remote_work_never_uploads_starts_or_cancels():
+    _bootstrap.app()
+    backend = FakeBackend()
+    thread, store, _root = make_thread(backend)
+    thread.request_detach()
+    thread.run()
+
+    assert backend.calls == []
+    assert store.records == {}
 
 
 def test_runner_reported_failure_marks_created_job_failed_not_unknown():

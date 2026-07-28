@@ -31,12 +31,20 @@ from gui.remote_training_runtime import (
     build_system_remote_backend,
     current_remote_training_runtime_paths,
 )
-from gui.remote_training_thread import RemoteTrainingRequest, RemoteTrainingThread
+from gui.remote_training_thread import (
+    RemoteTrainingRecoveryThread,
+    RemoteTrainingRequest,
+    RemoteTrainingThread,
+)
 from core.remote_training.dataset_sources import (
     RemoteDatasetPlanner,
     RemoteDatasetPlanningError,
 )
-from core.remote_training.jobs import RemoteTrainingJobStore, ResultStager
+from core.remote_training.jobs import (
+    RemoteTrainingJobError,
+    RemoteTrainingJobStore,
+    ResultStager,
+)
 from core.remote_training.launch import (
     LocalLaunchPlan,
     RemoteLaunchPlan,
@@ -48,6 +56,7 @@ from core.remote_training.results import verify_result_bundle
 from core.remote_training.snapshot import DatasetSnapshotBuilder, SnapshotError
 from core.remote_training.transport import ClientTransportUnavailable, RemoteTransportError
 from models.database import db
+from remote_protocol.v1 import JobStatus
 
 UNGROUPED_GROUP_ID = 0
 
@@ -760,6 +769,8 @@ class TrainPage(QWidget):
         self.remote_job_store = RemoteTrainingJobStore(self.settings)
         self._remote_target_notice = ""
         self._active_training_is_remote = False
+        self._active_remote_operation = None
+        self._recovery_job_id = None
         self._last_remote_result_dir = None
         self._last_remote_job_record = None
         self._config_collapsed = False
@@ -790,6 +801,8 @@ class TrainPage(QWidget):
         if not self.is_training_active():
             self.reset_ui_state()
         self.refresh_readiness()
+        if not self.is_training_active():
+            self.restore_project_training_state()
 
     def init_ui(self):
         """初始化界面：左边按顺序配置并开始，右边看进度、曲线和日志。
@@ -827,10 +840,13 @@ class TrainPage(QWidget):
 
         self.stop_requested = True
         if self._active_training_is_remote:
-            self.training_thread.request_cancel()
+            self.training_thread.request_detach()
             self.btn_stop.setEnabled(False)
-            self.set_status("正在等待服务器确认停止，暂时不能关闭窗口…", COLORS['warning'])
-            self.log_message("关闭窗口前已请求远程 runner 停止，等待明确确认…")
+            self.set_status(
+                "正在结束本机核验，暂时不能关闭窗口；服务器任务不会停止。",
+                COLORS['warning'],
+            )
+            self.log_message("关闭窗口只停止本机核验，不会停止服务器任务。")
         else:
             self.training_thread.stop()
             self.btn_stop.setEnabled(False)
@@ -1747,6 +1763,14 @@ class TrainPage(QWidget):
         self.btn_start.clicked.connect(self.start_training)
         layout.addWidget(self.btn_start)
 
+        self.btn_reconnect_remote = QPushButton("重新连接并核验")
+        self.btn_reconnect_remote.setObjectName("primary")
+        self.btn_reconnect_remote.setMinimumHeight(40)
+        self.btn_reconnect_remote.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reconnect_remote.clicked.connect(self.reconnect_remote_job)
+        self.btn_reconnect_remote.hide()
+        layout.addWidget(self.btn_reconnect_remote)
+
         # 训练中才出现，和「开始」互斥，不和别的按钮挤在一排。
         self.btn_stop = QPushButton("停止训练")
         self.btn_stop.setObjectName("danger")
@@ -1843,6 +1867,178 @@ class TrainPage(QWidget):
         self.btn_goto_result.hide()
         self.btn_train_again.hide()
         self._refresh_run_panel_visibility()
+
+    def restore_project_training_state(self):
+        """从本机模型与持久化 job 恢复页面；项目切换本身不联网。"""
+        self.btn_reconnect_remote.hide()
+        self._last_remote_job_record = None
+        self._last_remote_result_dir = None
+        if not self.current_project_id:
+            return
+        try:
+            records = self.remote_job_store.list_for_project(self.current_project_id)
+            unresolved = self.remote_job_store.unresolved_for_project(
+                self.current_project_id
+            )
+        except RemoteTrainingJobError:
+            self.btn_start.hide()
+            self.btn_start.setEnabled(False)
+            self.set_status(
+                "远程任务记录无法安全读取；已阻止新训练，且没有自动联网。",
+                COLORS['warning'],
+            )
+            return
+
+        latest = records[0] if records else None
+        record = unresolved[0] if unresolved else latest
+        self._last_remote_job_record = record
+        weights = self.snapshot.get("weights")
+        if weights:
+            verified_success = next(
+                (
+                    item
+                    for item in records
+                    if item.last_status == JobStatus.SUCCEEDED
+                    and item.local_result_dir
+                    and Path(item.local_result_dir, "weights", "best.pt").is_file()
+                ),
+                None,
+            )
+            if verified_success is not None:
+                self._last_remote_result_dir = verified_success.local_result_dir
+                self._active_training_is_remote = True
+            self.show_done_panel()
+            if unresolved:
+                self.btn_train_again.hide()
+                self.btn_reconnect_remote.setText(
+                    "继续收集结果"
+                    if record.last_status in {
+                        JobStatus.REMOTE_SUCCEEDED_PENDING_COLLECTION,
+                        JobStatus.COLLECTING,
+                    }
+                    else "核验未决任务"
+                )
+                self.btn_reconnect_remote.show()
+                self.set_status(
+                    f"已有模型可用；另有 {len(unresolved)} 个远程任务尚未核验。",
+                    COLORS['warning'],
+                )
+            elif latest is not None and latest.last_status == JobStatus.FAILED:
+                self.set_status(
+                    "已有模型可用；最近一次训练尝试失败，未影响现有模型。",
+                    COLORS['warning'],
+                )
+            else:
+                self.set_status("已恢复本项目现有训练结果", COLORS['success'])
+            return
+
+        if record is None or record.last_status in {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }:
+            return
+
+        self.btn_start.hide()
+        self.btn_reconnect_remote.setText(
+            "继续收集结果"
+            if record.last_status in {
+                JobStatus.REMOTE_SUCCEEDED_PENDING_COLLECTION,
+                JobStatus.COLLECTING,
+            }
+            else "重新连接并核验"
+        )
+        self.btn_reconnect_remote.show()
+        if record.last_status in {
+            JobStatus.REMOTE_SUCCEEDED_PENDING_COLLECTION,
+            JobStatus.COLLECTING,
+        }:
+            self.set_status(
+                "服务器已完成训练，本机结果尚未收集完成。",
+                COLORS['warning'],
+            )
+        else:
+            self.set_status(
+                "远程任务状态未知或连接已中断；请重新连接核验，不会重新提交训练。",
+                COLORS['warning'],
+            )
+        self._refresh_run_panel_visibility()
+
+    def reconnect_remote_job(self):
+        """继续已有 job：只查询状态并收集结果，不上传或重新 start。"""
+        if (
+            self.is_training_active()
+            or self._recovery_job_id is not None
+            or not self.current_project_id
+        ):
+            return
+        try:
+            unresolved = self.remote_job_store.unresolved_for_project(
+                self.current_project_id
+            )
+            record = unresolved[0] if unresolved else None
+            profiles = self.remote_profile_store.list()
+        except (RemoteTrainingJobError, ValueError):
+            QMessageBox.warning(
+                self,
+                "无法重新连接",
+                "远程任务或服务器档案无法安全读取；没有重新提交训练。",
+            )
+            return
+        if record is None or record.last_status in {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }:
+            self.restore_project_training_state()
+            return
+        profile = next((item for item in profiles if item.id == record.profile_id), None)
+        if profile is None or profile.remote_root != record.canonical_remote_root:
+            QMessageBox.warning(
+                self,
+                "无法重新连接",
+                "找不到原任务使用的服务器档案，或受控目录已经变化。没有重新提交训练。",
+            )
+            return
+        try:
+            runtime_paths = current_remote_training_runtime_paths(APP_ROOT)
+            backend = build_system_remote_backend(runtime_paths)
+            thread = RemoteTrainingRecoveryThread(
+                profile=profile,
+                record=record,
+                backend=backend,
+                job_store=self.remote_job_store,
+                result_stager=ResultStager(
+                    runtime_paths.result_staging_parent,
+                    runtime_paths.runs_train_root,
+                ),
+                result_verifier=verify_result_bundle,
+            )
+        except (
+            ClientTransportUnavailable,
+            RemoteTransportError,
+            RemoteTrainingRuntimeError,
+            ValueError,
+        ) as exc:
+            QMessageBox.warning(self, "无法重新连接", str(exc))
+            return
+
+        self.training_thread = thread
+        self._recovery_job_id = record.job_id
+        self._last_remote_job_record = record
+        self._active_training_is_remote = True
+        self._active_remote_operation = "recovery"
+        thread.state_changed.connect(self.on_remote_training_state_changed)
+        thread.job_updated.connect(self.on_remote_job_updated)
+        thread.training_finished.connect(self.on_training_finished)
+        thread.log_message.connect(self.on_log_message)
+        self.btn_reconnect_remote.hide()
+        self._begin_training_ui({"epochs": self.epochs.value()}, remote=True)
+        self.monitor_tabs.setCurrentIndex(self.log_tab_index)
+        self.log_message(
+            f"正在核验已有远程任务 {record.job_id[:8]}；不会上传数据或重新启动训练。"
+        )
+        thread.start()
 
     def refresh_readiness(self):
         """重新读项目事实，回答「现在能不能训练」，不能就说清缺什么、去哪补。"""
@@ -2386,6 +2582,33 @@ class TrainPage(QWidget):
         """解析一次明确的本地/远程启动计划；远程绝不自动降级成本地。"""
         # 前置条件：项目、图片、标注、类别，缺一样就说清楚缺什么
         self.refresh_readiness()
+        existing = None
+        if self.current_project_id:
+            try:
+                unresolved = self.remote_job_store.unresolved_for_project(
+                    self.current_project_id
+                )
+                existing = unresolved[0] if unresolved else None
+            except RemoteTrainingJobError:
+                QMessageBox.warning(
+                    self,
+                    "无法开始新训练",
+                    "远程任务记录无法安全读取。为避免重复训练，本次没有启动。",
+                )
+                return
+        if existing is not None and existing.last_status not in {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }:
+            self.restore_project_training_state()
+            QMessageBox.warning(
+                self,
+                "先核验已有远程任务",
+                "这个项目还有状态未确认的远程任务。请先点“重新连接并核验”或"
+                "“继续收集结果”；本次没有创建新任务。",
+            )
+            return
         if self.blocker:
             QMessageBox.warning(self, "还不能开始训练", self.blocker['reason'])
             return
@@ -2431,6 +2654,18 @@ class TrainPage(QWidget):
         if isinstance(launch_plan, RemoteLaunchPlan):
             self._start_remote_training(launch_plan)
             return
+        if self.snapshot.get("weights"):
+            reply = QMessageBox.question(
+                self,
+                "确认重新训练",
+                "这个项目已经有可用模型。继续会启动一次新的本机训练，"
+                "并可能更新本机默认结果目录；已经校验保存的远程结果不会被删除。\n\n"
+                "确定继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self._start_local_training(launch_plan.runtime_config)
 
     def _start_local_training(self, config: dict) -> None:
@@ -2442,6 +2677,8 @@ class TrainPage(QWidget):
         # 清空历史
         self.training_history = []
         self.log_text.clear()
+        self._active_remote_operation = None
+        self._last_remote_result_dir = None
 
         # 清空曲线数据
         self.clear_plots()
@@ -2533,6 +2770,7 @@ class TrainPage(QWidget):
             ),
             result_verifier=verify_result_bundle,
         )
+        self._active_remote_operation = "new_training"
         self.training_thread.state_changed.connect(self.on_remote_training_state_changed)
         self.training_thread.job_updated.connect(self.on_remote_job_updated)
         self.training_thread.training_finished.connect(self.on_training_finished)
@@ -2650,6 +2888,7 @@ class TrainPage(QWidget):
         """回到「可以开始训练」的样子。"""
         self._training_auto_collapsed = False
         self.hide_done_panel()
+        self.btn_reconnect_remote.hide()
         self.btn_stop.hide()
         self.btn_start.show()
         self.btn_start.setEnabled(self.blocker is None)
@@ -2757,6 +2996,7 @@ class TrainPage(QWidget):
     def on_training_finished(self, success: bool, message: str):
         """训练结束：完成、被停止、或者失败。"""
         was_remote = self._active_training_is_remote
+        remote_operation = self._active_remote_operation
         remote_terminal_status = getattr(
             getattr(self, "_last_remote_job_record", None),
             "last_status",
@@ -2771,10 +3011,41 @@ class TrainPage(QWidget):
             self.refresh_readiness()
             self.set_status("训练完成", COLORS['success'])
             self.show_done_panel()
+            self._active_remote_operation = None
+            self._recovery_job_id = None
             QMessageBox.information(self, "训练完成", message)
             return
 
         self.reset_ui_state()
+
+        if remote_operation == "recovery" and remote_terminal_status not in {
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }:
+            self._recovery_job_id = None
+            self._active_remote_operation = None
+            self._active_training_is_remote = False
+            self.restore_project_training_state()
+            if "服务器任务未停止" not in message:
+                QMessageBox.warning(
+                    self,
+                    "远程状态仍待核验",
+                    f"{message}\n\n没有重新提交训练；请稍后再次核验。",
+                )
+            return
+
+        if was_remote and remote_terminal_status == JobStatus.UNKNOWN:
+            self.restore_project_training_state()
+            QMessageBox.warning(
+                self,
+                "远程状态仍待核验",
+                f"{message}\n\n右侧“训练日志”只记录 EzYOLO 已收到的状态摘要，"
+                "不一定包含服务器完整报错。请稍后点“重新连接并核验”。",
+            )
+            self._active_training_is_remote = False
+            self._active_remote_operation = None
+            self._recovery_job_id = None
+            return
 
         if self.stop_requested and (
             not was_remote or getattr(remote_terminal_status, "value", None) == "CANCELLED"
@@ -2792,9 +3063,12 @@ class TrainPage(QWidget):
             self.set_status(failure_text, COLORS['error'])
             QMessageBox.warning(
                 self, "训练没能完成",
-                f"{message}\n\n右边「训练日志」里有完整报错，可以保存下来再排查。"
+                f"{message}\n\n右侧“训练日志”记录了 EzYOLO 已收到的信息，"
+                "不一定包含服务器完整报错。"
             )
         self._active_training_is_remote = False
+        self._active_remote_operation = None
+        self._recovery_job_id = None
     
     def on_log_message(self, message: str):
         """日志消息"""

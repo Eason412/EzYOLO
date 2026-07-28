@@ -9,7 +9,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Any, Mapping, Protocol, Sequence
+
+from PyQt6.QtCore import QLockFile
 
 from remote_protocol.v1 import (
     REMOTE_PROTOCOL_VERSION,
@@ -19,6 +22,7 @@ from remote_protocol.v1 import (
     ProtocolValidationError,
     RemoteStatus,
     ResultReceipt,
+    TERMINAL_STATUSES,
     advance_local_status,
     complete_collection,
     mark_unknown as protocol_mark_unknown,
@@ -40,12 +44,18 @@ class ResultPromotionError(RemoteTrainingJobError):
     """回传结果不能安全地从 staging 原子落地。"""
 
 
+class RemoteTrainingJobConflictError(RemoteTrainingJobError):
+    """另一个 EzYOLO 实例已经推进了同一任务，拒绝陈旧写入。"""
+
+
 class SettingsLike(Protocol):
     def value(self, key: str, default_value: Any = ...) -> Any: ...
 
     def setValue(self, key: str, value: Any) -> None: ...
 
     def sync(self) -> None: ...
+
+    def fileName(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -292,8 +302,15 @@ class RemoteTrainingJobStore:
 
     def __init__(self, settings: SettingsLike) -> None:
         self._settings = settings
+        settings_path = Path(settings.fileName())
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path = str(settings_path) + ".remote-jobs.lock"
 
     def list(self) -> list[RemoteTrainingJobRecord]:
+        self._settings.sync()
+        return self._read_records()
+
+    def _read_records(self) -> list[RemoteTrainingJobRecord]:
         raw = self._settings.value(REMOTE_TRAINING_JOBS_KEY, "[]")
         if raw in (None, ""):
             return []
@@ -316,25 +333,77 @@ class RemoteTrainingJobStore:
         validate_job_id(job_id)
         return next((record for record in self.list() if record.job_id == job_id), None)
 
-    def create(self, record: RemoteTrainingJobRecord) -> None:
-        records = self.list()
-        if any(item.job_id == record.job_id for item in records):
-            raise RemoteTrainingJobError("job id 已存在，拒绝覆盖")
-        self._save([*records, record])
+    def latest_for_project(self, project_id: int) -> RemoteTrainingJobRecord | None:
+        """返回项目最后更新的任务；不把 UNKNOWN 猜成失败或成功。"""
 
-    def replace(self, record: RemoteTrainingJobRecord) -> None:
-        records = self.list()
-        replaced = False
-        result = []
-        for item in records:
-            if item.job_id == record.job_id:
-                result.append(record)
-                replaced = True
-            else:
-                result.append(item)
-        if not replaced:
-            raise RemoteTrainingJobError("找不到要更新的 job record")
-        self._save(result)
+        records = self.list_for_project(project_id)
+        return records[0] if records else None
+
+    def list_for_project(self, project_id: int) -> list[RemoteTrainingJobRecord]:
+        """按真实时间从新到旧返回项目全部任务。"""
+
+        if type(project_id) is not int or project_id <= 0:
+            raise RemoteTrainingJobError("project_id 必须是正整数")
+        records = [record for record in self.list() if record.project_id == project_id]
+        return sorted(records, key=_record_sort_key, reverse=True)
+
+    def unresolved_for_project(self, project_id: int) -> list[RemoteTrainingJobRecord]:
+        """返回项目全部非终态任务，不能被较新的成功/失败任务遮蔽。"""
+
+        return [
+            record
+            for record in self.list_for_project(project_id)
+            if record.last_status not in TERMINAL_STATUSES
+        ]
+
+    def create(self, record: RemoteTrainingJobRecord) -> None:
+        lock = self._acquire_lock()
+        try:
+            self._settings.sync()
+            records = self._read_records()
+            if any(item.job_id == record.job_id for item in records):
+                raise RemoteTrainingJobError("job id 已存在，拒绝覆盖")
+            self._save([*records, record])
+        finally:
+            lock.unlock()
+
+    def replace(
+        self,
+        record: RemoteTrainingJobRecord,
+        *,
+        expected: RemoteTrainingJobRecord | None = None,
+    ) -> None:
+        lock = self._acquire_lock()
+        try:
+            self._settings.sync()
+            records = self._read_records()
+            current = next(
+                (item for item in records if item.job_id == record.job_id),
+                None,
+            )
+            if current is None:
+                raise RemoteTrainingJobError("找不到要更新的 job record")
+            if expected is not None and current != expected:
+                raise RemoteTrainingJobConflictError(
+                    "任务已被另一个窗口更新，拒绝陈旧状态覆盖"
+                )
+            if current.last_status in TERMINAL_STATUSES and record != current:
+                raise RemoteTrainingJobConflictError("终态任务不能被回退或改写")
+            result = [
+                record if item.job_id == record.job_id else item
+                for item in records
+            ]
+            self._save(result)
+        finally:
+            lock.unlock()
+
+    def _acquire_lock(self) -> QLockFile:
+        lock = QLockFile(self._lock_path)
+        if not lock.tryLock(5000):
+            raise RemoteTrainingJobConflictError(
+                "另一个 EzYOLO 窗口正在更新远程任务，请稍后再试"
+            )
+        return lock
 
     def _save(self, records: Sequence[RemoteTrainingJobRecord]) -> None:
         _ensure_unique_job_ids(records)
@@ -371,6 +440,13 @@ class ResultStager:
         except FileExistsError as exc:
             raise ResultPromotionError("该 job 的结果 staging 已存在，拒绝覆盖") from exc
         return staging_dir
+
+    def create_recovery_staging(self, job_id: str) -> Path:
+        """为一次恢复下载创建新目录，保留此前中断留下的 staging 证据。"""
+
+        validate_job_id(job_id)
+        self.staging_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=f"{job_id}-", dir=self.staging_parent))
 
     def final_dir_for(self, project_id: int, job_id: str) -> Path:
         if type(project_id) is not int or project_id <= 0:
@@ -466,6 +542,19 @@ def _validate_timestamp(value: object, field_name: str) -> None:
         raise RemoteTrainingJobError(f"{field_name} 必须是 UTC ISO 时间") from exc
     if parsed.tzinfo is None:
         raise RemoteTrainingJobError(f"{field_name} 必须带时区")
+
+
+def _record_sort_key(record: RemoteTrainingJobRecord) -> tuple[datetime, datetime, str]:
+    return (
+        _parse_timestamp(record.updated_at),
+        _parse_timestamp(record.created_at),
+        record.job_id,
+    )
+
+
+def _parse_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.astimezone(timezone.utc)
 
 
 def _timestamp(value: datetime | None) -> str:

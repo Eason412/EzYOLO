@@ -25,12 +25,16 @@ class _CloseEvent:
 class _ActiveRemoteThread:
     def __init__(self):
         self.cancel_requests = 0
+        self.detach_requests = 0
 
     def isRunning(self):
         return True
 
     def request_cancel(self):
         self.cancel_requests += 1
+
+    def request_detach(self):
+        self.detach_requests += 1
 
 
 class _ActiveLocalThread:
@@ -49,16 +53,32 @@ class _ActivePreflightThread:
         return True
 
 
-def test_train_page_close_requests_remote_cancel_without_waiting_for_thread():
+def test_train_page_close_detaches_recovery_without_cancelling_server_job():
     page = TrainPage()
     thread = _ActiveRemoteThread()
     page.training_thread = thread
     page._active_training_is_remote = True
+    page._active_remote_operation = "recovery"
 
     assert page.request_close() is False
-    assert thread.cancel_requests == 1
+    assert thread.detach_requests == 1
+    assert thread.cancel_requests == 0
     assert page.stop_requested is True
     assert "暂时不能关闭" in page.status_label.text()
+    assert "服务器任务不会停止" in page.status_label.text()
+
+
+def test_train_page_close_detaches_new_remote_training_without_cancelling_server_job():
+    page = TrainPage()
+    thread = _ActiveRemoteThread()
+    page.training_thread = thread
+    page._active_training_is_remote = True
+    page._active_remote_operation = "new_training"
+
+    assert page.request_close() is False
+    assert thread.detach_requests == 1
+    assert thread.cancel_requests == 0
+    assert "服务器任务不会停止" in page.status_label.text()
 
 
 def test_train_page_close_requests_local_stop_without_waiting_for_thread():

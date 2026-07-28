@@ -13,6 +13,7 @@ from PyQt6.QtCore import QSettings  # noqa: E402
 
 from core.remote_training.jobs import (  # noqa: E402
     REMOTE_TRAINING_JOBS_KEY,
+    RemoteTrainingJobConflictError,
     RemoteTrainingJobError,
     RemoteTrainingJobRecord,
     RemoteTrainingJobStore,
@@ -25,6 +26,7 @@ from remote_protocol.v1 import (  # noqa: E402
     JobStatus,
     RemoteStatus,
     ResultReceipt,
+    TERMINAL_STATUSES,
 )
 
 
@@ -72,6 +74,85 @@ def test_job_record_round_trip_and_store_rejects_duplicates():
     assert RemoteTrainingJobRecord.from_dict(payload) == record
     payload["password"] = "must-not-be-saved"
     assert_rejected(RemoteTrainingJobRecord.from_dict, payload)
+
+
+def test_store_returns_latest_job_for_one_project_deterministically():
+    store = RemoteTrainingJobStore(make_settings("remote-job-latest-project"))
+    older = make_record(job_id="1" * 32)
+    newer_payload = make_record(job_id="4" * 32).to_dict()
+    newer_payload["updated_at"] = "2026-07-13T13:00:00+00:00"
+    newer = RemoteTrainingJobRecord.from_dict(newer_payload)
+    other_payload = make_record(job_id="5" * 32).to_dict()
+    other_payload["project_id"] = 8
+    other_payload["updated_at"] = "2026-07-13T14:00:00+00:00"
+    other = RemoteTrainingJobRecord.from_dict(other_payload)
+    for record in (newer, other, older):
+        store.create(record)
+
+    assert store.latest_for_project(7) == newer
+    assert store.latest_for_project(8) == other
+    assert store.latest_for_project(9) is None
+
+
+def test_store_returns_every_unresolved_job_and_never_hides_one_behind_success():
+    store = RemoteTrainingJobStore(make_settings("remote-job-unresolved-project"))
+    unresolved_statuses = [
+        status for status in JobStatus if status not in TERMINAL_STATUSES
+    ]
+    for index, status in enumerate(unresolved_statuses, start=1):
+        payload = make_record(job_id=f"{index:032x}").to_dict()
+        payload["last_status"] = status.value
+        payload["updated_at"] = f"2026-07-13T12:{index:02d}:00+00:00"
+        store.create(RemoteTrainingJobRecord.from_dict(payload))
+
+    succeeded_payload = make_record(job_id="f" * 32).to_dict()
+    succeeded_payload["last_status"] = JobStatus.SUCCEEDED.value
+    succeeded_payload["updated_at"] = "2026-07-13T23:59:00+00:00"
+    store.create(RemoteTrainingJobRecord.from_dict(succeeded_payload))
+
+    unresolved = store.unresolved_for_project(7)
+    assert {record.last_status for record in unresolved} == set(unresolved_statuses)
+    assert [record.updated_at for record in unresolved] == sorted(
+        (record.updated_at for record in unresolved),
+        reverse=True,
+    )
+
+
+def test_store_compare_and_swap_prevents_stale_writer_from_regressing_success():
+    store = RemoteTrainingJobStore(make_settings("remote-job-store-cas"))
+    stale = make_record()
+    store.create(stale)
+    remote_success = stale.with_runner_status(
+        RemoteStatus(
+            REMOTE_PROTOCOL_VERSION,
+            JOB_ID,
+            JobStatus.REMOTE_SUCCEEDED_PENDING_COLLECTION,
+        ),
+        now=NOW,
+    ).begin_collection(now=NOW)
+    receipt = ResultReceipt(
+        REMOTE_PROTOCOL_VERSION,
+        JOB_ID,
+        SHA256,
+        result_count=1,
+        result_bytes=10,
+    )
+    succeeded = remote_success.finish_collection(
+        receipt=receipt,
+        local_result_dir="/tmp/verified-result",
+        now=NOW,
+    )
+    store.replace(succeeded, expected=stale)
+
+    stale_running = stale.with_runner_status(
+        RemoteStatus(REMOTE_PROTOCOL_VERSION, JOB_ID, JobStatus.RUNNING),
+        now=NOW,
+    )
+    assert_rejected(
+        lambda: store.replace(stale_running, expected=stale),
+        expected=RemoteTrainingJobConflictError,
+    )
+    assert store.get(JOB_ID) == succeeded
 
 
 def test_malformed_store_fails_closed():
