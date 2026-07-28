@@ -20,6 +20,12 @@ def test_module_global_database_is_inert_until_configured():
         pass
     else:
         raise AssertionError("未配置的数据库代理不得偷偷创建默认数据库")
+    try:
+        Database(None)
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("数据库不得再退回源码目录默认路径")
 
 
 def test_new_project_uses_injected_stable_project_root():

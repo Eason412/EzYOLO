@@ -16,24 +16,19 @@ from contextlib import contextmanager
 class Database:
     """数据库管理类"""
     
-    def __init__(self, db_path: str = None, projects_root: str | Path | None = None):
+    def __init__(self, db_path: str, projects_root: str | Path | None = None):
         """
         初始化数据库
         
         Args:
-            db_path: 数据库文件路径。生产入口必须显式传入用户应用数据目录。
+            db_path: 数据库文件路径，必须由应用入口或测试显式传入。
             projects_root: 新项目目录。显式数据库默认使用其同级 projects/，
                 生产入口应传入用户 Workspace。
         """
-        if db_path is None:
-            # 默认存储在软件所在目录
-            current_dir = Path(__file__).parent.parent
-            data_dir = current_dir / "data"
-            data_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = str(data_dir / "EzYOLO.db")
-        else:
-            self.db_path = db_path
-            Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        if not isinstance(db_path, str) or not db_path.strip():
+            raise ValueError("数据库路径必须由应用入口显式提供")
+        self.db_path = db_path
+        Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.projects_root = (
             Path(projects_root).expanduser()
             if projects_root is not None
