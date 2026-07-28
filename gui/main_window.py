@@ -273,6 +273,8 @@ class MainWindow(QMainWindow):
 
         target = select_id if select_id is not None else self.current_project_id
         index = self.project_combo.findData(target) if target else -1
+        if index < 0 and len(projects) == 1:
+            index = self.project_combo.findData(projects[0]['id'])
         self.project_combo.setCurrentIndex(index if index >= 0 else 0)
         self.project_combo.blockSignals(False)
 

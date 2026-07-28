@@ -13,6 +13,9 @@
 import _bootstrap  # noqa: F401  必须第一个导入
 
 import sys
+from unittest.mock import patch
+
+from PyQt6.QtCore import QSettings  # noqa: E402
 
 from gui.workflow import (  # noqa: E402
     STEP_IMPORT, STEP_ANNOTATE, STEP_TRAIN, STEP_RESULT, STEP_TEST,
@@ -108,6 +111,25 @@ def test_reopening_window_restores_the_last_selected_project():
 
     assert reopened.current_project_id == project_id
     assert reopened.project_combo.currentData() == project_id
+    db.delete_project(project_id)
+
+
+def test_first_open_selects_the_only_project_when_no_previous_choice_exists():
+    project_id = _bootstrap.create_temp_project(
+        name="唯一项目",
+        project_type="detect",
+        classes=[],
+    )
+    settings = QSettings("EzYOLO", "MainWindow")
+    settings.remove("current_project_id")
+    settings.sync()
+    only_project = db.get_project(project_id)
+
+    with patch.object(db, "get_all_projects", return_value=[only_project]):
+        window = make_window()
+
+    assert window.current_project_id == project_id
+    assert window.project_combo.currentData() == project_id
     db.delete_project(project_id)
 
 
