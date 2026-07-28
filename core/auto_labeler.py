@@ -13,6 +13,10 @@ from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
 from models.database import db
 
+# 兼容旧扩展和测试的注入点；生产流程把 manager 显式传给 AutoLabeler，
+# 这里保持 None，导入模块不会创建模型目录或下载模型。
+model_manager = None
+
 
 class AutoLabeler:
     """自动打标签器"""
