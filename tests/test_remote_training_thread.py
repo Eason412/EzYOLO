@@ -48,11 +48,14 @@ SHA256 = "b" * 64
 class MemoryJobStore:
     def __init__(self):
         self.records = {}
+        self.after_create = None
 
     def create(self, record):
         if record.job_id in self.records:
             raise AssertionError("duplicate job")
         self.records[record.job_id] = record
+        if self.after_create is not None:
+            self.after_create()
 
     def replace(self, record, *, expected=None):
         if record.job_id not in self.records:
@@ -401,6 +404,21 @@ def test_detach_before_remote_work_never_uploads_starts_or_cancels():
 
     assert backend.calls == []
     assert store.records == {}
+
+
+def test_detach_after_job_record_creation_prevents_upload_verify_and_start():
+    _bootstrap.app()
+    backend = FakeBackend()
+    thread, store, _root = make_thread(backend)
+    store.after_create = thread.request_detach
+
+    thread.run()
+
+    assert "upload" not in backend.calls
+    assert "verify-upload" not in backend.calls
+    assert "start" not in backend.calls
+    assert "cancel" not in backend.calls
+    assert store.records[JOB_ID].last_status == JobStatus.UNKNOWN
 
 
 def test_runner_reported_failure_marks_created_job_failed_not_unknown():

@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PyQt6.QtCore import QLockFile  # noqa: E402
@@ -293,6 +294,10 @@ def test_close_detach_completion_restores_state_without_failure_popup():
     page._active_training_is_remote = True
     page._active_remote_operation = "new_training"
     page._last_remote_job_record = None
+    page.training_thread = SimpleNamespace(
+        finish_reason="DETACHED",
+        isRunning=lambda: False,
+    )
 
     with patch.object(page, "restore_project_training_state") as restore, patch.object(
         train_page_module.QMessageBox,
@@ -302,6 +307,37 @@ def test_close_detach_completion_restores_state_without_failure_popup():
         page.on_training_finished(False, "已停止本机监控；服务器任务未停止")
 
     restore.assert_called_once_with()
+    assert page._active_remote_operation is None
+
+
+def test_concurrent_update_refreshes_ui_without_claiming_training_failed():
+    page = TrainPage()
+    page.settings.clear()
+    page.settings.sync()
+    page._active_training_is_remote = True
+    page._active_remote_operation = "new_training"
+    page.training_thread = SimpleNamespace(
+        finish_reason="CONFLICT",
+        isRunning=lambda: False,
+    )
+    notices = []
+
+    with patch.object(page, "restore_project_training_state") as restore, patch.object(
+        train_page_module.QMessageBox,
+        "information",
+        side_effect=lambda *args: notices.append(args),
+    ), patch.object(
+        train_page_module.QMessageBox,
+        "warning",
+        side_effect=AssertionError("并发刷新不应弹训练失败框"),
+    ):
+        page.on_training_finished(
+            False,
+            "任务已由另一个 EzYOLO 窗口更新；本窗口没有覆盖最新状态",
+        )
+
+    restore.assert_called_once_with()
+    assert notices[-1][1] == "任务状态已更新"
     assert page._active_remote_operation is None
 
 

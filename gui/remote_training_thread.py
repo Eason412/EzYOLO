@@ -119,6 +119,7 @@ class RemoteTrainingThread(QThread):
         self._cancel_started_at: float | None = None
         self._record: RemoteTrainingJobRecord | None = None
         self._capabilities = None
+        self.finish_reason: str | None = None
 
     def request_cancel(self) -> None:
         """UI 线程可安全调用：只记录请求，不在主线程执行网络 I/O。"""
@@ -145,6 +146,7 @@ class RemoteTrainingThread(QThread):
             self._finish(
                 False,
                 "任务已由另一个 EzYOLO 窗口更新；本窗口没有覆盖最新状态",
+                reason="CONFLICT",
             )
         except _ThreadFailure as exc:
             if exc.code == FailureCode.CANCEL_TIMEOUT:
@@ -196,9 +198,11 @@ class RemoteTrainingThread(QThread):
         self.job_updated.emit(record)
 
         self._advance(JobStatus.UPLOADING, "正在安全上传数据快照…")
+        self._raise_if_detached()
         self._backend.upload(plan.profile, job_id, snapshot.root)
         self._raise_if_detached()
         self._advance(JobStatus.VERIFYING_UPLOAD, "服务器正在核验上传的数据…")
+        self._raise_if_detached()
         self._accept_remote_status(
             self._backend.verify_upload(plan.profile, job_id)
         )
@@ -246,6 +250,7 @@ class RemoteTrainingThread(QThread):
             ) from exc
 
     def _maybe_cancel_or_start(self) -> None:
+        self._raise_if_detached()
         if self._cancel_requested.is_set():
             self._cancel()
             return
@@ -423,7 +428,11 @@ class RemoteTrainingThread(QThread):
                 self._persist(self._record.mark_unknown())
             except RemoteTrainingJobError:
                 pass
-        self._finish(False, "已停止本机监控；服务器任务未停止")
+        self._finish(
+            False,
+            "已停止本机监控；服务器任务未停止",
+            reason="DETACHED",
+        )
 
     def _handle_unconfirmed_cancel(self, message: str) -> None:
         if self._record is not None and self._record.last_status not in {
@@ -456,7 +465,14 @@ class RemoteTrainingThread(QThread):
         self.state_changed.emit(status.value)
         self.log_message.emit(message)
 
-    def _finish(self, succeeded: bool, message: str) -> None:
+    def _finish(
+        self,
+        succeeded: bool,
+        message: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        self.finish_reason = reason
         self.training_finished.emit(succeeded, message)
 
 
@@ -522,6 +538,7 @@ class RemoteTrainingRecoveryThread(QThread):
                 / f".recovery-{self._record.job_id}.lock"
             )
         )
+        self.finish_reason: str | None = None
 
     def request_cancel(self) -> None:
         self._cancel_requested.set()
@@ -540,16 +557,25 @@ class RemoteTrainingRecoveryThread(QThread):
             self._finish(
                 False,
                 "此任务正在由另一个 EzYOLO 窗口核验；本窗口没有修改任务状态",
+                reason="CONFLICT",
             )
             return
         try:
             if self._detach_requested.is_set():
-                self._finish(False, "已停止本机核验；服务器任务未停止")
+                self._finish(
+                    False,
+                    "已停止本机核验；服务器任务未停止",
+                    reason="DETACHED",
+                )
                 return
             self._set_state(JobStatus.VALIDATING, "正在重新连接并核验远程任务…")
             capabilities = self._backend.preflight(self._profile)
             if self._detach_requested.is_set():
-                self._finish(False, "已停止本机核验；服务器任务未停止")
+                self._finish(
+                    False,
+                    "已停止本机核验；服务器任务未停止",
+                    reason="DETACHED",
+                )
                 return
             if capabilities.canonical_remote_root != self._record.canonical_remote_root:
                 raise _ThreadFailure(
@@ -573,6 +599,7 @@ class RemoteTrainingRecoveryThread(QThread):
             self._finish(
                 False,
                 "任务已由另一个 EzYOLO 窗口更新；本窗口没有覆盖最新状态",
+                reason="CONFLICT",
             )
         except _ThreadFailure as exc:
             if exc.code == FailureCode.PRECHECK_FAILED:
@@ -590,7 +617,11 @@ class RemoteTrainingRecoveryThread(QThread):
     def _poll_until_terminal(self) -> None:
         while True:
             if self._detach_requested.is_set():
-                self._finish(False, "已停止本机核验；服务器任务未停止")
+                self._finish(
+                    False,
+                    "已停止本机核验；服务器任务未停止",
+                    reason="DETACHED",
+                )
                 return
             if (
                 self._cancel_sent
@@ -765,7 +796,14 @@ class RemoteTrainingRecoveryThread(QThread):
         self.state_changed.emit(status.value)
         self.log_message.emit(message)
 
-    def _finish(self, succeeded: bool, message: str) -> None:
+    def _finish(
+        self,
+        succeeded: bool,
+        message: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        self.finish_reason = reason
         self.training_finished.emit(succeeded, message)
 
 

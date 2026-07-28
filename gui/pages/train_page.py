@@ -831,9 +831,9 @@ class TrainPage(QWidget):
     def request_close(self) -> bool:
         """请求当前训练安全收尾，返回是否已经可以销毁窗口。
 
-        Qt 的 QThread 仍在运行时销毁其 owner 会直接终止进程。这里不等待网络或
-        训练线程：远程任务只发一次取消请求，本机任务沿用已有的 stop 标记；窗口
-        层据此拒绝本次关闭，等 ``training_finished`` 后用户可再次关闭。
+        Qt 的 QThread 仍在运行时销毁其 owner 会直接终止进程。这里不阻塞等待：
+        远程任务只请求结束本机监控，不向服务器发送停止请求；本机任务沿用已有
+        stop 标记。窗口层拒绝本次关闭，等 ``training_finished`` 后可再次关闭。
         """
         if not self.is_training_active():
             return True
@@ -3004,6 +3004,7 @@ class TrainPage(QWidget):
         """训练结束：完成、被停止、或者失败。"""
         was_remote = self._active_training_is_remote
         remote_operation = self._active_remote_operation
+        finish_reason = getattr(self.training_thread, "finish_reason", None)
         remote_terminal_status = getattr(
             getattr(self, "_last_remote_job_record", None),
             "last_status",
@@ -3025,11 +3026,18 @@ class TrainPage(QWidget):
 
         self.reset_ui_state()
 
-        if was_remote and "服务器任务未停止" in message:
+        if was_remote and finish_reason in {"DETACHED", "CONFLICT"}:
             self._recovery_job_id = None
             self._active_remote_operation = None
             self._active_training_is_remote = False
             self.restore_project_training_state()
+            if finish_reason == "CONFLICT":
+                QMessageBox.information(
+                    self,
+                    "任务状态已更新",
+                    "这个任务已由另一个 EzYOLO 窗口更新，"
+                    "本窗口已重新读取最新状态。",
+                )
             return
 
         if remote_operation == "recovery" and remote_terminal_status not in {
