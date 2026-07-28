@@ -44,7 +44,6 @@ def main() -> int:
     
     # 创建应用
     app = QApplication(sys.argv)
-    app.setOrganizationName("EzYOLO")
     app.setApplicationName("EzYOLO")
     app.setApplicationVersion("1.0.0")
 
