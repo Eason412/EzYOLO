@@ -30,7 +30,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 
 from gui.styles import COLORS, RADIUS_SM, set_menu_indicator
-from gui.workflow import APP_ROOT, find_project_runs
+from gui.workflow import APP_ROOT, find_project_runs, find_project_weights
 from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 
@@ -864,13 +864,19 @@ class ResultPage(QWidget):
             )
             return
 
-        # 最新的一次放在最上面，默认就看它
+        # 与侧边栏、训练页和模型测试共享同一个默认 best.pt。没有可用权重的
+        # 中断目录仍保留供排查，但不能抢占“当前模型”。
         runs = list(reversed(runs))
+        selected_weights = find_project_weights(self.current_project_id)
+        selected_run = (
+            selected_weights.parent.parent if selected_weights is not None else runs[0]
+        )
+        runs = [selected_run, *(run for run in runs if run != selected_run)]
 
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
         for i, run in enumerate(runs):
-            text = f"{run.name}（最新）" if i == 0 else run.name
+            text = f"{run.name}（当前模型）" if i == 0 else run.name
             self.run_combo.addItem(text, str(run))
         self.run_combo.setCurrentIndex(0)
         self.run_combo.blockSignals(False)

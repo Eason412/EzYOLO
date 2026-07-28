@@ -13,13 +13,20 @@
 import _bootstrap  # noqa: F401  必须第一个导入
 
 import sys
+import os
 from pathlib import Path
+import tempfile
+from unittest.mock import patch
 
+from gui import workflow as workflow_module  # noqa: E402
 from gui.workflow import (  # noqa: E402
     STEP_IMPORT, STEP_ANNOTATE, STEP_TRAIN, STEP_RESULT, STEP_TEST,
     DONE, CURRENT, READY, LOCKED,
-    compute_step_states, get_blocker, get_next_action, step_status_text,
+    compute_step_states, find_project_runs, find_project_weights,
+    get_blocker, get_next_action, step_status_text,
 )
+
+_app = _bootstrap.app()
 
 
 def snapshot(**kwargs):
@@ -150,6 +157,61 @@ def test_settings_and_about_are_never_blocked():
     snap = snapshot(project_id=None)
     assert get_blocker(PAGE_SETTINGS, snap) is None
     assert get_blocker(PAGE_ABOUT, snap) is None
+
+
+def test_run_discovery_respects_exact_project_id_boundary():
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-run-boundary-"))
+    own = root / "runs" / "train" / "exp_1_remote_aaaaaaaa" / "weights"
+    other = root / "runs" / "train" / "exp_10_remote_bbbbbbbb" / "weights"
+    own.mkdir(parents=True)
+    other.mkdir(parents=True)
+
+    with patch.object(workflow_module, "APP_ROOT", root):
+        assert find_project_runs(1) == [own.parent]
+
+
+def test_latest_weights_use_filesystem_recency_not_random_job_id_sorting():
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-run-recency-"))
+    older = root / "runs" / "train" / "exp_1_remote_ffffffff" / "weights"
+    newer = root / "runs" / "train" / "exp_1_remote_00000000" / "weights"
+    older.mkdir(parents=True)
+    newer.mkdir(parents=True)
+    older_best = older / "best.pt"
+    newer_best = newer / "best.pt"
+    older_best.write_bytes(b"older")
+    newer_best.write_bytes(b"newer")
+    os.utime(older_best, (10, 10))
+    os.utime(newer_best, (20, 20))
+
+    with patch.object(workflow_module, "APP_ROOT", root):
+        assert find_project_runs(1) == [older.parent, newer.parent]
+        assert find_project_weights(1) == newer_best
+
+
+def test_result_and_test_pages_share_same_available_model_when_newer_run_is_incomplete():
+    from gui.pages.result_page import ResultPage
+    from gui.pages.test_page import TestPage
+
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-page-model-selection-"))
+    available = root / "runs" / "train" / "exp_1_remote_aaaaaaaa" / "weights"
+    incomplete = root / "runs" / "train" / "exp_1_remote_zzzzzzzz" / "weights"
+    available.mkdir(parents=True)
+    incomplete.mkdir(parents=True)
+    best = available / "best.pt"
+    best.write_bytes(b"available")
+    os.utime(best, (10, 10))
+    os.utime(incomplete.parent, (20, 20))
+
+    with patch.object(workflow_module, "APP_ROOT", root):
+        result_page = ResultPage()
+        result_page.current_project_id = 1
+        result_page.scan_runs_directory()
+        test_page = TestPage()
+        test_page.current_project_id = 1
+        test_page.set_default_model_path()
+
+    assert result_page.current_run == available.parent
+    assert Path(test_page.model_path) == best
 
 
 if __name__ == "__main__":

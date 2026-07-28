@@ -130,20 +130,31 @@ def find_project_runs(project_id: Optional[int]) -> List[Path]:
         return []
 
     matches = []
+    base_name = f"exp_{project_id}"
     for weights_dir in runs_root.glob("**/weights"):
         run_dir = weights_dir.parent
-        if run_dir.name.startswith(f"exp_{project_id}"):
+        if run_dir.name == base_name or run_dir.name.startswith(base_name + "_"):
             matches.append(run_dir)
-    return sorted(matches)
+    return sorted(matches, key=_run_recency_key)
 
 
 def find_project_weights(project_id: Optional[int]) -> Optional[Path]:
     """找出这个项目最新一次训练产出的 best.pt。"""
     for run_dir in reversed(find_project_runs(project_id)):
         best = run_dir / "weights" / "best.pt"
-        if best.exists():
+        if best.is_file() and not best.is_symlink():
             return best
     return None
+
+
+def _run_recency_key(run_dir: Path) -> tuple[int, str]:
+    best = run_dir / "weights" / "best.pt"
+    candidate = best if best.is_file() and not best.is_symlink() else run_dir
+    try:
+        modified_ns = candidate.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 0
+    return modified_ns, str(run_dir)
 
 
 def compute_step_states(snapshot: Dict) -> Dict[int, str]:
