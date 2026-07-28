@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 
 from core.workspace_migration import (
     WorkspaceMigrationError,
@@ -239,6 +240,51 @@ def test_stale_inventory_and_symlinked_target_parent_fail_closed():
             raise AssertionError("目标父目录符号链接必须阻止迁移")
         assert list(outside.iterdir()) == []
         assert _db_paths(database)[0] == source / "projects" / "legacy-project"
+
+
+def test_remote_result_pointer_moves_to_verified_copy_while_unknown_is_untouched():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        unknown = SimpleNamespace(job_id="u" * 32, local_result_dir=None)
+        succeeded = SimpleNamespace(job_id="s" * 32, local_result_dir=str(old_result))
+
+        class FakeStore:
+            def __init__(self):
+                self.calls = []
+
+            def list(self):
+                return [unknown, succeeded]
+
+            def relocate_verified_result(
+                self, job_id, *, expected_local_result_dir, new_local_result_dir
+            ):
+                assert Path(new_local_result_dir, "weights", "best.pt").read_bytes() == b"best"
+                self.calls.append(
+                    (job_id, Path(expected_local_result_dir), Path(new_local_result_dir))
+                )
+
+        store = FakeStore()
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        result = execute_workspace_migration(
+            plan,
+            state_root=root / "app-state",
+            database_backups_root=root / "db-backups",
+            remote_job_store=store,
+        )
+        assert store.calls == [
+            (
+                "s" * 32,
+                old_result,
+                target / "runs" / "train" / "exp_1_remote_abcd",
+            )
+        ]
+        assert result.relocated_remote_results == 1
 
 
 if __name__ == "__main__":

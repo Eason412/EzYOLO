@@ -397,6 +397,53 @@ class RemoteTrainingJobStore:
         finally:
             lock.unlock()
 
+    def relocate_verified_result(
+        self,
+        job_id: str,
+        *,
+        expected_local_result_dir: Path | str,
+        new_local_result_dir: Path | str,
+    ) -> RemoteTrainingJobRecord:
+        """迁移已成功结果的位置，不改变终态、回执或训练时间。
+
+        这是终态不可改写规则的唯一受控例外：新目录必须再次通过原 result receipt
+        的完整 bundle 校验，且当前记录必须仍指向调用方盘点时的旧目录。
+        """
+        validate_job_id(job_id)
+        from core.remote_training.results import verify_result_bundle
+
+        new_directory = Path(new_local_result_dir)
+        lock = self._acquire_lock()
+        try:
+            self._settings.sync()
+            records = self._read_records()
+            current = next(
+                (item for item in records if item.job_id == job_id),
+                None,
+            )
+            if current is None:
+                raise RemoteTrainingJobError("找不到要迁移结果路径的 job record")
+            if (
+                current.last_status != JobStatus.SUCCEEDED
+                or current.result_receipt is None
+                or current.local_result_dir is None
+            ):
+                raise RemoteTrainingJobError("只有带回执的成功任务可以迁移结果路径")
+            if Path(current.local_result_dir) != Path(expected_local_result_dir):
+                raise RemoteTrainingJobConflictError(
+                    "任务结果路径已变化，拒绝陈旧迁移"
+                )
+            verify_result_bundle(new_directory, current.result_receipt)
+            relocated = replace(current, local_result_dir=str(new_directory))
+            updated = [
+                relocated if item.job_id == job_id else item
+                for item in records
+            ]
+            self._save(updated)
+            return relocated
+        finally:
+            lock.unlock()
+
     def _acquire_lock(self) -> QLockFile:
         lock = QLockFile(self._lock_path)
         if not lock.tryLock(5000):

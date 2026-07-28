@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
+import shutil
 
 from PyQt6.QtCore import QSettings  # noqa: E402
 
@@ -153,6 +154,53 @@ def test_store_compare_and_swap_prevents_stale_writer_from_regressing_success():
         expected=RemoteTrainingJobConflictError,
     )
     assert store.get(JOB_ID) == succeeded
+
+
+def test_succeeded_result_can_only_relocate_after_receipt_verifies_new_bundle():
+    from test_remote_results import JOB_ID as RESULT_JOB_ID, _write_bundle
+
+    store = RemoteTrainingJobStore(make_settings("remote-job-relocate-result"))
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        old_result = root / "old"
+        new_result = root / "new"
+        receipt = _write_bundle(old_result)
+        shutil.copytree(old_result, new_result)
+        record = make_record(job_id=RESULT_JOB_ID)
+        store.create(record)
+        collecting = record.with_runner_status(
+            RemoteStatus(
+                REMOTE_PROTOCOL_VERSION,
+                RESULT_JOB_ID,
+                JobStatus.REMOTE_SUCCEEDED_PENDING_COLLECTION,
+            ),
+            now=NOW,
+        ).begin_collection(now=NOW)
+        succeeded = collecting.finish_collection(
+            receipt=receipt,
+            local_result_dir=old_result,
+            now=NOW,
+        )
+        store.replace(succeeded, expected=record)
+
+        relocated = store.relocate_verified_result(
+            RESULT_JOB_ID,
+            expected_local_result_dir=old_result,
+            new_local_result_dir=new_result,
+        )
+        assert relocated.last_status == JobStatus.SUCCEEDED
+        assert relocated.result_receipt == receipt
+        assert relocated.updated_at == succeeded.updated_at
+        assert relocated.local_result_dir == str(new_result)
+
+        (new_result / "weights" / "best.pt").write_bytes(b"tampered")
+        assert_rejected(
+            store.relocate_verified_result,
+            RESULT_JOB_ID,
+            expected_local_result_dir=new_result,
+            new_local_result_dir=new_result,
+            expected=ValueError,
+        )
 
 
 def test_malformed_store_fails_closed():

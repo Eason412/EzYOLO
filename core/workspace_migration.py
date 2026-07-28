@@ -17,7 +17,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 
 from PyQt6.QtCore import QLockFile
 
@@ -108,6 +108,19 @@ class WorkspaceMigrationResult:
     reused_files: int
     database_backup: Path
     receipt_file: Path
+    relocated_remote_results: int = 0
+
+
+class RemoteJobStoreLike(Protocol):
+    def list(self) -> list: ...
+
+    def relocate_verified_result(
+        self,
+        job_id: str,
+        *,
+        expected_local_result_dir: Path | str,
+        new_local_result_dir: Path | str,
+    ): ...
 
 
 def _sha256(path: Path) -> str:
@@ -535,6 +548,7 @@ def execute_workspace_migration(
     state_root: str | Path,
     database_backups_root: str | Path,
     copy_file: Callable[[Path, Path], object] = shutil.copy2,
+    remote_job_store: RemoteJobStoreLike | None = None,
 ) -> WorkspaceMigrationResult:
     """执行已盘点计划；旧源不删除，失败可用同一计划重试。"""
     if plan.blockers:
@@ -612,6 +626,27 @@ def execute_workspace_migration(
                 plan.target_root / project.destination_root_relative,
             )
 
+        relocated_remote_results = 0
+        if remote_job_store is not None:
+            legacy_runs = plan.source_root / "runs"
+            for record in remote_job_store.list():
+                local_result = getattr(record, "local_result_dir", None)
+                if not local_result:
+                    continue
+                old_result = Path(local_result)
+                if not _inside(old_result, legacy_runs):
+                    continue
+                relative = old_result.resolve(strict=False).relative_to(
+                    legacy_runs.resolve(strict=False)
+                )
+                new_result = plan.target_root / "runs" / relative
+                remote_job_store.relocate_verified_result(
+                    record.job_id,
+                    expected_local_result_dir=old_result,
+                    new_local_result_dir=new_result,
+                )
+                relocated_remote_results += 1
+
         backup_file = _backup_database(
             plan.database_file, backups, plan.migration_id
         )
@@ -628,7 +663,8 @@ def execute_workspace_migration(
             "copied_files": copied,
             "reused_files": reused,
             "source_preserved": True,
-            "remote_job_records_modified": False,
+            "remote_job_records_modified": bool(relocated_remote_results),
+            "relocated_remote_results": relocated_remote_results,
         }
         temporary_receipt = receipt_file.with_suffix(".json.tmp")
         temporary_receipt.write_text(
@@ -642,6 +678,7 @@ def execute_workspace_migration(
             reused_files=reused,
             database_backup=backup_file,
             receipt_file=receipt_file,
+            relocated_remote_results=relocated_remote_results,
         )
     except sqlite3.Error as exc:
         raise WorkspaceMigrationError(f"数据库路径切换失败: {exc}") from exc
