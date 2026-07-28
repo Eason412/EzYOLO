@@ -387,7 +387,7 @@ def test_collection_state_hides_stop_server_button():
     assert page.btn_stop.isHidden()
 
 
-def test_reopened_train_page_restores_verified_success_instead_of_resetting_to_start():
+def test_reopened_train_page_restores_legacy_model_without_claiming_remote_verification():
     project_id = _bootstrap.create_temp_project(
         name="恢复成功项目",
         project_type="detect",
@@ -426,6 +426,7 @@ def test_reopened_train_page_restores_verified_success_instead_of_resetting_to_s
         page.set_project(project_id)
 
     assert page._last_remote_job_record.last_status == JobStatus.SUCCEEDED
+    assert page._last_remote_result_dir is None
     assert page.btn_goto_result.isVisible()
     assert not page.btn_start.isVisible()
     assert str(root) in page.done_label.toolTip()

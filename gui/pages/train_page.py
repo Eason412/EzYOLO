@@ -1899,6 +1899,7 @@ class TrainPage(QWidget):
                     item
                     for item in records
                     if item.last_status == JobStatus.SUCCEEDED
+                    and item.result_receipt is not None
                     and item.local_result_dir
                     and Path(item.local_result_dir, "weights", "best.pt").is_file()
                 ),
