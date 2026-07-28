@@ -1,7 +1,7 @@
 {
   "sam_type": "SAM2",
   "model_file": "sam2.1_b.pt",
-  "device": "mps",
+  "device": "cpu",
   "imgsz": 1024,
   "conf": 0.2,
   "iou": 0.9,
