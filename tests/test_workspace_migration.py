@@ -426,6 +426,75 @@ def test_state_directory_symlink_and_corrupted_recovery_state_fail_closed():
             raise AssertionError("字段损坏的恢复状态必须明确阻止继续")
 
 
+def test_legacy_v1_recovery_state_is_upgraded_without_losing_remote_count():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        succeeded = SimpleNamespace(
+            job_id="s" * 32,
+            local_result_dir=str(old_result),
+        )
+
+        class StatefulStore:
+            def list(self):
+                return [succeeded]
+
+            def relocate_verified_result(
+                self, job_id, *, expected_local_result_dir, new_local_result_dir
+            ):
+                assert job_id == succeeded.job_id
+                assert Path(succeeded.local_result_dir) == Path(expected_local_result_dir)
+                succeeded.local_result_dir = str(new_local_result_dir)
+
+        store = StatefulStore()
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        current_state = json.loads(state_file.read_text(encoding="utf-8"))
+        legacy_state = {
+            "version": 1,
+            "migration_id": current_state["migration_id"],
+            "phase": current_state["phase"],
+            "database_backup": current_state["database_backup"],
+            "copied_files": current_state["copied_files"],
+            "reused_files": current_state["reused_files"],
+            "relocated_remote_results": 1,
+        }
+        _write_json(state_file, legacy_state)
+
+        result = execute_workspace_migration(
+            plan,
+            state_root=root / "app-state",
+            database_backups_root=root / "db-backups",
+            remote_job_store=store,
+        )
+        upgraded_state = json.loads(state_file.read_text(encoding="utf-8"))
+        receipt = json.loads(result.receipt_file.read_text(encoding="utf-8"))
+        assert upgraded_state["version"] == 2
+        assert receipt["relocated_remote_results"] == 1
+        assert Path(succeeded.local_result_dir).is_relative_to(target / "runs")
+
+
 def test_remote_relocation_waits_for_durable_state_and_count_survives_retry():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)

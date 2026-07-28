@@ -750,6 +750,57 @@ def _validate_remote_result_relocations(
     return validated
 
 
+def _recover_v1_remote_result_relocations(
+    plan: WorkspaceMigrationPlan,
+    remote_job_store: RemoteJobStoreLike | None,
+    expected_count: object,
+) -> list[dict[str, str]]:
+    if type(expected_count) is not int or expected_count < 0:
+        raise WorkspaceMigrationError("旧版迁移状态中的远程结果计数不合法")
+    if expected_count == 0:
+        return []
+    if remote_job_store is None:
+        raise WorkspaceMigrationError("旧版迁移状态需要远程任务记录存储")
+
+    target_runs = plan.target_root / "runs"
+    source_runs = plan.source_root / "runs"
+    planned_destinations = {
+        item.destination_relative
+        for item in plan.files
+        if item.category == "runs"
+    }
+    relocations = []
+    for record in remote_job_store.list():
+        local_result = getattr(record, "local_result_dir", None)
+        if not local_result:
+            continue
+        new_result = Path(local_result)
+        if not _inside(new_result, target_runs):
+            continue
+        relative = new_result.resolve(strict=False).relative_to(
+            target_runs.resolve(strict=False)
+        )
+        destination_prefix = Path("runs") / relative
+        if not any(
+            destination == destination_prefix
+            or destination.is_relative_to(destination_prefix)
+            for destination in planned_destinations
+        ):
+            continue
+        relocations.append(
+            {
+                "job_id": record.job_id,
+                "old_result_dir": str(source_runs / relative),
+                "new_result_dir": str(new_result),
+            }
+        )
+    if len(relocations) != expected_count:
+        raise WorkspaceMigrationError(
+            "旧版迁移状态与远程结果记录不一致，拒绝自动升级"
+        )
+    return _validate_remote_result_relocations(plan, relocations)
+
+
 def _apply_remote_result_relocations(
     relocations: list[dict[str, str]],
     remote_job_store: RemoteJobStoreLike | None,
@@ -858,7 +909,7 @@ def execute_workspace_migration(
                 raise WorkspaceMigrationError("迁移恢复状态无法读取") from exc
             if (
                 not isinstance(recovery_state, dict)
-                or recovery_state.get("version") != 1
+                or recovery_state.get("version") not in {1, 2}
                 or recovery_state.get("migration_id") != plan.migration_id
                 or recovery_state.get("phase")
                 not in {"ready_to_switch", "database_switched", "completed"}
@@ -867,12 +918,10 @@ def execute_workspace_migration(
 
             try:
                 raw_backup = recovery_state["database_backup"]
-                raw_backup_hash = recovery_state["database_backup_sha256"]
                 raw_copied = recovery_state["copied_files"]
                 raw_reused = recovery_state["reused_files"]
                 if (
                     not isinstance(raw_backup, str)
-                    or not isinstance(raw_backup_hash, str)
                     or type(raw_copied) is not int
                     or raw_copied < 0
                     or type(raw_reused) is not int
@@ -880,14 +929,40 @@ def execute_workspace_migration(
                 ):
                     raise ValueError
                 backup_file = Path(raw_backup)
-                backup_sha256 = raw_backup_hash
                 copied = raw_copied
                 reused = raw_reused
-                remote_relocations = _validate_remote_result_relocations(
-                    plan,
-                    recovery_state["remote_result_relocations"],
-                )
-            except (KeyError, TypeError, ValueError) as exc:
+                if recovery_state["version"] == 1:
+                    _verify_existing_safe_directory(backups, backup_file.parent)
+                    info = backup_file.lstat()
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ValueError
+                    backup_sha256 = _sha256(backup_file)
+                    remote_relocations = _recover_v1_remote_result_relocations(
+                        plan,
+                        remote_job_store,
+                        recovery_state["relocated_remote_results"],
+                    )
+                    recovery_state = {
+                        "version": 2,
+                        "migration_id": plan.migration_id,
+                        "phase": recovery_state["phase"],
+                        "database_backup": str(backup_file),
+                        "database_backup_sha256": backup_sha256,
+                        "copied_files": copied,
+                        "reused_files": reused,
+                        "remote_result_relocations": remote_relocations,
+                    }
+                    write_json(state_file, recovery_state)
+                else:
+                    raw_backup_hash = recovery_state["database_backup_sha256"]
+                    if not isinstance(raw_backup_hash, str):
+                        raise ValueError
+                    backup_sha256 = raw_backup_hash
+                    remote_relocations = _validate_remote_result_relocations(
+                        plan,
+                        recovery_state["remote_result_relocations"],
+                    )
+            except (KeyError, OSError, TypeError, ValueError) as exc:
                 raise WorkspaceMigrationError(
                     "迁移恢复状态字段损坏，拒绝继续"
                 ) from exc
@@ -998,7 +1073,7 @@ def execute_workspace_migration(
                 remote_job_store,
             )
             ready_state = {
-                "version": 1,
+                "version": 2,
                 "migration_id": plan.migration_id,
                 "phase": "ready_to_switch",
                 "database_backup": str(backup_file),
