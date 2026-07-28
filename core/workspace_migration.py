@@ -370,7 +370,11 @@ def inventory_legacy_workspace(
     except OSError as exc:
         blockers.append(f"无法读取目标磁盘空间: {exc}")
     else:
-        required = total_bytes + max(64 * 1024 * 1024, total_bytes // 20)
+        # 执行期间 staging 与 final 会同时存在，预检必须按双份峰值保留空间。
+        required = (2 * total_bytes) + max(
+            64 * 1024 * 1024,
+            total_bytes // 10,
+        )
         if free_bytes < required:
             blockers.append(
                 f"目标空间不足：需要至少 {required} 字节，可用 {free_bytes} 字节"

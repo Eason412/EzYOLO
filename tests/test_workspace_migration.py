@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from core.workspace_migration import (
     WorkspaceMigrationError,
@@ -809,6 +810,31 @@ def test_recovery_rejects_impossible_copy_counters():
             pass
         else:
             raise AssertionError("不可能的复制计数不能进入完成回执")
+
+
+def test_inventory_reserves_space_for_staging_and_final_copies():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        baseline = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        old_single_copy_threshold = baseline.total_bytes + max(
+            64 * 1024 * 1024,
+            baseline.total_bytes // 20,
+        )
+        with patch(
+            "core.workspace_migration.shutil.disk_usage",
+            return_value=SimpleNamespace(free=old_single_copy_threshold),
+        ):
+            plan = inventory_legacy_workspace(
+                source_root=source,
+                target_root=target,
+                database_file=database,
+            )
+        assert any("目标空间不足" in blocker for blocker in plan.blockers)
 
 
 def test_remote_relocation_waits_for_durable_state_and_count_survives_retry():
