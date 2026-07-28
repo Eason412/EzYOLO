@@ -16,12 +16,14 @@ from contextlib import contextmanager
 class Database:
     """数据库管理类"""
     
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, projects_root: str | Path | None = None):
         """
         初始化数据库
         
         Args:
-            db_path: 数据库文件路径，默认为项目目录下的data/EzYOLO.db
+            db_path: 数据库文件路径。生产入口必须显式传入用户应用数据目录。
+            projects_root: 新项目目录。显式数据库默认使用其同级 projects/，
+                生产入口应传入用户 Workspace。
         """
         if db_path is None:
             # 默认存储在软件所在目录
@@ -31,6 +33,12 @@ class Database:
             self.db_path = str(data_dir / "EzYOLO.db")
         else:
             self.db_path = db_path
+            Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.projects_root = (
+            Path(projects_root).expanduser()
+            if projects_root is not None
+            else Path(self.db_path).expanduser().parent / "projects"
+        )
         
         # 初始化数据库
         self.init_database()
@@ -230,22 +238,23 @@ class Database:
         
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # 项目存储路径也放在软件所在目录
-            current_dir = Path(__file__).parent.parent
-            storage_path = current_dir / "projects" / f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            storage_path.mkdir(parents=True, exist_ok=True)
-            
             cursor.execute("""
                 INSERT INTO projects (name, description, type, classes, storage_path)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, NULL)
             """, (
                 name, 
                 description, 
                 project_type, 
                 json.dumps(classes, ensure_ascii=False),
-                str(storage_path)
             ))
-            return cursor.lastrowid
+            project_id = cursor.lastrowid
+            storage_path = self.projects_root / f"project-{project_id:06d}"
+            storage_path.mkdir(parents=True, exist_ok=False)
+            cursor.execute(
+                "UPDATE projects SET storage_path = ? WHERE id = ?",
+                (str(storage_path), project_id),
+            )
+            return project_id
     
     def get_project(self, project_id: int) -> Optional[Dict]:
         """获取项目信息"""
@@ -922,7 +931,7 @@ class Database:
                 })
 
         if projects_dir is None:
-            projects_dir_path = Path(__file__).parent.parent / "projects"
+            projects_dir_path = self.projects_root
         else:
             projects_dir_path = Path(projects_dir)
 
@@ -997,5 +1006,23 @@ class Database:
         }
 
 
-# 全局数据库实例
-db = Database()
+class DatabaseProxy:
+    """保持既有 ``from models.database import db`` 接口，但导入模块时不碰磁盘。"""
+
+    def __init__(self):
+        self._target: Database | None = None
+
+    def configure(self, target: Database) -> None:
+        self._target = target
+
+    def __getattr__(self, name):
+        if self._target is None:
+            raise RuntimeError("EzYOLO 数据库尚未由应用入口配置")
+        return getattr(self._target, name)
+
+
+db = DatabaseProxy()
+
+
+def configure_database(target: Database) -> None:
+    db.configure(target)
