@@ -1973,10 +1973,12 @@ class TrainPage(QWidget):
         ):
             return
         try:
-            unresolved = self.remote_job_store.unresolved_for_project(
-                self.current_project_id
+            displayed = self._last_remote_job_record
+            record = (
+                self.remote_job_store.get(displayed.job_id)
+                if displayed is not None
+                else None
             )
-            record = unresolved[0] if unresolved else None
             profiles = self.remote_profile_store.list()
         except (RemoteTrainingJobError, ValueError):
             QMessageBox.warning(
@@ -2758,6 +2760,7 @@ class TrainPage(QWidget):
         )
         self.training_history = []
         self.clear_plots()
+        self._last_remote_job_record = None
         self._last_remote_result_dir = None
         self.training_thread = RemoteTrainingThread(
             request=request,
@@ -3017,6 +3020,13 @@ class TrainPage(QWidget):
             return
 
         self.reset_ui_state()
+
+        if was_remote and "服务器任务未停止" in message:
+            self._recovery_job_id = None
+            self._active_remote_operation = None
+            self._active_training_is_remote = False
+            self.restore_project_training_state()
+            return
 
         if remote_operation == "recovery" and remote_terminal_status not in {
             JobStatus.FAILED,
