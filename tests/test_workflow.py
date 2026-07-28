@@ -214,6 +214,30 @@ def test_new_workspace_and_legacy_runs_are_both_read_without_copying():
         assert find_project_weights(1) == current / "best.pt"
 
 
+def test_migrated_workspace_run_is_not_counted_again_from_legacy_source():
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-run-migrated-dedup-"))
+    workspace = root / "workspace"
+    resources = root / "source"
+    relative_run = Path("train") / "exp_1_remote_aaaaaaaa"
+    legacy = resources / "runs" / relative_run / "weights"
+    current = workspace / "runs" / relative_run / "weights"
+    legacy.mkdir(parents=True)
+    current.mkdir(parents=True)
+    (legacy / "best.pt").write_bytes(b"same-result")
+    (current / "best.pt").write_bytes(b"same-result")
+
+    fake_runtime = SimpleNamespace(
+        workspace=SimpleNamespace(runs_root=workspace / "runs")
+    )
+    with (
+        patch.object(workflow_module, "APP_ROOT", resources),
+        patch.object(workflow_module, "_RESOURCE_ROOT", resources),
+        patch.object(workflow_module, "get_runtime_paths", return_value=fake_runtime),
+    ):
+        assert find_project_runs(1) == [current.parent]
+        assert find_project_weights(1) == current / "best.pt"
+
+
 def test_result_and_test_pages_share_same_available_model_when_newer_run_is_incomplete():
     from gui.pages.result_page import ResultPage
     from gui.pages.test_page import TestPage

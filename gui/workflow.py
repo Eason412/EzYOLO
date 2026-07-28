@@ -143,18 +143,31 @@ def find_project_runs(project_id: Optional[int]) -> List[Path]:
 
     matches = []
     base_name = f"exp_{project_id}"
-    seen = set()
+    seen: Dict[Path, int] = {}
     for runs_root in runs_roots:
         if not runs_root.exists():
             continue
         for weights_dir in runs_root.glob("**/weights"):
             run_dir = weights_dir.parent
-            if (
-                run_dir not in seen
-                and (run_dir.name == base_name or run_dir.name.startswith(base_name + "_"))
+            if not (
+                run_dir.name == base_name or run_dir.name.startswith(base_name + "_")
             ):
+                continue
+            relative_run = run_dir.relative_to(runs_root)
+            existing_index = seen.get(relative_run)
+            if existing_index is None:
+                seen[relative_run] = len(matches)
                 matches.append(run_dir)
-                seen.add(run_dir)
+                continue
+            existing = matches[existing_index]
+            existing_best = existing / "weights" / "best.pt"
+            candidate_best = run_dir / "weights" / "best.pt"
+            if (
+                (not existing_best.is_file() or existing_best.is_symlink())
+                and candidate_best.is_file()
+                and not candidate_best.is_symlink()
+            ):
+                matches[existing_index] = run_dir
     return sorted(matches, key=_run_recency_key)
 
 
