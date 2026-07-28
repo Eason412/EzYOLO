@@ -478,7 +478,9 @@ class RemoteTrainingRecoveryThread(QThread):
         result_stager: ResultStager,
         result_verifier: ResultVerifier,
         poll_interval_seconds: float = 2.0,
+        cancel_timeout_seconds: float = 60.0,
         sleep: SleepFunction = time.sleep,
+        clock: MonotonicClock = time.monotonic,
     ) -> None:
         super().__init__()
         if profile.id != record.profile_id:
@@ -493,6 +495,12 @@ class RemoteTrainingRecoveryThread(QThread):
             raise ValueError("终态远程任务不需要重新连接")
         if poll_interval_seconds < 0:
             raise ValueError("poll interval 不能小于零")
+        if (
+            isinstance(cancel_timeout_seconds, bool)
+            or not isinstance(cancel_timeout_seconds, (int, float))
+            or cancel_timeout_seconds <= 0
+        ):
+            raise ValueError("取消确认超时必须是正数")
         self._profile = profile
         self._record = record
         self._backend = backend
@@ -500,10 +508,13 @@ class RemoteTrainingRecoveryThread(QThread):
         self._result_stager = result_stager
         self._result_verifier = result_verifier
         self._poll_interval_seconds = poll_interval_seconds
+        self._cancel_timeout_seconds = float(cancel_timeout_seconds)
         self._sleep = sleep
+        self._clock = clock
         self._capabilities = None
         self._cancel_requested = threading.Event()
         self._cancel_sent = False
+        self._cancel_started_at: float | None = None
         self._detach_requested = threading.Event()
         self._lease = QLockFile(
             str(
@@ -581,6 +592,14 @@ class RemoteTrainingRecoveryThread(QThread):
             if self._detach_requested.is_set():
                 self._finish(False, "已停止本机核验；服务器任务未停止")
                 return
+            if (
+                self._cancel_sent
+                and self._cancel_started_at is not None
+                and self._clock() - self._cancel_started_at
+                >= self._cancel_timeout_seconds
+            ):
+                self._handle_cancel_timeout()
+                return
             if self._record.last_status == JobStatus.FAILED:
                 self._finish(False, "服务器已明确报告原任务失败")
                 return
@@ -595,6 +614,7 @@ class RemoteTrainingRecoveryThread(QThread):
                 return
             if self._cancel_requested.is_set() and not self._cancel_sent:
                 self._cancel_sent = True
+                self._cancel_started_at = self._clock()
                 self._accept_remote_status(
                     self._backend.cancel(self._profile, self._record.job_id)
                 )
@@ -720,6 +740,19 @@ class RemoteTrainingRecoveryThread(QThread):
 
     def _handle_recovery_blocked(self, message: str) -> None:
         """本机无法安全核验不等于服务器任务失败。"""
+        if self._record.last_status != JobStatus.UNKNOWN:
+            try:
+                self._persist(self._record.mark_unknown())
+            except RemoteTrainingJobError:
+                pass
+        self._set_state(JobStatus.UNKNOWN, message)
+        self._finish(False, message)
+
+    def _handle_cancel_timeout(self) -> None:
+        message = (
+            "停止请求已发送，但服务器是否停止尚未确认；"
+            "原任务保持待核验状态"
+        )
         if self._record.last_status != JobStatus.UNKNOWN:
             try:
                 self._persist(self._record.mark_unknown())

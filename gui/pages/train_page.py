@@ -2834,12 +2834,15 @@ class TrainPage(QWidget):
     def on_remote_training_state_changed(self, status: str) -> None:
         """只显示已持久化/runner 确认的状态，不猜测远程训练是否成功。"""
         if status == "RUNNING":
+            self.btn_stop.show()
             self.set_status("远程服务器正在训练…", COLORS['accent_text'])
         elif status == "CANCEL_REQUESTED":
             self.set_status("正在等待服务器确认停止…", COLORS['warning'])
         elif status == "REMOTE_SUCCEEDED_PENDING_COLLECTION":
+            self.btn_stop.hide()
             self.set_status("服务器训练完成，正在准备回传结果…", COLORS['accent_text'])
         elif status == "COLLECTING":
+            self.btn_stop.hide()
             self.set_status("正在回传并校验训练结果…", COLORS['accent_text'])
         elif status == "UNKNOWN":
             self.set_status("连接中断，远程任务状态未知。", COLORS['warning'])

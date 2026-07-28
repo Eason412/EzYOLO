@@ -337,6 +337,56 @@ def test_recovery_lease_blocks_second_window_without_backend_or_store_changes():
         lease.unlock()
 
 
+def test_recovery_cancel_timeout_stays_unknown_instead_of_hanging_or_failing():
+    class NeverConfirmsCancelBackend(RecoveryBackend):
+        def poll(self, _profile, job_id):
+            self.calls.append("poll")
+            return RemoteStatus(
+                REMOTE_PROTOCOL_VERSION,
+                job_id,
+                JobStatus.RUNNING,
+            )
+
+        def cancel(self, _profile, job_id):
+            self.calls.append("cancel")
+            return RemoteStatus(
+                REMOTE_PROTOCOL_VERSION,
+                job_id,
+                JobStatus.CANCEL_REQUESTED,
+            )
+
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-recovery-cancel-timeout-"))
+    store = MemoryJobStore(_record(status=JobStatus.RUNNING))
+    backend = NeverConfirmsCancelBackend()
+    ticks = iter((0.0, 61.0))
+    thread = RemoteTrainingRecoveryThread(
+        profile=_profile(),
+        record=store.record,
+        backend=backend,
+        job_store=store,
+        result_stager=ResultStager(root / "staging", root / "runs" / "train"),
+        result_verifier=verify_result_bundle,
+        poll_interval_seconds=0,
+        cancel_timeout_seconds=60,
+        clock=lambda: next(ticks),
+    )
+    thread.request_cancel()
+
+    thread.run()
+
+    assert store.record.last_status == JobStatus.UNKNOWN
+    assert backend.calls.count("cancel") == 1
+
+
+def test_collection_state_hides_stop_server_button():
+    page = TrainPage()
+    page.btn_stop.show()
+
+    page.on_remote_training_state_changed(JobStatus.COLLECTING.value)
+
+    assert page.btn_stop.isHidden()
+
+
 def test_reopened_train_page_restores_verified_success_instead_of_resetting_to_start():
     project_id = _bootstrap.create_temp_project(
         name="恢复成功项目",
