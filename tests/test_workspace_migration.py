@@ -3,6 +3,8 @@
 import _bootstrap  # noqa: F401
 
 import hashlib
+import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -164,6 +166,56 @@ def test_copy_failure_keeps_database_on_old_paths_and_is_retryable():
         )
         assert result.receipt_file.is_file()
         assert _db_paths(database)[0] == target / "projects" / "project-000001"
+
+
+def test_receipt_write_failure_after_database_switch_is_recoverable():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        failed_once = False
+
+        def fail_first_receipt(path, payload):
+            nonlocal failed_once
+            if path.name == "switch-receipt.json" and not failed_once:
+                failed_once = True
+                raise OSError("simulated receipt failure")
+            temporary_file = path.with_name(f".{path.name}.tmp")
+            temporary_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary_file, path)
+
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=fail_first_receipt,
+            )
+        except OSError as exc:
+            assert "simulated receipt failure" in str(exc)
+        else:
+            raise AssertionError("第一次完成回执写入失败必须向调用方报告")
+
+        expected_project = target / "projects" / "project-000001"
+        assert _db_paths(database)[0] == expected_project
+        assert image.exists()
+
+        result = execute_workspace_migration(
+            plan,
+            state_root=root / "app-state",
+            database_backups_root=root / "db-backups",
+            write_json=fail_first_receipt,
+        )
+        assert result.receipt_file.is_file()
+        assert _db_paths(database)[0] == expected_project
+        assert image.exists()
 
 
 def test_conflict_and_symlink_block_execution_without_writes():

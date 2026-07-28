@@ -123,6 +123,28 @@ class RemoteJobStoreLike(Protocol):
     ): ...
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -542,6 +564,113 @@ def _switch_database_paths(plan: WorkspaceMigrationPlan) -> None:
         connection.close()
 
 
+def _database_path_state(plan: WorkspaceMigrationPlan) -> str:
+    """返回 old/new/mixed；mixed 必须人工核查，不能猜测或继续写入。"""
+    connection = sqlite3.connect(f"file:{plan.database_file}?mode=ro", uri=True)
+    try:
+        old_matches = True
+        new_matches = True
+        for project in plan.projects:
+            project_row = connection.execute(
+                "SELECT storage_path FROM projects WHERE id = ?",
+                (project.project_id,),
+            ).fetchone()
+            if project_row is None:
+                return "mixed"
+            old_matches &= Path(project_row[0]) == project.source_root
+            new_matches &= (
+                Path(project_row[0])
+                == plan.target_root / project.destination_root_relative
+            )
+
+            current_images = connection.execute(
+                "SELECT id, storage_path FROM images WHERE project_id = ? ORDER BY id",
+                (project.project_id,),
+            ).fetchall()
+            old_images = [
+                (image_id, str(source))
+                for image_id, source, _destination in project.image_paths
+            ]
+            new_images = [
+                (image_id, str(plan.target_root / destination))
+                for image_id, _source, destination in project.image_paths
+            ]
+            normalized = [(int(row[0]), row[1]) for row in current_images]
+            old_matches &= normalized == old_images
+            new_matches &= normalized == new_images
+        if new_matches:
+            return "new"
+        if old_matches:
+            return "old"
+        return "mixed"
+    finally:
+        connection.close()
+
+
+def _verify_published_files(plan: WorkspaceMigrationPlan) -> None:
+    for item in plan.files:
+        destination = plan.target_root / item.destination_relative
+        if (
+            not destination.is_file()
+            or destination.is_symlink()
+            or destination.stat().st_size != item.size
+            or _sha256(destination) != item.sha256
+        ):
+            raise WorkspaceMigrationError(
+                f"迁移目标文件未通过恢复核验: {destination}"
+            )
+
+
+def _relocate_remote_results(
+    plan: WorkspaceMigrationPlan,
+    remote_job_store: RemoteJobStoreLike | None,
+) -> int:
+    if remote_job_store is None:
+        return 0
+    relocated = 0
+    legacy_runs = plan.source_root / "runs"
+    for record in remote_job_store.list():
+        local_result = getattr(record, "local_result_dir", None)
+        if not local_result:
+            continue
+        old_result = Path(local_result)
+        if not _inside(old_result, legacy_runs):
+            continue
+        relative = old_result.resolve(strict=False).relative_to(
+            legacy_runs.resolve(strict=False)
+        )
+        remote_job_store.relocate_verified_result(
+            record.job_id,
+            expected_local_result_dir=old_result,
+            new_local_result_dir=plan.target_root / "runs" / relative,
+        )
+        relocated += 1
+    return relocated
+
+
+def _migration_receipt(
+    plan: WorkspaceMigrationPlan,
+    *,
+    backup_file: Path,
+    copied_files: int,
+    reused_files: int,
+    relocated_remote_results: int,
+) -> dict:
+    return {
+        "version": 1,
+        "migration_id": plan.migration_id,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "source_root": str(plan.source_root),
+        "target_root": str(plan.target_root),
+        "database_backup": str(backup_file),
+        "copied_files": copied_files,
+        "reused_files": reused_files,
+        "source_preserved": True,
+        "remote_job_records_modified": bool(relocated_remote_results),
+        "relocated_remote_results": relocated_remote_results,
+    }
+
+
 def execute_workspace_migration(
     plan: WorkspaceMigrationPlan,
     *,
@@ -549,6 +678,7 @@ def execute_workspace_migration(
     database_backups_root: str | Path,
     copy_file: Callable[[Path, Path], object] = shutil.copy2,
     remote_job_store: RemoteJobStoreLike | None = None,
+    write_json: Callable[[Path, dict], None] = _write_json_atomic,
 ) -> WorkspaceMigrationResult:
     """执行已盘点计划；旧源不删除，失败可用同一计划重试。"""
     if plan.blockers:
@@ -560,19 +690,6 @@ def execute_workspace_migration(
     if state.is_symlink() or backups.is_symlink():
         raise WorkspaceMigrationError("迁移状态和备份根目录不能是符号链接")
 
-    refreshed = inventory_legacy_workspace(
-        source_root=plan.source_root,
-        target_root=plan.target_root,
-        database_file=plan.database_file,
-    )
-    if (
-        refreshed.migration_id != plan.migration_id
-        or refreshed.files != plan.files
-        or refreshed.projects != plan.projects
-        or refreshed.blockers != plan.blockers
-    ):
-        raise WorkspaceMigrationError("迁移清单已变化，请重新盘点后再确认")
-
     migration_root = state / "workspace-migrations" / plan.migration_id
     migration_root.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(migration_root / "migration.lock"))
@@ -580,14 +697,86 @@ def execute_workspace_migration(
         raise WorkspaceMigrationError("另一个迁移流程正在处理同一工作区")
     try:
         plan_file = migration_root / "plan.json"
-        serialized_plan = json.dumps(
-            plan.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
-        )
         if plan_file.exists():
-            if plan_file.read_text(encoding="utf-8") != serialized_plan:
+            try:
+                stored_plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise WorkspaceMigrationError("迁移计划记录无法读取") from exc
+            if stored_plan != plan.to_dict():
                 raise WorkspaceMigrationError("同一迁移 ID 的计划内容不一致")
         else:
-            plan_file.write_text(serialized_plan, encoding="utf-8")
+            write_json(plan_file, plan.to_dict())
+
+        state_file = migration_root / "state.json"
+        receipt_file = migration_root / "switch-receipt.json"
+        recovery_state = None
+        if state_file.exists():
+            try:
+                recovery_state = json.loads(state_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise WorkspaceMigrationError("迁移恢复状态无法读取") from exc
+            if (
+                not isinstance(recovery_state, dict)
+                or recovery_state.get("version") != 1
+                or recovery_state.get("migration_id") != plan.migration_id
+                or recovery_state.get("phase")
+                not in {"ready_to_switch", "database_switched", "completed"}
+            ):
+                raise WorkspaceMigrationError("迁移恢复状态不合法，拒绝继续")
+
+            _verify_published_files(plan)
+            database_state = _database_path_state(plan)
+            if database_state == "mixed":
+                raise WorkspaceMigrationError(
+                    "数据库路径处于混合状态，拒绝自动继续迁移"
+                )
+            if database_state == "new":
+                backup_file = Path(recovery_state["database_backup"])
+                if (
+                    not backup_file.is_file()
+                    or backup_file.is_symlink()
+                    or not _inside(backup_file, backups)
+                ):
+                    raise WorkspaceMigrationError("迁移恢复状态中的数据库备份不可用")
+                relocated = int(recovery_state.get("relocated_remote_results", 0))
+                relocated += _relocate_remote_results(plan, remote_job_store)
+                copied = int(recovery_state.get("copied_files", 0))
+                reused = int(recovery_state.get("reused_files", 0))
+                receipt = _migration_receipt(
+                    plan,
+                    backup_file=backup_file,
+                    copied_files=copied,
+                    reused_files=reused,
+                    relocated_remote_results=relocated,
+                )
+                write_json(receipt_file, receipt)
+                completed_state = dict(recovery_state)
+                completed_state.update(
+                    phase="completed",
+                    relocated_remote_results=relocated,
+                )
+                write_json(state_file, completed_state)
+                return WorkspaceMigrationResult(
+                    migration_id=plan.migration_id,
+                    copied_files=copied,
+                    reused_files=reused,
+                    database_backup=backup_file,
+                    receipt_file=receipt_file,
+                    relocated_remote_results=relocated,
+                )
+
+        refreshed = inventory_legacy_workspace(
+            source_root=plan.source_root,
+            target_root=plan.target_root,
+            database_file=plan.database_file,
+        )
+        if (
+            refreshed.migration_id != plan.migration_id
+            or refreshed.files != plan.files
+            or refreshed.projects != plan.projects
+            or refreshed.blockers != plan.blockers
+        ):
+            raise WorkspaceMigrationError("迁移清单已变化，请重新盘点后再确认")
 
         staging_root = plan.target_root / ".ezyolo" / "workspace-migrations" / plan.migration_id
         staging_files = staging_root / "files"
@@ -626,52 +815,39 @@ def execute_workspace_migration(
                 plan.target_root / project.destination_root_relative,
             )
 
-        relocated_remote_results = 0
-        if remote_job_store is not None:
-            legacy_runs = plan.source_root / "runs"
-            for record in remote_job_store.list():
-                local_result = getattr(record, "local_result_dir", None)
-                if not local_result:
-                    continue
-                old_result = Path(local_result)
-                if not _inside(old_result, legacy_runs):
-                    continue
-                relative = old_result.resolve(strict=False).relative_to(
-                    legacy_runs.resolve(strict=False)
-                )
-                new_result = plan.target_root / "runs" / relative
-                remote_job_store.relocate_verified_result(
-                    record.job_id,
-                    expected_local_result_dir=old_result,
-                    new_local_result_dir=new_result,
-                )
-                relocated_remote_results += 1
+        relocated_remote_results = _relocate_remote_results(
+            plan, remote_job_store
+        )
 
         backup_file = _backup_database(
             plan.database_file, backups, plan.migration_id
         )
-        _switch_database_paths(plan)
-
-        receipt_file = migration_root / "switch-receipt.json"
-        receipt = {
+        ready_state = {
             "version": 1,
             "migration_id": plan.migration_id,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "source_root": str(plan.source_root),
-            "target_root": str(plan.target_root),
+            "phase": "ready_to_switch",
             "database_backup": str(backup_file),
             "copied_files": copied,
             "reused_files": reused,
-            "source_preserved": True,
-            "remote_job_records_modified": bool(relocated_remote_results),
             "relocated_remote_results": relocated_remote_results,
         }
-        temporary_receipt = receipt_file.with_suffix(".json.tmp")
-        temporary_receipt.write_text(
-            json.dumps(receipt, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        write_json(state_file, ready_state)
+        _switch_database_paths(plan)
+        switched_state = dict(ready_state)
+        switched_state["phase"] = "database_switched"
+        write_json(state_file, switched_state)
+
+        receipt = _migration_receipt(
+            plan,
+            backup_file=backup_file,
+            copied_files=copied,
+            reused_files=reused,
+            relocated_remote_results=relocated_remote_results,
         )
-        os.replace(temporary_receipt, receipt_file)
+        write_json(receipt_file, receipt)
+        completed_state = dict(switched_state)
+        completed_state["phase"] = "completed"
+        write_json(state_file, completed_state)
         return WorkspaceMigrationResult(
             migration_id=plan.migration_id,
             copied_files=copied,
