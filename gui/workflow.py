@@ -167,14 +167,21 @@ def find_project_weights(project_id: Optional[int]) -> Optional[Path]:
     return None
 
 
-def _run_recency_key(run_dir: Path) -> tuple[int, str]:
+def _run_recency_key(run_dir: Path) -> tuple[int, int, str]:
     best = run_dir / "weights" / "best.pt"
     candidate = best if best.is_file() and not best.is_symlink() else run_dir
     try:
         modified_ns = candidate.stat().st_mtime_ns
     except OSError:
         modified_ns = 0
-    return modified_ns, str(run_dir)
+    workspace_priority = 0
+    try:
+        workspace_root = get_runtime_paths().workspace.runs_root.resolve(strict=False)
+        run_dir.resolve(strict=False).relative_to(workspace_root)
+        workspace_priority = 1
+    except (RuntimeError, ValueError):
+        pass
+    return modified_ns, workspace_priority, str(run_dir)
 
 
 def compute_step_states(snapshot: Dict) -> Dict[int, str]:

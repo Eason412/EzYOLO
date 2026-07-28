@@ -199,6 +199,8 @@ def test_new_workspace_and_legacy_runs_are_both_read_without_copying():
     current.mkdir(parents=True)
     (legacy / "best.pt").write_bytes(b"legacy")
     (current / "best.pt").write_bytes(b"current")
+    os.utime(legacy / "best.pt", (10, 10))
+    os.utime(current / "best.pt", (10, 10))
 
     fake_runtime = SimpleNamespace(
         workspace=SimpleNamespace(runs_root=workspace / "runs")
@@ -209,6 +211,7 @@ def test_new_workspace_and_legacy_runs_are_both_read_without_copying():
         patch.object(workflow_module, "get_runtime_paths", return_value=fake_runtime),
     ):
         assert set(find_project_runs(1)) == {legacy.parent, current.parent}
+        assert find_project_weights(1) == current / "best.pt"
 
 
 def test_result_and_test_pages_share_same_available_model_when_newer_run_is_incomplete():
