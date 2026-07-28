@@ -80,6 +80,27 @@ def _db_paths(database: Path):
         connection.close()
 
 
+def _write_json(path: Path, payload: dict) -> None:
+    temporary_file = path.with_name(f".{path.name}.tmp")
+    temporary_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary_file, path)
+
+
+class _FailFirstJsonWrite:
+    def __init__(self, file_name: str):
+        self.file_name = file_name
+        self.failed = False
+
+    def __call__(self, path: Path, payload: dict) -> None:
+        if path.name == self.file_name and not self.failed:
+            self.failed = True
+            raise OSError(f"simulated {self.file_name} failure")
+        _write_json(path, payload)
+
+
 def test_inventory_is_read_only_and_includes_project_run_and_unknown_staging():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -177,19 +198,7 @@ def test_receipt_write_failure_after_database_switch_is_recoverable():
             target_root=target,
             database_file=database,
         )
-        failed_once = False
-
-        def fail_first_receipt(path, payload):
-            nonlocal failed_once
-            if path.name == "switch-receipt.json" and not failed_once:
-                failed_once = True
-                raise OSError("simulated receipt failure")
-            temporary_file = path.with_name(f".{path.name}.tmp")
-            temporary_file.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            os.replace(temporary_file, path)
+        fail_first_receipt = _FailFirstJsonWrite("switch-receipt.json")
 
         try:
             execute_workspace_migration(
@@ -199,7 +208,7 @@ def test_receipt_write_failure_after_database_switch_is_recoverable():
                 write_json=fail_first_receipt,
             )
         except OSError as exc:
-            assert "simulated receipt failure" in str(exc)
+            assert "simulated switch-receipt.json failure" in str(exc)
         else:
             raise AssertionError("第一次完成回执写入失败必须向调用方报告")
 
@@ -216,6 +225,258 @@ def test_receipt_write_failure_after_database_switch_is_recoverable():
         assert result.receipt_file.is_file()
         assert _db_paths(database)[0] == expected_project
         assert image.exists()
+
+
+def test_recovery_rejects_symlinked_target_parent_after_database_switch():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        fail_first_receipt = _FailFirstJsonWrite("switch-receipt.json")
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=fail_first_receipt,
+            )
+        except OSError:
+            pass
+        else:
+            raise AssertionError("测试必须进入数据库已切换、回执未写入的窗口")
+
+        outside = root / "outside-projects"
+        (target / "projects").rename(outside)
+        (target / "projects").symlink_to(outside, target_is_directory=True)
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("恢复时目标父目录 symlink 必须阻止完成回执")
+
+
+def test_recovery_rejects_corrupted_database_backup():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        fail_first_receipt = _FailFirstJsonWrite("switch-receipt.json")
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=fail_first_receipt,
+            )
+        except OSError:
+            pass
+        else:
+            raise AssertionError("测试必须进入数据库已切换、回执未写入的窗口")
+
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        recovery_state = json.loads(state_file.read_text(encoding="utf-8"))
+        Path(recovery_state["database_backup"]).write_bytes(b"corrupt")
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("损坏的数据库备份必须阻止完成回执")
+
+
+def test_recovery_treats_new_legacy_project_as_mixed_database_state():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        fail_first_receipt = _FailFirstJsonWrite("switch-receipt.json")
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=fail_first_receipt,
+            )
+        except OSError:
+            pass
+        else:
+            raise AssertionError("测试必须进入数据库已切换、回执未写入的窗口")
+
+        extra_project = source / "projects" / "late-project"
+        extra_image = extra_project / "images" / "late.jpg"
+        extra_image.parent.mkdir(parents=True)
+        extra_image.write_bytes(b"late")
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "INSERT INTO projects VALUES (2, ?, 'late')",
+                (str(extra_project),),
+            )
+            connection.execute(
+                "INSERT INTO images VALUES (20, 2, ?)",
+                (str(extra_image),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError as exc:
+            assert "混合状态" in str(exc)
+        else:
+            raise AssertionError("新增旧路径项目必须被识别为 mixed")
+
+
+def test_state_directory_symlink_and_corrupted_recovery_state_fail_closed():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        state_root = root / "app-state"
+        outside = root / "outside-state"
+        state_root.mkdir()
+        outside.mkdir()
+        (state_root / "workspace-migrations").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=state_root,
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError:
+            pass
+        else:
+            raise AssertionError("迁移状态目录 symlink 必须阻止写入")
+        assert list(outside.iterdir()) == []
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                write_json=_FailFirstJsonWrite("switch-receipt.json"),
+            )
+        except OSError:
+            pass
+        state_file = (
+            root
+            / "app-state"
+            / "workspace-migrations"
+            / plan.migration_id
+            / "state.json"
+        )
+        recovery_state = json.loads(state_file.read_text(encoding="utf-8"))
+        del recovery_state["database_backup_sha256"]
+        _write_json(state_file, recovery_state)
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+            )
+        except WorkspaceMigrationError as exc:
+            assert "状态字段损坏" in str(exc)
+        else:
+            raise AssertionError("字段损坏的恢复状态必须明确阻止继续")
+
+
+def test_remote_relocation_waits_for_durable_state_and_count_survives_retry():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, target, database, _image, _run_best, _partial = _fixture(root)
+        old_result = source / "runs" / "train" / "exp_1_remote_abcd"
+        succeeded = SimpleNamespace(
+            job_id="s" * 32,
+            local_result_dir=str(old_result),
+        )
+
+        class StatefulStore:
+            def list(self):
+                return [succeeded]
+
+            def relocate_verified_result(
+                self, job_id, *, expected_local_result_dir, new_local_result_dir
+            ):
+                assert job_id == succeeded.job_id
+                assert Path(succeeded.local_result_dir) == Path(expected_local_result_dir)
+                succeeded.local_result_dir = str(new_local_result_dir)
+
+        store = StatefulStore()
+        plan = inventory_legacy_workspace(
+            source_root=source,
+            target_root=target,
+            database_file=database,
+        )
+        try:
+            execute_workspace_migration(
+                plan,
+                state_root=root / "app-state",
+                database_backups_root=root / "db-backups",
+                remote_job_store=store,
+                write_json=_FailFirstJsonWrite("state.json"),
+            )
+        except OSError:
+            pass
+        else:
+            raise AssertionError("测试必须进入远程指针已迁移、状态未写入的窗口")
+        assert Path(succeeded.local_result_dir) == old_result
+        assert _db_paths(database)[0] == source / "projects" / "legacy-project"
+
+        result = execute_workspace_migration(
+            plan,
+            state_root=root / "app-state",
+            database_backups_root=root / "db-backups",
+            remote_job_store=store,
+        )
+        receipt = json.loads(result.receipt_file.read_text(encoding="utf-8"))
+        assert receipt["remote_job_records_modified"] is True
+        assert receipt["relocated_remote_results"] == 1
 
 
 def test_conflict_and_symlink_block_execution_without_writes():
