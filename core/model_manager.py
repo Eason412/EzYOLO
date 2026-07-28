@@ -65,12 +65,13 @@ ULTRALYTICS_MODELS = {
 class ModelManager:
     """模型管理器"""
     
-    def __init__(self):
+    def __init__(self, pretrained_dir: str | Path | None = None):
         self.models = {}
-        # 使用基于应用根目录的相对路径
-        app_root = Path(__file__).parent.parent  # 向上两级到sfyolo根目录
-        self.pretrained_dir = app_root / "pretrained"
-        self.pretrained_dir.mkdir(exist_ok=True)
+        if pretrained_dir is None:
+            from core.app_paths import get_runtime_paths
+            pretrained_dir = get_runtime_paths().app.cache_root / "models"
+        self.pretrained_dir = Path(pretrained_dir).expanduser()
+        self.pretrained_dir.mkdir(parents=True, exist_ok=True)
     
     def get_model_path(self, version: str, size: str, task: str = "detect") -> Path:
         """获取模型路径
@@ -284,10 +285,6 @@ class ModelManager:
                     })
         
         return available_models
-
-
-# 全局模型管理器实例
-model_manager = ModelManager()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import tempfile
 
 from models.database import Database, DatabaseProxy
 import models.database as database_module
+from core.model_manager import ModelManager
 
 
 def test_module_global_database_is_inert_until_configured():
@@ -50,6 +51,14 @@ def test_default_sync_scan_uses_injected_projects_root():
         result = database.sync_files_with_database()
         assert result["orphan_disk_count"] == 1
         assert any(issue.get("path") == str(orphan) for issue in result["issues"])
+
+
+def test_model_manager_uses_injected_cache_without_import_side_effect():
+    with tempfile.TemporaryDirectory() as temporary:
+        models_root = Path(temporary) / "cache" / "models"
+        manager = ModelManager(pretrained_dir=models_root)
+        assert manager.pretrained_dir == models_root
+        assert models_root.is_dir()
 
 
 if __name__ == "__main__":
