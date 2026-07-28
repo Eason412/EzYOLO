@@ -1,9 +1,13 @@
 # 数据和模型目录
-pretrained/
-projects/
-runs/
-datasets/
-data/
+/pretrained/
+/projects/
+/runs/
+/datasets/
+/data/
+/outputs/
+/backups/
+/training_log.txt
+/inference_log.txt
 
 # 开发和临时文件
 .git/
