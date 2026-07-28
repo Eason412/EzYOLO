@@ -16,6 +16,7 @@ import sys
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gui import workflow as workflow_module  # noqa: E402
@@ -186,6 +187,28 @@ def test_latest_weights_use_filesystem_recency_not_random_job_id_sorting():
     with patch.object(workflow_module, "APP_ROOT", root):
         assert find_project_runs(1) == [older.parent, newer.parent]
         assert find_project_weights(1) == newer_best
+
+
+def test_new_workspace_and_legacy_runs_are_both_read_without_copying():
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-run-compat-"))
+    workspace = root / "workspace"
+    resources = root / "source"
+    legacy = resources / "runs" / "train" / "exp_1_remote_legacy" / "weights"
+    current = workspace / "runs" / "train" / "exp_1_remote_current" / "weights"
+    legacy.mkdir(parents=True)
+    current.mkdir(parents=True)
+    (legacy / "best.pt").write_bytes(b"legacy")
+    (current / "best.pt").write_bytes(b"current")
+
+    fake_runtime = SimpleNamespace(
+        workspace=SimpleNamespace(runs_root=workspace / "runs")
+    )
+    with (
+        patch.object(workflow_module, "APP_ROOT", resources),
+        patch.object(workflow_module, "_RESOURCE_ROOT", resources),
+        patch.object(workflow_module, "get_runtime_paths", return_value=fake_runtime),
+    ):
+        assert set(find_project_runs(1)) == {legacy.parent, current.parent}
 
 
 def test_result_and_test_pages_share_same_available_model_when_newer_run_is_incomplete():

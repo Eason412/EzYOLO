@@ -127,23 +127,34 @@ def find_project_runs(project_id: Optional[int]) -> List[Path]:
     if not project_id:
         return []
 
-    # 测试可以继续显式替换 APP_ROOT；生产运行只读统一 Workspace。
+    # 测试可以继续显式替换 APP_ROOT。生产同时读取新 Workspace 与只读旧版
+    # 源码 runs，直到用户完成显式迁移；所有新 writer 只写 Workspace。
     if APP_ROOT != _RESOURCE_ROOT:
-        runs_root = APP_ROOT / "runs"
+        runs_roots = [APP_ROOT / "runs"]
     else:
         try:
-            runs_root = get_runtime_paths().workspace.runs_root
+            workspace_runs = get_runtime_paths().workspace.runs_root
         except RuntimeError:
-            runs_root = APP_ROOT / "runs"
-    if not runs_root.exists():
-        return []
+            workspace_runs = APP_ROOT / "runs"
+        runs_roots = [workspace_runs]
+        legacy_runs = APP_ROOT / "runs"
+        if legacy_runs != workspace_runs:
+            runs_roots.append(legacy_runs)
 
     matches = []
     base_name = f"exp_{project_id}"
-    for weights_dir in runs_root.glob("**/weights"):
-        run_dir = weights_dir.parent
-        if run_dir.name == base_name or run_dir.name.startswith(base_name + "_"):
-            matches.append(run_dir)
+    seen = set()
+    for runs_root in runs_roots:
+        if not runs_root.exists():
+            continue
+        for weights_dir in runs_root.glob("**/weights"):
+            run_dir = weights_dir.parent
+            if (
+                run_dir not in seen
+                and (run_dir.name == base_name or run_dir.name.startswith(base_name + "_"))
+            ):
+                matches.append(run_dir)
+                seen.add(run_dir)
     return sorted(matches, key=_run_recency_key)
 
 
