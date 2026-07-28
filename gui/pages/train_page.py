@@ -14,6 +14,7 @@ from PyQt6.QtGui import QIcon
 import os
 import json
 import shutil
+import secrets
 from html import escape
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -228,6 +229,8 @@ class TrainingThread(QThread):
         super().__init__()
         self.config = config
         self.project_id = project_id
+        project_part = str(project_id) if project_id else "unassigned"
+        self.run_name = f"train/exp_{project_part}_local_{secrets.token_hex(4)}"
         self._is_running = False
         self._is_paused = False
         self.metrics_history = []  # 存储训练指标历史
@@ -427,8 +430,8 @@ class TrainingThread(QThread):
                 workers=self.config.get('workers', 4),
                 verbose=True,
                 project=str(runtime_paths.workspace.runs_root),
-                name=f'train/exp_{self.project_id}' if self.project_id else 'train/exp',
-                exist_ok=True,
+                name=self.run_name,
+                exist_ok=False,
                 mosaic=self.config.get('mosaic', True),
                 mixup=self.config.get('mixup', 0.0),
                 hsv_h=self.config.get('hsv_strength', 50) / 100.0 if self.config.get('hsv', False) else 0.0,
