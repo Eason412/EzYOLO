@@ -8,6 +8,7 @@ import tempfile
 from core.app_paths import (
     AppPathError,
     platform_default_locations,
+    resolve_pretrained_models_root,
     resolve_runtime_paths,
 )
 
@@ -71,6 +72,21 @@ def test_resolver_rejects_relative_empty_and_source_nested_workspace():
         resolve_runtime_paths,
         **{**common, "workspace_root": "/opt/EzYOLO/runs"},
     )
+
+
+def test_legacy_source_pretrained_setting_falls_back_to_user_cache():
+    paths = resolve_runtime_paths(
+        resource_root="/opt/EzYOLO",
+        app_data_location="/tmp/state",
+        cache_location="/tmp/cache",
+        documents_location="/tmp/documents",
+    )
+    assert resolve_pretrained_models_root(
+        paths, "/opt/EzYOLO/pretrained"
+    ) == Path("/tmp/cache/models")
+    assert resolve_pretrained_models_root(
+        paths, "/mnt/models"
+    ) == Path("/mnt/models")
 
 
 if __name__ == "__main__":

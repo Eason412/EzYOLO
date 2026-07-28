@@ -15,7 +15,11 @@
 
 import json
 from pathlib import Path
-from core.app_paths import WORKSPACE_SETTING_KEY, get_runtime_paths
+from core.app_paths import (
+    WORKSPACE_SETTING_KEY,
+    get_runtime_paths,
+    resolve_pretrained_models_root,
+)
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -235,7 +239,10 @@ class SettingsPage(QWidget):
                        Qt.AlignmentFlag.AlignLeft)
 
         self._pretrained_path_value = str(
-            self.settings.value("pretrained_path", str(DEFAULT_PRETRAINED_PATH))
+            resolve_pretrained_models_root(
+                get_runtime_paths(),
+                self.settings.value("pretrained_path", str(DEFAULT_PRETRAINED_PATH)),
+            )
         )
         self.pretrained_path = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
         self._refresh_pretrained_path_display()
@@ -771,7 +778,15 @@ class SettingsPage(QWidget):
 
         if path:
             if setting_key == "pretrained_path":
-                self._pretrained_path_value = path
+                resolved = resolve_pretrained_models_root(get_runtime_paths(), path)
+                if resolved != Path(path):
+                    QMessageBox.warning(
+                        self,
+                        "无法使用此目录",
+                        "预训练模型目录不能放在 EzYOLO 源码或安装目录中。",
+                    )
+                    return
+                self._pretrained_path_value = str(resolved)
                 self._refresh_pretrained_path_display()
                 self.mark_dirty()
 

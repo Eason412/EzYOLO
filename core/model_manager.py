@@ -68,8 +68,13 @@ class ModelManager:
     def __init__(self, pretrained_dir: str | Path | None = None):
         self.models = {}
         if pretrained_dir is None:
-            from core.app_paths import get_runtime_paths
-            pretrained_dir = get_runtime_paths().app.cache_root / "models"
+            from PyQt6.QtCore import QSettings
+            from core.app_paths import get_runtime_paths, resolve_pretrained_models_root
+            runtime_paths = get_runtime_paths()
+            pretrained_dir = resolve_pretrained_models_root(
+                runtime_paths,
+                QSettings("EzYOLO", "Settings").value("pretrained_path", ""),
+            )
         self.pretrained_dir = Path(pretrained_dir).expanduser()
         self.pretrained_dir.mkdir(parents=True, exist_ok=True)
     

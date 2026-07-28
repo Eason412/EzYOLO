@@ -213,6 +213,26 @@ def prepare_runtime_directories(paths: RuntimePaths) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
 
+def resolve_pretrained_models_root(
+    paths: RuntimePaths,
+    configured_path: str | Path | None,
+) -> Path:
+    """解析用户模型目录；旧版源码内配置自动退回用户缓存。"""
+    fallback = paths.app.cache_root / "models"
+    if not configured_path or not str(configured_path).strip():
+        return fallback
+    candidate = Path(configured_path).expanduser()
+    if not candidate.is_absolute():
+        return fallback
+    try:
+        candidate.resolve(strict=False).relative_to(
+            paths.app.resource_root.resolve(strict=False)
+        )
+    except ValueError:
+        return candidate
+    return fallback
+
+
 __all__ = [
     "AppPathError",
     "AppPaths",
@@ -225,4 +245,5 @@ __all__ = [
     "platform_default_locations",
     "prepare_runtime_directories",
     "resolve_runtime_paths",
+    "resolve_pretrained_models_root",
 ]

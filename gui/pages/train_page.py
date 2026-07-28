@@ -56,7 +56,7 @@ from core.remote_training.profile_store import RemoteTrainingProfileStore
 from core.remote_training.results import verify_result_bundle
 from core.remote_training.snapshot import DatasetSnapshotBuilder, SnapshotError
 from core.remote_training.transport import ClientTransportUnavailable, RemoteTransportError
-from core.app_paths import get_runtime_paths
+from core.app_paths import get_runtime_paths, resolve_pretrained_models_root
 from models.database import db
 from remote_protocol.v1 import JobStatus
 
@@ -285,7 +285,10 @@ class TrainingThread(QThread):
         # 可重新下载的预训练权重放在用户缓存，不写源码/安装目录。
         import os
         runtime_paths = get_runtime_paths()
-        pretrained_dir = runtime_paths.app.cache_root / "models"
+        pretrained_dir = resolve_pretrained_models_root(
+            runtime_paths,
+            QSettings("EzYOLO", "Settings").value("pretrained_path", ""),
+        )
         model_path = os.path.join(pretrained_dir, model_name)
         
         # 如果本地不存在，则使用模型名称（会自动下载）
