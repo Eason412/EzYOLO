@@ -15,6 +15,7 @@
 
 import json
 from pathlib import Path
+from core.app_paths import get_runtime_paths
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -36,8 +37,8 @@ from core.remote_training.profile_store import (
 
 APP_ROOT = Path(__file__).parent.parent.parent
 DEFAULT_PRETRAINED_PATH = APP_ROOT / "pretrained"
-SAM_CONFIG_FILE = APP_ROOT / "config" / "sam_config.json"
-LLM_CONFIG_FILE = APP_ROOT / "config" / "llm_config.json"
+SAM_CONFIG_FILE = get_runtime_paths().app.config_root / "sam_config.json"
+LLM_CONFIG_FILE = get_runtime_paths().app.config_root / "llm_config.json"
 
 # 设置键与界面显示名
 THEME_SETTING_KEY = 'theme'

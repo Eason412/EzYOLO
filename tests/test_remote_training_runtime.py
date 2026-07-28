@@ -33,7 +33,7 @@ def test_runtime_paths_are_private_and_result_staging_shares_runs_parent():
         root = Path(temporary)
         paths = resolve_remote_training_runtime_paths(
             app_data_location=str(root / "app-data"),
-            app_root=root / "EzYOLO",
+            workspace_root=root / "Documents" / "EzYOLO",
         )
         assert paths.known_hosts_dir == root / "app-data" / "remote-training-v1" / "known-hosts"
         assert paths.snapshot_parent == root / "app-data" / "remote-training-v1" / "snapshots"
@@ -46,17 +46,17 @@ def test_runtime_rejects_empty_or_relative_location_and_only_builds_backend():
     _rejected(
         resolve_remote_training_runtime_paths,
         app_data_location="",
-        app_root="/tmp/EzYOLO",
+        workspace_root="/tmp/EzYOLO",
     )
     _rejected(
         resolve_remote_training_runtime_paths,
         app_data_location="relative",
-        app_root="/tmp/EzYOLO",
+        workspace_root="/tmp/EzYOLO",
     )
 
     paths = resolve_remote_training_runtime_paths(
         app_data_location="/tmp/ezyolo-state",
-        app_root="/tmp/EzYOLO",
+        workspace_root="/tmp/EzYOLO",
     )
     backend = build_system_remote_backend(paths, resolver=_FakeResolver())
     assert isinstance(backend, SshRsyncBackend)

@@ -10,8 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from PyQt6.QtCore import QStandardPaths
-
+from core.app_paths import get_runtime_paths
 from core.remote_training.transport import (
     ClientTransportResolver,
     HostTrustStore,
@@ -35,17 +34,17 @@ class RemoteTrainingRuntimePaths:
 def resolve_remote_training_runtime_paths(
     *,
     app_data_location: str,
-    app_root: Path | str,
+    workspace_root: Path | str,
 ) -> RemoteTrainingRuntimePaths:
     """从已知目录推导受控路径；本函数不创建任何目录。"""
     if not isinstance(app_data_location, str) or not app_data_location.strip():
         raise RemoteTrainingRuntimeError("本机没有可用的应用数据目录，无法安全准备远程训练")
     state_root = Path(app_data_location).expanduser()
-    repository_root = Path(app_root).expanduser()
-    if not state_root.is_absolute() or not repository_root.is_absolute():
+    workspace = Path(workspace_root).expanduser()
+    if not state_root.is_absolute() or not workspace.is_absolute():
         raise RemoteTrainingRuntimeError("远程训练运行时目录必须是绝对路径")
     client_root = state_root / "remote-training-v1"
-    runs_root = repository_root / "runs"
+    runs_root = workspace / "runs"
     return RemoteTrainingRuntimePaths(
         known_hosts_dir=client_root / "known-hosts",
         snapshot_parent=client_root / "snapshots",
@@ -54,13 +53,17 @@ def resolve_remote_training_runtime_paths(
     )
 
 
-def current_remote_training_runtime_paths(app_root: Path | str) -> RemoteTrainingRuntimePaths:
-    """读取 Qt 提供的用户级应用数据位置；空值 fail closed。"""
+def current_remote_training_runtime_paths(
+    _legacy_app_root: Path | str | None = None,
+) -> RemoteTrainingRuntimePaths:
+    """读取应用入口已经冻结的用户数据和 Workspace；未配置则 fail closed。"""
+    try:
+        runtime = get_runtime_paths()
+    except RuntimeError as exc:
+        raise RemoteTrainingRuntimeError(str(exc)) from exc
     return resolve_remote_training_runtime_paths(
-        app_data_location=QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.AppLocalDataLocation
-        ),
-        app_root=app_root,
+        app_data_location=str(runtime.app.data_root),
+        workspace_root=runtime.workspace.root,
     )
 
 

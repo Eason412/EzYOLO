@@ -27,6 +27,7 @@ class AppPaths:
     data_root: Path
     cache_root: Path
     log_root: Path
+    config_root: Path
     database_file: Path
     database_backups_root: Path
     remote_state_root: Path
@@ -91,6 +92,7 @@ def resolve_runtime_paths(
         data_root=data_root,
         cache_root=cache_root,
         log_root=logs,
+        config_root=data_root / "config",
         database_file=data_root / "database" / "EzYOLO.db",
         database_backups_root=data_root / "database-backups",
         remote_state_root=data_root / "remote-training-v1",
@@ -201,6 +203,7 @@ def prepare_runtime_directories(paths: RuntimePaths) -> None:
         paths.app.database_backups_root,
         paths.app.cache_root,
         paths.app.log_root,
+        paths.app.config_root,
         paths.app.remote_state_root,
         paths.workspace.projects_root,
         paths.workspace.runs_train_root,

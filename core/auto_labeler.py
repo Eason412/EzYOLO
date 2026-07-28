@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
-from core.model_manager import model_manager
 from models.database import db
 
 
@@ -55,14 +54,14 @@ class AutoLabeler:
             
             # 加载模型
             if model_source == 'official':
-                self.current_model = model_manager.load_model(
+                self.current_model = self.model_manager.load_model(
                     model_version, model_size, model_task
                 )
             else:
-                self.current_model = model_manager.load_custom_model(custom_model_path)
+                self.current_model = self.model_manager.load_custom_model(custom_model_path)
             
             if self.current_model:
-                self.model_info = model_manager.get_model_info(self.current_model)
+                self.model_info = self.model_manager.get_model_info(self.current_model)
                 self.class_mappings = config.get('class_mappings', {})
                 self.model_task = model_task
                 
@@ -106,7 +105,7 @@ class AutoLabeler:
         iou_threshold = config.get('iou_threshold', 0.45)
         
         # 进行推理
-        result = model_manager.infer(
+        result = self.model_manager.infer(
             self.current_model, image_path, conf_threshold, iou_threshold
         )
         
@@ -479,7 +478,7 @@ class AutoLabeler:
     
     def unload_model(self):
         """卸载模型"""
-        model_manager.unload_all_models()
+        self.model_manager.unload_all_models()
         self.current_model = None
         self.model_info = {}
 

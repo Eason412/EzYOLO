@@ -21,10 +21,11 @@ from pathlib import Path
 from gui.pages.result_page import ResultPage
 from gui.pages.test_page import TestPage, annotated_output_path, is_video_path
 from gui.workflow import APP_ROOT
+from core.app_paths import get_runtime_paths
 
 _app = _bootstrap.app()
 
-OUTPUTS = APP_ROOT / "outputs"
+OUTPUTS = get_runtime_paths().workspace.outputs_root
 
 
 def test_constructing_test_page_keeps_existing_results():

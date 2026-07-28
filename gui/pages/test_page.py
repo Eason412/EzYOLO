@@ -29,6 +29,7 @@ from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.context_help import ContextHelp
 from gui.widgets.workflow_widgets import EmptyState
 from gui.workflow import find_project_weights
+from core.app_paths import get_runtime_paths
 from models.database import db
 
 UNGROUPED_GROUP_ID = 0
@@ -73,7 +74,7 @@ class InferenceThread(QThread):
         self.class_mapping = class_mapping or {}  # 类别映射
         self._is_running = False
         self.model = None
-        self.output_root = Path(__file__).parent.parent.parent / "outputs"
+        self.output_root = get_runtime_paths().workspace.outputs_root
         self.image_output_dir = self.output_root / "test_images"
         self.video_output_dir = self.output_root / "test_videos"
         
@@ -803,7 +804,7 @@ class TestPage(QWidget):
         self._stopping = False
         self._model_note = ""  # 模型来源那一行的补充说明
         self._model_user_chosen = False  # 用户自己挑过模型文件，别再被默认值盖掉
-        self.output_root = Path(__file__).parent.parent.parent / "outputs"
+        self.output_root = get_runtime_paths().workspace.outputs_root
         self.image_output_dir = self.output_root / "test_images"
         self.video_output_dir = self.output_root / "test_videos"
 
@@ -2229,7 +2230,9 @@ class TestPage(QWidget):
     def save_log(self):
         """保存日志"""
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存日志", "inference_log.txt",
+            self,
+            "保存日志",
+            str(get_runtime_paths().workspace.root / "inference_log.txt"),
             "文本文件 (*.txt);;所有文件 (*.*)"
         )
 

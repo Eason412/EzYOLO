@@ -49,14 +49,27 @@ class _TempQSettings(_RealQSettings):
 
 _qtcore.QSettings = _TempQSettings
 
+# --- 运行目录：所有 GUI writer 都必须落在统一临时根 ---
+from core.app_paths import configure_runtime_paths, resolve_runtime_paths  # noqa: E402
+
+TEMP_RUNTIME_ROOT = Path(tempfile.mkdtemp(prefix="ezyolo-runtime-"))
+RUNTIME_PATHS = resolve_runtime_paths(
+    resource_root=APP_ROOT,
+    app_data_location=TEMP_RUNTIME_ROOT / "state",
+    cache_location=TEMP_RUNTIME_ROOT / "cache",
+    documents_location=TEMP_RUNTIME_ROOT / "documents",
+)
+configure_runtime_paths(RUNTIME_PATHS)
+
 # --- 数据库：必须在 gui.* 被 import 之前换掉 ---
 from models.database import Database  # noqa: E402
 import models.database as database_module  # noqa: E402
 
-_tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_tmp_db.close()
-DB_PATH = _tmp_db.name
-database_module.db = Database(db_path=DB_PATH)
+DB_PATH = str(TEMP_RUNTIME_ROOT / "state" / "database" / "EzYOLO.db")
+database_module.db = Database(
+    db_path=DB_PATH,
+    projects_root=RUNTIME_PATHS.workspace.projects_root,
+)
 
 # 真实实现现在是只读扫描，但界面测试仍不应读取真实 projects/。只替换这个
 # 临时实例，不能修改 Database 类本身，否则同一 pytest 进程中的安全测试会被污染。
@@ -75,7 +88,7 @@ db = database_module.db
 # 测试项目必须连目录也落在临时区。Database.create_project() 的存储目录固定指向
 # APP_ROOT/projects，即使数据库本身是临时的也会在真实项目区留下文件；测试被中止时
 # atexit 来不及清理。统一从这里直写临时 DB，并把 storage_path 放进 /tmp。
-TEMP_PROJECTS_DIR = Path(tempfile.mkdtemp(prefix="ezyolo-test-projects-"))
+TEMP_PROJECTS_DIR = RUNTIME_PATHS.workspace.projects_root
 
 
 def create_temp_project(name="测试项目", project_type="detect", classes=None):
@@ -95,23 +108,10 @@ def create_temp_project(name="测试项目", project_type="detect", classes=None
     finally:
         conn.close()
 
-# Database.create_project 总会在 APP_ROOT/projects 下 mkdir 一个真目录——临时数据库
-# 拦不住它（路径是按 models/../projects 硬算的）。所以记下开跑前已有的目录，
-# 退出时把测试新建的那些删掉，仓库里不留垃圾。只动「本进程新出现的」目录。
-_PROJECTS_DIR = APP_ROOT / "projects"
-_PREEXISTING_PROJECTS = (
-    {p.name for p in _PROJECTS_DIR.iterdir()} if _PROJECTS_DIR.exists() else set()
-)
-
-
 def _cleanup_test_projects():
     import shutil
-    shutil.rmtree(TEMP_PROJECTS_DIR, ignore_errors=True)
-    if not _PROJECTS_DIR.exists():
-        return
-    for entry in _PROJECTS_DIR.iterdir():
-        if entry.is_dir() and entry.name not in _PREEXISTING_PROJECTS:
-            shutil.rmtree(entry, ignore_errors=True)
+    shutil.rmtree(TEMP_RUNTIME_ROOT, ignore_errors=True)
+    shutil.rmtree(SETTINGS_DIR, ignore_errors=True)
 
 
 import atexit  # noqa: E402

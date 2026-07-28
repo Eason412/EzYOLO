@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from models.database import db
+from core.app_paths import get_runtime_paths
 
 APP_ROOT = Path(__file__).parent.parent
+_RESOURCE_ROOT = APP_ROOT
 
 # 步骤在 QStackedWidget 中的索引，也是流程顺序
 STEP_IMPORT = 0
@@ -125,7 +127,14 @@ def find_project_runs(project_id: Optional[int]) -> List[Path]:
     if not project_id:
         return []
 
-    runs_root = APP_ROOT / "runs"
+    # 测试可以继续显式替换 APP_ROOT；生产运行只读统一 Workspace。
+    if APP_ROOT != _RESOURCE_ROOT:
+        runs_root = APP_ROOT / "runs"
+    else:
+        try:
+            runs_root = get_runtime_paths().workspace.runs_root
+        except RuntimeError:
+            runs_root = APP_ROOT / "runs"
     if not runs_root.exists():
         return []
 

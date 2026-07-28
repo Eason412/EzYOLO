@@ -12,9 +12,6 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 from PyQt6.QtGui import QIcon
 
-from gui.main_window import MainWindow
-from gui.styles import get_primary_font_family
-
 
 def qt_message_handler(msg_type, context, message):
     """自定义Qt消息处理器，过滤QFont警告"""
@@ -32,7 +29,7 @@ def qt_message_handler(msg_type, context, message):
         print(msg_str, file=sys.stderr)
 
 
-def main():
+def main() -> int:
     """主函数"""
     # 安装自定义消息处理器，屏蔽QFont警告
     qInstallMessageHandler(qt_message_handler)
@@ -47,35 +44,77 @@ def main():
     
     # 创建应用
     app = QApplication(sys.argv)
+    app.setOrganizationName("EzYOLO")
     app.setApplicationName("EzYOLO")
     app.setApplicationVersion("1.0.0")
 
-    # 按当前系统真实存在的字体设置界面字体：
-    # macOS/Linux 上不会再去请求 Windows 才有的 "Microsoft YaHei"，字体缺失警告随之消失
-    font_family = get_primary_font_family()
-    if font_family:
-        app_font = app.font()
-        app_font.setFamily(font_family)
-        app.setFont(app_font)
+    # 必须先解析路径并取得单实例租约，再打开、复制或迁移任何用户数据库。
+    from core.app_paths import (
+        configure_runtime_paths,
+        current_runtime_paths,
+        prepare_runtime_directories,
+    )
+    from core.instance_lease import ApplicationInstanceLease
+    from core.storage_migration import StorageMigrationError, prepare_database
 
-    # 设置应用图标（使用相对路径）
-    icon_path = app_root / "icon.png"
-    if icon_path.exists():
-        app_icon = QIcon(str(icon_path))
-        app.setWindowIcon(app_icon)
+    try:
+        runtime_paths = current_runtime_paths(app_root)
+    except Exception as exc:
+        print(f"EzYOLO 无法确定安全的用户数据目录: {exc}", file=sys.stderr)
+        return 1
+
+    lease = ApplicationInstanceLease(runtime_paths.app.data_root / "EzYOLO.lock")
+    if not lease.try_acquire():
+        print("EzYOLO 已在另一个窗口中运行；本次没有打开或迁移数据库。")
+        return 0
+
+    try:
+        prepare_runtime_directories(runtime_paths)
+        preparation = prepare_database(
+            legacy_database=app_root / "data" / "EzYOLO.db",
+            target_database=runtime_paths.app.database_file,
+            backup_root=runtime_paths.app.database_backups_root,
+        )
+        from models.database import Database, configure_database
+
+        configure_database(
+            Database(
+                db_path=str(preparation.database_file),
+                projects_root=runtime_paths.workspace.projects_root,
+            )
+        )
+        configure_runtime_paths(runtime_paths)
+
+        # GUI 模块会绑定 db 和运行路径，必须在上述装配完成后再导入。
+        from gui.main_window import MainWindow
+        from gui.styles import get_primary_font_family
+
+        # 按当前系统真实存在的字体设置界面字体。
+        font_family = get_primary_font_family()
+        if font_family:
+            app_font = app.font()
+            app_font.setFamily(font_family)
+            app.setFont(app_font)
+
+        icon_path = app_root / "icon.png"
+        if icon_path.exists():
+            app_icon = QIcon(str(icon_path))
+            app.setWindowIcon(app_icon)
     
-    # 创建主窗口
-    window = MainWindow()
+        window = MainWindow()
     
-    # 为主窗口设置图标
-    if 'app_icon' in locals():
-        window.setWindowIcon(app_icon)
+        if 'app_icon' in locals():
+            window.setWindowIcon(app_icon)
     
-    window.show()
+        window.show()
     
-    # 运行应用
-    sys.exit(app.exec())
+        return app.exec()
+    except StorageMigrationError as exc:
+        print(f"EzYOLO 为保护旧数据已停止启动: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        lease.release()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

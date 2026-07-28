@@ -23,10 +23,11 @@ from gui.styles import COLORS, CONTROL_HEIGHT_LG, RADIUS_SM
 from gui.widgets.app_dialog import confirm, show_warning
 from gui.widgets.collapsible_section import CollapsibleSection
 from gui.widgets.context_help import ContextHelp
+from core.app_paths import get_runtime_paths
 
 # LLM配置文件路径
-LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
-SAM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'sam_config.json')
+LLM_CONFIG_FILE = str(get_runtime_paths().app.config_root / "llm_config.json")
+SAM_CONFIG_FILE = str(get_runtime_paths().app.config_root / "sam_config.json")
 SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
 
 # 默认LLM配置

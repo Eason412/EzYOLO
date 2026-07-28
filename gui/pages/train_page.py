@@ -55,6 +55,7 @@ from core.remote_training.profile_store import RemoteTrainingProfileStore
 from core.remote_training.results import verify_result_bundle
 from core.remote_training.snapshot import DatasetSnapshotBuilder, SnapshotError
 from core.remote_training.transport import ClientTransportUnavailable, RemoteTransportError
+from core.app_paths import get_runtime_paths
 from models.database import db
 from remote_protocol.v1 import JobStatus
 
@@ -278,11 +279,10 @@ class TrainingThread(QThread):
             suffix = task_suffix_map.get(task, task)
             model_name = f"{model_prefix}{model_size}-{suffix}.pt"
         
-        # 从pretrained目录加载（使用相对路径）
+        # 可重新下载的预训练权重放在用户缓存，不写源码/安装目录。
         import os
-        from pathlib import Path
-        app_root = Path(__file__).parent.parent.parent  # 向上三级到EzYOLO根目录
-        pretrained_dir = app_root / "pretrained"
+        runtime_paths = get_runtime_paths()
+        pretrained_dir = runtime_paths.app.cache_root / "models"
         model_path = os.path.join(pretrained_dir, model_name)
         
         # 如果本地不存在，则使用模型名称（会自动下载）
@@ -426,7 +426,7 @@ class TrainingThread(QThread):
                 device=device,
                 workers=self.config.get('workers', 4),
                 verbose=True,
-                project='runs',
+                project=str(runtime_paths.workspace.runs_root),
                 name=f'train/exp_{self.project_id}' if self.project_id else 'train/exp',
                 exist_ok=True,
                 mosaic=self.config.get('mosaic', True),
@@ -472,12 +472,13 @@ class TrainingThread(QThread):
                 self.log_message.emit("✗ 错误：无法获取项目信息")
                 return None
             
-            # 创建数据集目录（使用基于应用根目录的相对路径）
+            # 数据集是可重新生成的训练缓存，不写源码或用户永久项目目录。
             import os
             import shutil
-            from pathlib import Path
-            app_root = Path(__file__).parent.parent.parent  # 向上三级到EzYOLO根目录
-            dataset_dir = app_root / f"datasets/project_{self.project_id}"
+            dataset_dir = (
+                get_runtime_paths().workspace.datasets_root
+                / f"project_{self.project_id}"
+            )
             
             # 清空原有训练数据目录
             if os.path.exists(dataset_dir):
@@ -3113,7 +3114,9 @@ class TrainPage(QWidget):
     def save_log(self):
         """保存日志"""
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存日志", "training_log.txt",
+            self,
+            "保存日志",
+            str(get_runtime_paths().workspace.root / "training_log.txt"),
             "文本文件 (*.txt);;所有文件 (*.*)"
         )
         
