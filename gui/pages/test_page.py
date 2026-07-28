@@ -237,7 +237,6 @@ class InferenceThread(QThread):
         self.log_message.emit(f"视频信息: {width}x{height}, {fps}fps, {total_frames}帧")
 
         # 创建输出视频（边推理边写盘，避免帧缓存导致内存暴涨）
-        app_root = Path(__file__).parent.parent.parent
         output_video_path = annotated_output_path(
             video_path, self.image_output_dir, self.video_output_dir
         )
