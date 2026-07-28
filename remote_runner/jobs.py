@@ -444,7 +444,10 @@ class Runner:
                     cwd=str(self.paths.job_dir(job_id)),
                     start_new_session=True,
                     close_fds=True,
-                    env=controlled_environment(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=supervisor_environment(),
                 )
                 identity = self.inspector.identity_for(job_id, int(process.pid))
                 if identity is None or identity.pgid != identity.pid:
@@ -983,3 +986,11 @@ def controlled_environment() -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
+
+
+def supervisor_environment() -> dict[str, str]:
+    """只为从源码树启动的 supervisor 补充 runner 包搜索路径。"""
+
+    environment = controlled_environment()
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    return environment

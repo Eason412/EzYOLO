@@ -9,15 +9,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Callable, Sequence
+from typing import BinaryIO, Callable, Sequence
 
 from remote_protocol.v1 import REMOTE_PROTOCOL_VERSION, FailureCode, JobStatus, RemoteStatus, validate_job_id
 
 from .config import load_server_config
 from .jobs import ProcessIdentity, Runner, RunnerFailure, controlled_environment
+
+
+def open_launcher_log(job_dir: Path) -> BinaryIO:
+    """Create one private launcher log without ever overwriting prior evidence."""
+
+    path = job_dir / "launcher.log"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    return os.fdopen(descriptor, "wb")
 
 
 @dataclass
@@ -99,12 +108,15 @@ def supervise_job(
         return 2
 
     try:
-        process = spawner(
-            launcher_command(runner, job_id),
-            cwd=str(runner.paths.job_dir(job_id)),
-            close_fds=True,
-            env=controlled_environment(),
-        )
+        with open_launcher_log(runner.paths.job_dir(job_id)) as launcher_log:
+            process = spawner(
+                launcher_command(runner, job_id),
+                cwd=str(runner.paths.job_dir(job_id)),
+                close_fds=True,
+                stdout=launcher_log,
+                stderr=subprocess.STDOUT,
+                env=controlled_environment(),
+            )
     except OSError as exc:
         runner._write_failed(job_id, FailureCode.TRAINING_FAILED, f"训练 launcher 无法启动：{exc}")
         runner.lock.release_if_matches(own_identity)

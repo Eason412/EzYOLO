@@ -45,8 +45,10 @@ from remote_runner.jobs import (  # noqa: E402
     Runner,
     RunnerFailure,
     RunnerPaths,
+    controlled_environment,
+    supervisor_environment,
 )
-from remote_runner.trainer import Watchdog  # noqa: E402
+from remote_runner.trainer import Watchdog, open_launcher_log, supervise_job  # noqa: E402
 
 
 JOB_ID = "a" * 32
@@ -617,7 +619,13 @@ def test_start_uses_a_fake_independent_supervisor_and_persists_the_matching_lock
         assert command[-2] == "remote_runner.trainer"
         assert kwargs["start_new_session"] is True
         assert kwargs["close_fds"] is True
-        assert set(kwargs["env"]) == {"HOME", "PATH", "LANG", "LC_ALL"}
+        assert kwargs["stdin"] is __import__("subprocess").DEVNULL
+        assert kwargs["stdout"] is __import__("subprocess").DEVNULL
+        assert kwargs["stderr"] is __import__("subprocess").DEVNULL
+        assert set(kwargs["env"]) == {"HOME", "PATH", "LANG", "LC_ALL", "PYTHONPATH"}
+        assert kwargs["env"]["PYTHONPATH"] == str(APP_ROOT)
+        assert supervisor_environment() == kwargs["env"]
+        assert set(controlled_environment()) == {"HOME", "PATH", "LANG", "LC_ALL"}
         assert runner.lock.read() == inspector.identity_for(JOB_ID, 101)
 
 
@@ -660,6 +668,44 @@ def test_watchdog_only_stops_verified_job_process_group_and_reports_limits():
     with tempfile.TemporaryDirectory() as name:
         runner = verified_runner(Path(name), disk=FakeDisk(free=0))
         assert runner.watchdog_failure(JOB_ID, 0) == FailureCode.LOW_DISK_SPACE
+
+
+def test_launcher_log_is_private_and_never_overwrites_prior_failure_evidence():
+    with tempfile.TemporaryDirectory() as name:
+        job_dir = Path(name)
+        with open_launcher_log(job_dir) as handle:
+            handle.write(b"first failure\n")
+        log_path = job_dir / "launcher.log"
+        assert log_path.read_bytes() == b"first failure\n"
+        assert log_path.stat().st_mode & 0o777 == 0o600
+        assert_rejected(open_launcher_log, job_dir, expected=FileExistsError)
+        assert log_path.read_bytes() == b"first failure\n"
+
+
+def test_supervisor_routes_launcher_output_to_private_log_with_clean_environment():
+    with tempfile.TemporaryDirectory() as name:
+        inspector = PreflightInspector()
+        runner = verified_runner(Path(name), inspector=inspector)
+        own_identity = inspector.identity_for(JOB_ID, __import__("os").getpid())
+        runner.write_status(RemoteStatus(REMOTE_PROTOCOL_VERSION, JOB_ID, JobStatus.RUNNING))
+        runner.lock.acquire(own_identity)
+        calls = []
+
+        def spawner(command, **kwargs):
+            kwargs["stdout"].write(b"launcher output\n")
+            kwargs["stdout"].flush()
+            calls.append((tuple(command), kwargs))
+            return SimpleNamespace(poll=lambda: 1, returncode=1)
+
+        assert supervise_job(JOB_ID, runner=runner, spawner=spawner) == 1
+        command, kwargs = calls[0]
+        assert command[0] == str(runner.config.runtime.launcher)
+        assert kwargs["stderr"] is __import__("subprocess").STDOUT
+        assert set(kwargs["env"]) == {"HOME", "PATH", "LANG", "LC_ALL"}
+        assert "PYTHONPATH" not in kwargs["env"]
+        log_path = runner.paths.job_dir(JOB_ID) / "launcher.log"
+        assert log_path.read_bytes() == b"launcher output\n"
+        assert log_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_result_manifest_and_receipt_are_controlled_and_never_load_weights():
