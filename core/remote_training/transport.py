@@ -129,6 +129,12 @@ def host_key_alias(profile: RemoteTrainingProfile) -> str:
     return f"{_HOST_ALIAS_PREFIX}{profile.id}"
 
 
+def _ssh_config_quote(value: Path | str) -> str:
+    """Quote one OpenSSH ``-o key=value`` value as config syntax."""
+
+    return '"' + str(value).replace('"', '\\"') + '"'
+
+
 class HostTrustStore:
     """profile 专属 known_hosts pin：每次连接前重写唯一条目，绝不 TOFU。"""
 
@@ -330,7 +336,7 @@ class RemoteCommandBuilder:
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
-            f"UserKnownHostsFile={known_hosts}",
+            f"UserKnownHostsFile={_ssh_config_quote(known_hosts)}",
             "-o",
             f"GlobalKnownHostsFile={self._tools.null_device}",
             "-o",

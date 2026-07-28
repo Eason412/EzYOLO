@@ -109,8 +109,22 @@ def test_known_hosts_is_private_unique_and_rewritten_from_profile_pin():
     assert list(path.parent.glob("*.known_hosts")) == [path]
 
 
+def test_known_hosts_option_quotes_macos_application_support_path():
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-command-builder-")) / "Application Support"
+    builder = make_builder(root)
+    argv = builder.ssh_argv(make_profile(), "preflight")
+    options = option_values(argv)
+    known_hosts_option = next(
+        option for option in options if option.startswith("UserKnownHostsFile=")
+    )
+    assert known_hosts_option == (
+        f'UserKnownHostsFile="{root / "known-hosts" / f"{PROFILE_ID}.known_hosts"}"'
+    )
+
+
 def test_rsync_upload_download_share_the_same_security_options_and_no_delete():
-    root = Path(tempfile.mkdtemp(prefix="ezyolo-command-builder-"))
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-command-builder-")) / "Application Support"
+    root.mkdir()
     snapshot = root / "snapshot"
     staging = root / "staging"
     snapshot.mkdir()
@@ -141,6 +155,10 @@ def test_rsync_upload_download_share_the_same_security_options_and_no_delete():
         assert "ControlMaster=no" in options
         assert "ControlPath=none" in options
         assert "ProxyCommand=none" in options
+        assert (
+            f'UserKnownHostsFile="{root / "known-hosts" / f"{PROFILE_ID}.known_hosts"}"'
+            in options
+        )
         assert not any("accept-new" in value for value in shell_args)
     assert upload[-1].endswith(f":/srv/ezyolo/trainer/incoming/{JOB_ID}")
     assert download[-2].endswith(f":/srv/ezyolo/trainer/results/{JOB_ID}/")
@@ -186,7 +204,8 @@ def test_rsync_ipv6_destination_is_bracketed_and_local_symlink_is_rejected():
 
 
 def test_windows_rsync_shell_uses_createprocess_quoting_and_never_requires_wsl():
-    root = Path(tempfile.mkdtemp(prefix="ezyolo-command-builder-"))
+    root = Path(tempfile.mkdtemp(prefix="ezyolo-command-builder-")) / "Application Support"
+    root.mkdir()
     snapshot = root / "snapshot"
     snapshot.mkdir()
     tools = ClientTransportTools(
@@ -204,6 +223,8 @@ def test_windows_rsync_shell_uses_createprocess_quoting_and_never_requires_wsl()
     assert '"C:\\Program Files\\OpenSSH\\ssh.exe"' in remote_shell
     assert "-F NUL" in remote_shell
     assert "GlobalKnownHostsFile=NUL" in remote_shell
+    assert 'UserKnownHostsFile=\\"' in remote_shell
+    assert "Application Support" in remote_shell
     assert "wsl" not in remote_shell.lower()
     assert argv[-2].endswith("/")
 
